@@ -146,3 +146,16 @@ sandbox/
 config/
 
 src/private/
+
+Dockerfile
+docker-compose.yml
+file_db.json
+
+
+
+# napcat
+napcat/
+
+#api
+haruki_api/
+api_data/

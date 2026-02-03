@@ -1,0 +1,10 @@
+# 忽略 data 文件夹 (因为它太大了，而且我们是用 volumes 映射进去的，不需要打包进镜像)
+data/
+# 忽略 napcat (QQ端)
+napcat/
+# 忽略 git 历史
+.git/
+# 忽略缓存
+__pycache__/
+*.pyc
+venv/

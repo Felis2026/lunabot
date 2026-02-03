@@ -1,48 +1,109 @@
+# === 核心框架与适配器 ===
+nb-cli
 nonebot2[fastapi]
 nonebot-adapter-onebot
-nonebot_plugin_htmlrender==0.6.0
-nonebot_plugin_picstatus==2.1.3.post1
-nonebot_plugin_apscheduler
-tenacity
-matplotlib
+nonebot-plugin-apscheduler
+nonebot-plugin-htmlrender
+nonebot-plugin-picstatus
+nonebot-plugin-alconna        
+nonebot-plugin-orm            # 数据库 ORM 插件
+nonebot-plugin-sentry         # 报错日志上传
+nonebot-plugin-userinfo       # 用户信息管理
+nonebot-plugin-waiter         # 等待用户回复
+nonebot-plugin-localstore     # 本地存储
+nonebot-plugin-docs           # 文档插件
+nonebot-plugin-filehost       # 文件托管
+arclet-alconna
+arclet-alconna-tools
+
+# === 数据库相关 ===
+SQLAlchemy
+alembic
+aiosqlite
+chromadb       # 向量数据库
+
+# === 文本与语言处理 ===
 jieba
+zhon           # 中文处理
+zhconv         # 简繁转换
+pydantic       # 数据验证
+emoji
+Markdown
+markdown2
+markdown-it-py
+html2text
+pyyaml
+
+# === 图像与多媒体 (补全) ===
+Pillow
+pilmoji[requests]
+PicImageSearch
+wordcloud
+ascii_magic
+colour-science
+imageio[ffmpeg]
+ffmpeg-python
+pdf2image
+zstandard
+CairoSVG       # SVG 处理 (htmlrender 可能用到)
+cairocffi
+matplotlib
+numpy
+opencv-python
+lxml           # 网页解析核心
+BeautifulSoup4 # (通常配合 lxml)
+
+# === 浏览器与爬虫 ===
+playwright
+selenium
 requests
-openai
-pandas
 httpx
 aiohttp
-wordcloud
-aiosmtplib
+yt-dlp
+
+# === PJSK 游戏相关 ===
+pjsekai.scores
+sekai-deck-recommend-cpp
+
+# === AI 与 LLM ===
+openai
+google-genai
+orjson
+rapidfuzz
+
+# === 工具库 ===
+tenacity
+tqdm
+loguru
+colorama
+coloredlogs
+bypy
 mail
 mcrcon
-ascii_magic
-PicImageSearch
-aiorpcx
-asteval
-yt-dlp
-imageio[ffmpeg]
-pilmoji[requests]
-zhon
-orjson
 tencentcloud-sdk-python
-ffmpeg-python
-pdf2image   # also need to install poppler-utils
-uvloop
-svgwrite
-setproctitle
-bypy
-colour-science
-opencv-python
-zstandard
-aiosqlite
-rapidfuzz
-sekai_deck_recommend_cpp
 pydub
+psutil==5.9.8
+sentry-sdk
+attrs
+cachetools
+click
+urwid
+websockets
+yarl
+typing_extensions
+setproctitle
+
+# === 系统兼容项 (3.13 必需) ===
 audioop-lts
+
+onnxruntime 
+
+
+#补充
+aiorpcx
+pandas
 yappi
-brotli
+asteval
 scipy
 mistune
-psutil<7.0.0
-
-# easyocr   # optional for llm.translator
+brotli
