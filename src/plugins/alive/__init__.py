@@ -55,6 +55,8 @@ async def alive_check():
         try:
             bot = get_bot_by_self_id(self_id)
             assert bot
+            status = await bot.get_status()
+            assert status['online'] and status['good']
             new_state = CONNECT_STATE
         except:
             new_state = DISCONNECT_STATE
