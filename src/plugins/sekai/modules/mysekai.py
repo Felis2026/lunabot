@@ -408,7 +408,7 @@ def get_mysekai_phenomena_color_info(phenomena_id: int) -> dict:
         }
 
 # 合成mysekai资源位置地图图片
-async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_map: dict, show_harvested: bool, phenomena_color_info: dict) -> Image.Image:
+async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_map: dict, show_harvested: bool, phenomena_color_info: dict, mysekai_info: dict = None) -> Image.Image:
     site_id = harvest_map['mysekaiSiteId']
     site_image_info = Config('sekai.mysekai_site_map_image_info').get(site_id)
     site_image = ctx.static_imgs.get(site_image_info['image'])
@@ -601,6 +601,7 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
             draw_order: int = None
             outline: Optional[Tuple[Tuple[int, int, int, int], int]] = None
             light_size: int = None
+            attachment: Image.Image = None
 
         # 获取所有资源掉落绘制
         res_draw_calls: List[ResDrawCall] = []
@@ -636,6 +637,8 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
                     large_size *= 1.5
                 if item['type'] == 'mysekai_music_record':
                     large_size *= 1.5
+                    has_music_record = mysekai_info and find_by(mysekai_info['updatedResources'].get('userMysekaiMusicRecords', []), 'mysekaiMusicRecordId', item['id']) is not None
+                    call.attachment = ctx.static_imgs.get("mysekai/music_record.png") if has_music_record else None
                 if item['small_icon']:
                     call.size = small_size
                     call.x = int(item['x'] + 0.5 * large_size * large_total - 0.6 * small_size)
@@ -697,6 +700,13 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
                     stroke, stroke_w = call.outline
                     Frame().set_bg(FillBg(stroke=stroke, stroke_width=stroke_w, fill=TRANSPARENT)) \
                         .set_size((call.size+stroke_w*2, call.size+stroke_w*2))
+
+        # 绘制附件
+        for call in res_draw_calls:
+            if call.attachment:
+                attach_size = int(call.size * 0.6)
+                ImageBox(call.attachment, size=(attach_size, attach_size), use_alphablend=True) \
+                    .set_offset((int(call.x + call.size - attach_size * 0.7), int(call.z + call.size - attach_size * 0.7)))
 
         # 绘制资源数量
         for call in res_draw_calls:
@@ -869,7 +879,7 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
             site_id, res_num = site_res_num[i]
             site_harvest_map = find_by(harvest_maps, "mysekaiSiteId", site_id)
             if site_harvest_map:
-                site_harvest_map_imgs.append(compose_mysekai_harvest_map_image(ctx, site_harvest_map, show_harvested, phenom_color_info))
+                site_harvest_map_imgs.append(compose_mysekai_harvest_map_image(ctx, site_harvest_map, show_harvested, phenom_color_info, mysekai_info))
         site_harvest_map_imgs = await asyncio.gather(*site_harvest_map_imgs)
    
     try: 

@@ -37,6 +37,7 @@ class SekaiHandlerContext(HandlerContext):
     create_from_region: bool = False
     prefix_arg: str = None
     uid_arg: str = None
+    data_mode_arg: str = None
 
     @classmethod
     def from_region(cls, region: str) -> 'SekaiHandlerContext':
@@ -47,6 +48,7 @@ class SekaiHandlerContext(HandlerContext):
         ctx.static_imgs = StaticImageRes()
         ctx.create_from_region = True
         ctx.prefix_arg = None
+        ctx.data_mode_arg = None
         return ctx
     
     def block_region(self, key="", timeout=3*60, err_msg: str = None):
@@ -63,6 +65,7 @@ class SekaiCmdHandler(CmdHandler):
         regions: List[str] = None, 
         prefix_args: List[str] = None,
         parse_uid_arg: bool = True,
+        parse_data_mode_arg: bool = True,
         **kwargs
     ):
         self.available_regions = regions or self.DEFAULT_AVAILABLE_REGIONS
@@ -78,6 +81,7 @@ class SekaiCmdHandler(CmdHandler):
         all_region_commands = list(set(all_region_commands))
         self.original_commands = commands
         self.parse_uid_arg = parse_uid_arg
+        self.parse_data_mode_arg = parse_data_mode_arg
         super().__init__(all_region_commands, logger, **kwargs)
 
     async def additional_context_process(self, context: HandlerContext):
@@ -140,7 +144,15 @@ class SekaiCmdHandler(CmdHandler):
                     if stype == "at" and sdata.get('qq'):
                         uid_arg = f"@{sdata['qq']}"
                         break
-        
+            # 处理抓包模式参数
+            data_mode_arg = None
+            if self.parse_data_mode_arg:
+                # 匹配 "抓包模式xxx"
+                data_mode_match = re.search(r'抓包模式(.*)', args)
+                if data_mode_match:
+                    data_mode_arg = data_mode_match.group(1).strip()
+                    args = args.replace(data_mode_match.group(0), '', 1).strip()
+            
         with ProfileTimer("sekaihandler.construct_ctx"):
             # 构造新的上下文
             params = context.__dict__.copy()
@@ -153,7 +165,7 @@ class SekaiCmdHandler(CmdHandler):
             params['create_from_region'] = False
             params['prefix_arg'] = prefix_arg
             params['uid_arg'] = uid_arg
-
+            params['data_mode_arg'] = data_mode_arg
             return SekaiHandlerContext(**params)
 
 
