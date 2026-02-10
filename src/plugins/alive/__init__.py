@@ -77,7 +77,7 @@ async def alive_check():
         if not st.group_reported and st.cur_state == CONNECT_STATE:
             for group_id in REPORT_GROUPS_CFG.get():
                 try:
-                    await send_group_msg_by_bot(group_id, f"{self_id} 恢复连接")
+                    await send_group_msg_by_bot(group_id, "恢复连接")
                 except Exception as e:
                     logger.print_exc(f"向群 {group_id} 发送恢复连接通知失败")
             st.group_reported = True

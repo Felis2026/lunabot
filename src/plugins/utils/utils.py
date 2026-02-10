@@ -3,10 +3,10 @@ from datetime import datetime, timedelta, timezone
 
 # ============================ 启动时性能分析 ============================ #
 
-if _profile_at_startup := global_config.get('profile_at_starup.enable'):
+if _profile_at_startup := global_config.get('profile_at_startup.enable'):
     import yappi
-    _profile_at_startup_clock_type = global_config.get('profile_at_starup.clock_type')
-    _profile_at_startup_seconds = global_config.get('profile_at_starup.seconds')
+    _profile_at_startup_clock_type = global_config.get('profile_at_startup.clock_type')
+    _profile_at_startup_seconds = global_config.get('profile_at_startup.seconds')
     yappi.set_clock_type(_profile_at_startup_clock_type)
     yappi.start()
     print(f"启动时性能分析已开启 (clocktype={_profile_at_startup_clock_type}, seconds={_profile_at_startup_seconds})", flush=True)
