@@ -191,24 +191,38 @@ async def get_snowy_forecast_data(region: str, event_id: int, chapter_id: int | 
         region=region,
         event_id=event_id,
     )
-    async with TempBotOrInternetFilePath('html', cfg['url']) as html_path:
-        with open(html_path, 'r', encoding='utf-8') as f:
-            html = f.read()
+    # 从网页爬取
+    # async with TempBotOrInternetFilePath('html', cfg['url']) as html_path:
+    #     with open(html_path, 'r', encoding='utf-8') as f:
+    #         html = f.read()
 
-        if f'event_{event_id}' not in html:
-            raise GetForecastException("最新活动预测未更新")
+    #     if f'event_{event_id}' not in html:
+    #         raise GetForecastException("最新活动预测未更新")
 
-        rank_preds = {}
+    #     rank_preds = {}
 
-        pattern = re.compile(r'"Rank":(\d+),"CurrentScore":\d+,"PredictedScore":(\d+),')
-        for match in pattern.finditer(html):
-            rank = int(match.group(1))
-            pred_score = int(match.group(2))
-            rank_preds[rank] = pred_score
+    #     pattern = re.compile(r'"Rank":(\d+),"CurrentScore":\d+,"PredictedScore":(\d+),')
+    #     for match in pattern.finditer(html):
+    #         rank = int(match.group(1))
+    #         pred_score = int(match.group(2))
+    #         rank_preds[rank] = pred_score
         
-        data.forecast_ts = int(time.time())
-        for rank, pred in rank_preds.items():
-            data.rank_data[rank] = RankForecastData(final_score=pred)
+    #     data.forecast_ts = int(time.time())
+    #     for rank, pred in rank_preds.items():
+    #         data.rank_data[rank] = RankForecastData(final_score=pred)
+
+    # 从公开API获取
+    resp = await download_json(cfg['url'].format(region=region + '/' if region != 'cn' else '', event_id=event_id))
+    for item in resp.get('data', {}).get('charts', []):
+        rank = int(item['Rank'])
+        if rank not in cfg['ranks']:
+            continue
+        pred_score = int(item['PredictedScore'])
+        data.rank_data[rank] = RankForecastData(final_score=pred_score)
+    if not data.rank_data:
+        raise GetForecastException("最新活动预测未更新")
+    data.forecast_ts = int(resp['timestamp'] / 1000)
+
     return data
 
 async def get_sekarun_forecast_data(region: str, event_id: int, chapter_id: int | None = None) -> ForecastData | None:
