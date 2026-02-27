@@ -29,10 +29,13 @@ class CharacterNicknameData:
 
 _character_nickname_data = CharacterNicknameData()
 
-ALL_SERVER_REGIONS = ['jp', 'en', 'tw', 'kr', 'cn']
-ALL_SERVER_REGION_NAMES = ['日服', '国际服', '台服', '韩服', '国服']
-NEED_TRANSLATE_REGIONS = ['jp', 'en', 'kr']
-TRANSLATED_REGIONS = ['cn', 'tw']
+# Runtime region scope is intentionally limited to CN/JP.
+# To restore legacy 5-region behavior, change this back to:
+# ['jp', 'en', 'tw', 'kr', 'cn'].
+ALL_SERVER_REGIONS = ['cn', 'jp']
+ALL_SERVER_REGION_NAMES = ['国服', '日服']
+NEED_TRANSLATE_REGIONS = ['jp']
+TRANSLATED_REGIONS = ['cn']
 
 REGION_UTC_OFFSET = {
     'jp': 9,

@@ -1881,24 +1881,35 @@ async def compose_deck_recommend_image(
                                 TextBox(f"*根据游玩记录自动推荐", TextStyle(font=DEFAULT_FONT, size=20, color=(70, 70, 70)))
 
                     if recommend_type not in ["bonus", "wl_bonus", "mysekai"]:
-                        if options.skill_order_choose_strategy == 'average':
-                            skill_order_text = "技能顺序: ⚖️平均情况"
-                        elif options.skill_order_choose_strategy == 'max':
-                            skill_order_text = "技能顺序: 🌟最优顺序"
-                        elif options.skill_order_choose_strategy == 'min':
-                            skill_order_text = "技能顺序: 🥀最差顺序"
-                        elif options.skill_order_choose_strategy == 'specific':
-                            skill_order = options.specific_skill_order
-                            skill_order_text = f"技能顺序: {''.join([str(s+1) for s in skill_order])}"
+                        skill_text_style = TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(70, 70, 70))
+                        avg_icon_text_offset = (0, 1)
+                        with HSplit().set_content_align('l').set_item_align('c').set_sep(16):
+                            with HSplit().set_content_align('l').set_item_align('c').set_sep(2):
+                                TextBox("技能顺序:", skill_text_style)
+                                if options.skill_order_choose_strategy == 'average':
+                                    TextBox("⚖️", skill_text_style).set_text_offset(avg_icon_text_offset)
+                                    TextBox("平均情况", skill_text_style)
+                                elif options.skill_order_choose_strategy == 'max':
+                                    TextBox("🌟", skill_text_style)
+                                    TextBox("最优顺序", skill_text_style)
+                                elif options.skill_order_choose_strategy == 'min':
+                                    TextBox("🥀", skill_text_style)
+                                    TextBox("最差顺序", skill_text_style)
+                                elif options.skill_order_choose_strategy == 'specific':
+                                    skill_order = options.specific_skill_order
+                                    TextBox(f"{''.join([str(s + 1) for s in skill_order])}", skill_text_style)
 
-                        if options.skill_reference_choose_strategy == 'average':
-                            skill_reference_text = "BloomFes花前技能吸取: ⚖️平均值"
-                        elif options.skill_reference_choose_strategy == 'max':
-                            skill_reference_text = "BloomFes花前技能吸取: 🌟最大值"
-                        elif options.skill_reference_choose_strategy == 'min':
-                            skill_reference_text = "BloomFes花前技能吸取: 🥀最小值"
-
-                        TextBox(skill_order_text + "  " + skill_reference_text, TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(70, 70, 70)))
+                            with HSplit().set_content_align('l').set_item_align('c').set_sep(2):
+                                TextBox("BloomFes花前技能吸取:", skill_text_style)
+                                if options.skill_reference_choose_strategy == 'average':
+                                    TextBox("⚖️", skill_text_style).set_text_offset(avg_icon_text_offset)
+                                    TextBox("平均值", skill_text_style)
+                                elif options.skill_reference_choose_strategy == 'max':
+                                    TextBox("🌟", skill_text_style)
+                                    TextBox("最大值", skill_text_style)
+                                elif options.skill_reference_choose_strategy == 'min':
+                                    TextBox("🥀", skill_text_style)
+                                    TextBox("最小值", skill_text_style)
                     
                     info_text = ""
 

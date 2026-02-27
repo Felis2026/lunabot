@@ -16,6 +16,10 @@ def forecast(
 ):
     t = datetime.now()
 
+    history_csvs = [csv for csv in history_csvs if csv and os.path.exists(csv)]
+    if not history_csvs:
+        raise ValueError("No valid history csv files")
+
     history_all = pd.concat([pd.read_csv(csv) for csv in history_csvs], ignore_index=True)
     current_all = pd.read_csv(current_csv)
 
@@ -99,7 +103,7 @@ if __name__ == "__main__":
         """.strip())
     args = parser.parse_args()
 
-    args.history_csvs = args.history_csvs.split(",")
+    args.history_csvs = [x for x in args.history_csvs.split(",") if x.strip()]
     args.ranks = [int(r) for r in args.ranks.split(",")]
 
     forecast(

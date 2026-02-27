@@ -28,8 +28,12 @@ from .card import get_character_sd_image
 from ...imgtool import shrink_image
 
 
-MYSEKAI_REGIONS = ['jp', 'tw', 'cn', 'kr', 'en']
-BD_MYSEKAI_REGIONS = ['cn', 'tw', 'kr']
+# Runtime MySekai scope is aligned to CN/JP only.
+# To restore legacy settings:
+# MYSEKAI_REGIONS = ['jp', 'tw', 'cn', 'kr', 'en']
+# BD_MYSEKAI_REGIONS = ['cn', 'tw', 'kr']
+MYSEKAI_REGIONS = ['cn', 'jp']
+BD_MYSEKAI_REGIONS = ['cn']
 
 bd_msr_sub = SekaiGroupSubHelper("msr", "msr指令权限", BD_MYSEKAI_REGIONS)
 msr_sub = SekaiUserSubHelper("msr", "烤森资源查询自动推送", MYSEKAI_REGIONS, only_one_group=True)

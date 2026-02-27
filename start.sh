@@ -12,12 +12,16 @@ python src/services/deck_recommender/serve.py &
 echo "正在启动 Chatroom Client..."
 # python -m src.services.chatroom.client &
 
+# 4. 启动 Sekai 榜线追踪服务 (放入后台运行 &)
+echo "正在启动 Event Tracker..."
+python -m src.services.event_tracker.main &
+
 # === 如果还有其他服务，按上面的格式继续加 ===
 
-# 4. 休息一下
+# 5. 休息一下
 sleep 3
 
-# 5. 最后启动 NoneBot 主程序
+# 6. 最后启动 NoneBot 主程序
 
 echo "所有子服务启动完毕，正在启动 NoneBot..."
 nb run

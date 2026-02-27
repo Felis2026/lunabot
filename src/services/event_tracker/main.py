@@ -7,7 +7,7 @@ from tenacity import retry, wait_fixed, stop_after_attempt
 
 set_log_level('INFO')
 
-ALL_SERVER_REGIONS = ['jp', 'cn', 'tw', 'kr', 'en']
+ALL_SERVER_REGIONS = ['cn']
 
 RECORD_TIME_AFTER_EVENT_END_CFG = config.item('sk.record_time_after_event_end_minutes')
 RECORD_INTERVAL_CFG = config.item('sk.record_interval_seconds')
@@ -87,6 +87,25 @@ def parse_rankings(region: str, event_id: int, data: dict) -> tuple[list[Ranking
     
     return top100, border
 
+def build_split_ranking_urls(formatted_url: str) -> Optional[tuple[str, str]]:
+    """
+    根据ranking接口地址生成 top100/border 两个接口地址
+    兼容 /ranking /rankings /ranking-top100 /ranking-border
+    """
+    if formatted_url.endswith("/ranking-top100"):
+        prefix = formatted_url[:-len("/ranking-top100")]
+        return (formatted_url, prefix + "/ranking-border")
+    if formatted_url.endswith("/ranking-border"):
+        prefix = formatted_url[:-len("/ranking-border")]
+        return (prefix + "/ranking-top100", formatted_url)
+    if formatted_url.endswith("/rankings"):
+        prefix = formatted_url[:-len("/rankings")]
+        return (prefix + "/ranking-top100", prefix + "/ranking-border")
+    if formatted_url.endswith("/ranking"):
+        prefix = formatted_url[:-len("/ranking")]
+        return (prefix + "/ranking-top100", prefix + "/ranking-border")
+    return None
+
 def get_wl_events(region: str, event_id: int) -> list[dict]:
     """获取event_id对应的所有wl_event（时间顺序），如果不是wl则返回空列表"""
     event = mds.get(region, 'events').find_by_id(event_id)
@@ -144,12 +163,34 @@ class EventTracker:
         """
         请求榜线数据，返回 (数据，耗时)
         """
+        t = datetime.now().timestamp()
+        formatted_url = url.format(event_id=eid)
+
+        # 优先双接口：top100 + border（避免每次先撞单接口导致404）
+        split_urls = build_split_ranking_urls(formatted_url)
+        if split_urls:
+            top100_url, border_url = split_urls
+            try:
+                top100_data = await request_gameapi(top100_url)
+                border_data = await request_gameapi(border_url)
+                data = {
+                    'top100': top100_data,
+                    'border': border_data,
+                }
+                return (data, datetime.now().timestamp() - t)
+            except Exception:
+                self.error(f"请求榜线双接口失败")
+                return (None, datetime.now().timestamp() - t)
+
+        # 兼容旧接口：直接返回 top100 + border
         try:
-            t = datetime.now().timestamp()
-            data = await request_gameapi(url.format(event_id=eid))
-            return (data, datetime.now().timestamp() - t)
+            data = await request_gameapi(formatted_url)
+            if isinstance(data, dict) and data.get('top100') and data.get('border'):
+                return (data, datetime.now().timestamp() - t)
+            self.error(f"请求榜线数据失败: 非法返回结构 {formatted_url}")
+            return (None, datetime.now().timestamp() - t)
         except Exception:
-            self.error(f"请求榜线数据失败")
+            self.error(f"请求榜线单接口失败")
             return (None, datetime.now().timestamp() - t)
         
 
@@ -213,11 +254,11 @@ class EventTracker:
         try:
             if not (event := get_current_event(region, fallback="prev")):
                 self.info(f"当前无进行中或已结束活动，跳过榜线更新")
-                close_conn(region)
+                await close_conn(region)
                 return ret
             if datetime.now() > datetime.fromtimestamp(event['aggregateAt'] / 1000 + RECORD_TIME_AFTER_EVENT_END_CFG.get() * 60):
                 self.info(f"当前活动 {event['id']} 已过榜线记录时间，跳过榜线更新")
-                close_conn(region)
+                await close_conn(region)
                 return ret
         except Exception as e:
             self.warning(f"检查当前活动时失败: {get_exc_desc(e)}")

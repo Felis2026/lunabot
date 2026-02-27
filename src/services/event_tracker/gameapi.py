@@ -1,3 +1,5 @@
+import os
+
 from .utils import *
 from aiohttp import ClientSession, ClientConnectionError, ClientTimeout
 
@@ -44,7 +46,17 @@ def get_gameapi_config(region: str) -> GameApiConfig:
 async def request_gameapi(url: str, method: str = 'GET', data_type: str | None = 'json', **kwargs):
     debug(f"请求游戏API后端: {method} {url}")
     token = config.get('gameapi_token', '')
-    headers = { 'Authorization': f'Bearer {token}' }
+    accept_encoding = config.get('gameapi_accept_encoding', 'zstd', raise_exc=False)
+    extra_header_name = os.getenv('SEKAI_EXTRA_HEADER_NAME', '').strip()
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept-Encoding': accept_encoding,
+    }
+    if extra_header_name:
+        headers[extra_header_name] = token
+    if 'headers' in kwargs:
+        headers.update(kwargs['headers'])
+        del kwargs['headers']
     try:
         async with get_session().request(method, url, headers=headers, verify_ssl=False, **kwargs) as resp:
             if resp.status != 200:

@@ -375,7 +375,7 @@ def get_local_forecast_history_csv_path(region: str, event_id: int) -> str:
     """
     return f"{FORECAST_DATA_DIR}/local/{region}/history/{event_id}.csv"
 
-async def save_rankings_to_csv(region: str, event_id: int, save_path: str):
+async def save_rankings_to_csv(region: str, event_id: int, save_path: str) -> int:
     """
     将指定活动的历史排名数据保存为 CSV 文件用于本地预测
     """
@@ -407,6 +407,7 @@ async def save_rankings_to_csv(region: str, event_id: int, save_path: str):
     pd.DataFrame(data).to_csv(tmp_path, index=False)
     os.replace(tmp_path, save_path)
     logger.info(f"已保存活动 {event_id} 的历史排名数据到 {save_path}")
+    return len(data)
 
 async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
     """
@@ -415,8 +416,14 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
     cfg = config.get('sk.forecast.local')
 
     base_dir = f"{FORECAST_DATA_DIR}/local/{region}"
-    history_csvs = glob.glob(f"{base_dir}/history/*.csv")
+    history_csvs = sorted([
+        p for p in glob.glob(f"{base_dir}/history/*.csv")
+        if os.path.isfile(p)
+    ])
     result_csv = f"{base_dir}/forecast/{event_id}_future.csv"
+
+    if not history_csvs:
+        raise GetForecastException("本地预测缺少历史样本，等待活动结束后自动生成历史数据")
 
     ctx = SekaiHandlerContext.from_region(region)
     event = await ctx.md.events.find_by_id(event_id)
@@ -428,7 +435,9 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
         raise GetForecastException(f"距离活动结束不足 {cfg['end_before_hours']} 小时，取消本地预测")
 
     with TempFilePath('.csv') as current_csv:
-        await save_rankings_to_csv(region, event_id, current_csv)
+        sample_count = await save_rankings_to_csv(region, event_id, current_csv)
+        if sample_count <= 0:
+            raise GetForecastException("当前活动榜线样本不足，取消本地预测")
         args = [
             sys.executable, "src/services/sk_forecast/cli.py", 
             "--history_csvs", ",".join(history_csvs),

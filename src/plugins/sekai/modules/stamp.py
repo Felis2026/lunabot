@@ -211,11 +211,13 @@ async def ensure_stamp_maker_base_image(ctx: SekaiHandlerContext, sid: int, use_
 
 # ======================= 指令处理 ======================= #
 
+STAMP_SUPPORTED_REGIONS = ['cn']
+
 # 表情查询/制作
 pjsk_stamp = SekaiCmdHandler([
     "/pjsk stamp", "/pjsk bq", 
     "/pjsk表情",  "/pjsk表情制作",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_stamp.check_cdrate(cd).check_wblist(gbl)
 @pjsk_stamp.handle()
 async def _(ctx: SekaiHandlerContext):
@@ -299,7 +301,7 @@ async def _(ctx: SekaiHandlerContext):
 pjsk_rand_stamp = SekaiCmdHandler([
     "/pjsk rand stamp", "/pjsk rand bq",
     "/pjsk随机表情", "/pjsk随机表情制作", "/随机表情",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_rand_stamp.check_cdrate(cd).check_wblist(gbl)
 @pjsk_rand_stamp.handle()
 async def _(ctx: SekaiHandlerContext):
@@ -345,7 +347,7 @@ async def _(ctx: SekaiHandlerContext):
 pjsk_stamp_refresh = SekaiCmdHandler([
     "/pjsk stamp refresh", "/pjsk refresh stamp", 
     "/pjsk表情刷新", "/pjsk刷新表情", "/pjsk刷新表情底图", "/pjsk表情刷新底图",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_stamp_refresh.check_cdrate(cd).check_wblist(gbl)
 @pjsk_stamp_refresh.handle()
 async def _(ctx: SekaiHandlerContext):
@@ -375,7 +377,7 @@ async def _(ctx: SekaiHandlerContext):
 pjsk_stamp_refresh_batch = SekaiCmdHandler([
     "/pjsk stamp refresh batch",
     "/pjsk表情刷新批量",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_stamp_refresh_batch.check_cdrate(cd).check_wblist(gbl).check_superuser()
 @pjsk_stamp_refresh_batch.handle()
 async def _(ctx: SekaiHandlerContext):
@@ -407,7 +409,7 @@ async def _(ctx: SekaiHandlerContext):
 pjsk_stamp_base = SekaiCmdHandler([
     "/pjsk stamp base",
     "/pjsk表情底图",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_stamp_base.check_cdrate(cd).check_wblist(gbl)
 @pjsk_stamp_base.handle()
 async def _(ctx: SekaiHandlerContext):
@@ -441,7 +443,7 @@ async def _(ctx: SekaiHandlerContext):
 pjsk_stamp_base_delete = SekaiCmdHandler([
     "/pjsk remove stamp base", "/pjsk del stamp base",
     "/pjsk删除表情底图",
-])
+], regions=STAMP_SUPPORTED_REGIONS)
 pjsk_stamp_base_delete.check_cdrate(cd).check_wblist(gbl).check_superuser()
 @pjsk_stamp_base_delete.handle()
 async def _(ctx: SekaiHandlerContext):

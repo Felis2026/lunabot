@@ -1,0 +1,49 @@
+﻿services:
+  # === 服务A: Lunabot (Python 3.13) ===
+  lunabot:
+    env_file:
+      - .env
+    build: .
+    container_name: lunabot_container
+    restart: always
+    volumes:
+      # 1) 挂载项目目录，代码改动可即时生效
+      - ./:/app
+      # 2) 挂载字体目录，避免图片渲染出现方块字
+      - ./fonts:/root/.fonts
+    environment:
+      - TZ=Asia/Shanghai
+    depends_on:
+      - napcat
+    # 对外暴露 OneBot 反向 WS 监听端口（可用于调试）
+    ports:
+      - "3309:3309"
+    networks:
+      - your_bot_net
+
+  # === 服务B: NapCat (QQ 接入端) ===
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat_container
+    restart: always
+    # 固定主机名，便于容器间排查网络问题
+    hostname: napcat-bot
+    environment:
+      # 请在这里填写你自己的 QQ 号（示例：123456789）
+      - ACCOUNT=123456789
+      - WSR_ENABLE=true
+      - WSR_URL=ws://lunabot:3309/onebot/v11/ws
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
+      - ./data:/app/data
+    ports:
+      - "6099:6099"
+    networks:
+      - your_bot_net
+    # 示例 MAC 地址，请按你的网络环境自行修改，避免与已有设备冲突
+    mac_address: 02:42:AC:12:34:56
+
+networks:
+  your_bot_net:
+    driver: bridge

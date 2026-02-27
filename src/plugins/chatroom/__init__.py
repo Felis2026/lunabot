@@ -1,3 +1,5 @@
+import os
+
 from ..record.sql import query_recent_msg
 from ..record import before_record_hook
 from ..utils import *
@@ -57,7 +59,7 @@ def on_disconnect(session: RpcSession):
 start_rpc_service(
     host=config.get('host'),
     port=config.get('port'),
-    token=config.get('token'),
+    token=os.getenv("CHATROOM_RPC_TOKEN", config.get('token')),
     name=RPC_SERVICE,
     logger=logger,
     on_connect=on_connect,

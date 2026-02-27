@@ -586,6 +586,29 @@ def process_hide_uid(ctx: SekaiHandlerContext, uid: int, keep: int=0) -> str:
         return "*" * 16
     return uid
 
+# 统一Unix时间戳到毫秒，兼容10位秒级与13位毫秒级
+def to_unix_millis(ts: int | float | str | None) -> int | None:
+    if ts is None or isinstance(ts, bool):
+        return None
+    if isinstance(ts, str):
+        if not ts.isdigit():
+            return None
+        ts = int(ts)
+    if isinstance(ts, (int, float)):
+        ts = int(ts)
+        if ts < 1_000_000_000_000:
+            ts *= 1000
+        return ts
+    return None
+
+def normalize_upload_time_inplace(data: dict, key: str='upload_time') -> dict:
+    if not isinstance(data, dict):
+        return data
+    ts_ms = to_unix_millis(data.get(key))
+    if ts_ms is not None:
+        data[key] = ts_ms
+    return data
+
 # 根据获取玩家详细信息，返回(profile, err_msg)
 async def get_detailed_profile(
     ctx: SekaiHandlerContext, 
@@ -615,19 +638,44 @@ async def get_detailed_profile(
         url = get_gameapi_config(ctx).suite_api_url
         if not url:
             raise ReplyException(f"暂不支持查询{get_region_name(ctx.region)}的抓包数据")
+        use_suite_api_public = "suite-api.haruki.seiunx.com/public/" in url
         
         # 数据获取模式
         mode = mode or get_user_data_mode(ctx, qid)
 
         # 尝试下载
         try:   
-            url = url.format(uid=uid) + f"?mode={mode}"
-            if filter:
-                url += f"&filter={','.join(filter)}"
-            profile = await request_gameapi(url)
+            # 原逻辑（支持 mode/filter 的后端，保留便于回滚）
+            # url = url.format(uid=uid) + f"?mode={mode}"
+            # if filter:
+            #     url += f"&filter={','.join(filter)}"
+            # profile = await request_gameapi(url)
+
+            req_url = url.format(uid=uid)
+            if use_suite_api_public:
+                # suite-api 使用 key 参数做字段裁剪
+                if filter:
+                    if isinstance(filter, set):
+                        key_list = sorted(filter)
+                    else:
+                        key_list = list(filter)
+                    # 去重（保持原有顺序）
+                    seen = set()
+                    key_list = [k for k in key_list if not (k in seen or seen.add(k))]
+                    req_url += f"?key={','.join(key_list)}"
+                profile = await request_gameapi(req_url)
+            else:
+                req_url += f"?mode={mode}"
+                if filter:
+                    req_url += f"&filter={','.join(filter)}"
+                profile = await request_gameapi(req_url)
         except HttpError as e:
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
-            if e.status_code == 404:
+            # suite-api 的 key 可能不支持某些字段，回退到全量请求
+            if use_suite_api_public and e.status_code == 400 and filter:
+                logger.warning(f"suite-api key参数请求失败，回退到全量请求: {req_url}")
+                profile = await request_gameapi(url.format(uid=uid))
+            elif e.status_code == 404:
                 local_err = e.message.get('local_err', None)
                 haruki_err = e.message.get('haruki_err', None)
                 msg = f"获取你的{get_region_name(ctx.region)}Suite抓包数据失败，发送\"/抓包\"指令可获取帮助\n"
@@ -639,21 +687,38 @@ async def get_detailed_profile(
         except Exception as e:
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
             raise e
+
+        # suite-api may return scalar for single-key requests (e.g. key=upload_time).
+        # Coerce it to dict so downstream code can access fields consistently.
+        if filter and not isinstance(profile, dict):
+            filter_keys = sorted(filter) if isinstance(filter, set) else list(filter)
+            if len(filter_keys) == 1:
+                profile = {filter_keys[0]: profile}
             
         if not profile:
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: 找不到该玩家")
             raise ReplyException(f"找不到ID为 {uid} 的玩家")
         
-        # 缓存数据（目前已不缓存）
+        # 补齐来源字段，避免界面显示“数据来源: ?”
+        if not profile.get('source'):
+            profile['source'] = 'haruki'
+
+        # 统一 upload_time 单位为毫秒（兼容秒级/毫秒级）
+        normalize_upload_time_inplace(profile)
+        
+        # 默认关闭suite本地缓存（保留注释便于按需恢复）
         cache_path = f"{SEKAI_PROFILE_DIR}/suite_cache/{ctx.region}/{uid}.json"
-        # if not upload_time_only:
+        # if use_cache:
         #     dump_json(profile, cache_path)
-        logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据成功，数据已缓存")
+        logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据成功")
         
     except Exception as e:
         # 获取失败的情况，尝试读取缓存
         if cache_path and os.path.exists(cache_path):
             profile = load_json(cache_path)
+            if not profile.get('source'):
+                profile['source'] = 'haruki'
+            normalize_upload_time_inplace(profile)
             logger.info(f"从缓存获取 {qid} {ctx.region} {uid} 抓包数据")
             return profile, get_exc_desc(e) + "(使用先前的缓存数据)"
         else:
@@ -668,7 +733,8 @@ async def get_detailed_profile(
         missing_keys = [k for k in filter if k not in profile]
         if missing_keys:
             source = profile.get('source', '?')
-            update_time = datetime.fromtimestamp(profile['upload_time'] / 1000).strftime('%m-%d %H:%M:%S')
+            upload_time_ms = to_unix_millis(profile.get('upload_time'))
+            update_time = datetime.fromtimestamp(upload_time_ms / 1000).strftime('%m-%d %H:%M:%S') if upload_time_ms else "?"
             raise ReplyException(f"你的{get_region_name(ctx.region)}Suite抓包数据中缺少必要的字段: {', '.join(missing_keys)}"
                                  f" (数据来源: {source} 更新时间: {update_time})")
         
@@ -797,7 +863,7 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
                     TextBox(f"{ctx.region.upper()}: {process_hide_uid(ctx, game_data['userId'], keep=6)}", TextStyle(font=DEFAULT_FONT, size=20, color=ADAPTIVE_WB))
                     with Frame():
                         ImageBox(ctx.static_imgs.get("lv_rank_bg.png"), size=(180, None))
-                        TextBox(f"{game_data['rank']}", TextStyle(font=DEFAULT_FONT, size=30, color=WHITE)).set_offset((110, 0))\
+                        TextBox(f"{game_data['rank']}", TextStyle(font=DEFAULT_FONT, size=30, color=WHITE)).set_offset((110, 7))\
                         
             # 头衔（竖版）
             if vertical:

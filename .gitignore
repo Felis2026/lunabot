@@ -147,15 +147,35 @@ config/
 
 src/private/
 
-Dockerfile
-docker-compose.yml
 file_db.json
+docker-compose.yml
+!docker-compose.example.yml
+
+# release safety (public repo)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.bak
+*.bak_*
+*.local
+*.orig
+*.rej
+*.tmp
+docker-compose*.bak*
+*.sqlite
+*.sqlite3
+*.db
+**/bak/
+**/bak_*/
 
 
 
 # napcat
 napcat/
 
-#api
-haruki_api/
-api_data/
+

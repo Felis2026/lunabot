@@ -158,25 +158,25 @@ async def _(bot: Bot, event: NoticeEvent):
             return
         if not is_group_msg(event):
             return
-        if event.target_id != event.self_id or event.user_id == event.self_id:
+            
+        if str(event.target_id) != str(event.self_id) or str(event.user_id) == str(event.self_id):
             return
+            
         if check_group_disabled(event.group_id):
             return
         
-        poke_reply_interval = timedelta(seconds=config.get('group_poke_reply_interval'))
+        poke_reply_interval = timedelta(seconds=config.get('group_poke_reply_interval') or 0)
         t = datetime.now()
         if event.group_id not in group_last_poke_reply_time:
             group_last_poke_reply_time[event.group_id] = t - poke_reply_interval
+        
         if t - group_last_poke_reply_time[event.group_id] < poke_reply_interval:
-            return
+            return # 冷却中，不理会
+        
         group_last_poke_reply_time[event.group_id] = t
 
-        imgs = glob.glob("data/alive/poke_reply/*")
-        if not imgs:
-            return
-        img = random.choice(imgs)
-        await send_group_msg_by_bot(event.group_id, await get_image_cq(img))
+        status_img = await get_status_image_cq()
+        await send_group_msg_by_bot(event.group_id, status_img)
 
     except:
         logger.print_exc("回复戳失败")
-

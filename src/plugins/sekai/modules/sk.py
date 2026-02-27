@@ -237,6 +237,53 @@ async def parse_rankings(ctx: SekaiHandlerContext, event_id: int, data: dict) ->
         item.uid = str(item.uid)
     
     return top100 + border
+
+def build_split_ranking_urls(formatted_url: str) -> Optional[Tuple[str, str]]:
+    """
+    根据ranking接口地址生成 top100/border 两个接口地址
+    兼容 /ranking /rankings /ranking-top100 /ranking-border
+    """
+    if formatted_url.endswith("/ranking-top100"):
+        prefix = formatted_url[:-len("/ranking-top100")]
+        return (formatted_url, prefix + "/ranking-border")
+    if formatted_url.endswith("/ranking-border"):
+        prefix = formatted_url[:-len("/ranking-border")]
+        return (prefix + "/ranking-top100", formatted_url)
+    if formatted_url.endswith("/rankings"):
+        prefix = formatted_url[:-len("/rankings")]
+        return (prefix + "/ranking-top100", prefix + "/ranking-border")
+    if formatted_url.endswith("/ranking"):
+        prefix = formatted_url[:-len("/ranking")]
+        return (prefix + "/ranking-top100", prefix + "/ranking-border")
+    return None
+
+async def request_ranking_data(ctx: SekaiHandlerContext, event_id: int) -> dict:
+    """
+    请求榜线数据：
+    1) 优先尝试双接口（ranking-top100 + ranking-border）
+    2) 不支持拆分时回退到单接口（返回top100+border）
+    """
+    url_tpl = get_gameapi_config(ctx).ranking_api_url
+    assert_and_reply(url_tpl, f"暂不支持获取{ctx.region}榜线数据")
+
+    formatted_url = url_tpl.format(event_id=event_id % 1000)
+
+    # 优先双接口：避免每次先请求单接口导致404
+    split_urls = build_split_ranking_urls(formatted_url)
+    if split_urls:
+        top100_url, border_url = split_urls
+        top100_data = await request_gameapi(top100_url)
+        border_data = await request_gameapi(border_url)
+        return {
+            'top100': top100_data,
+            'border': border_data,
+        }
+
+    # 兼容旧接口：直接返回 top100 + border
+    data = await request_gameapi(formatted_url)
+    assert_and_reply(isinstance(data, dict) and data.get('top100') and data.get('border'),
+                     f"榜线接口返回格式不正确: {formatted_url}")
+    return data
   
 # 获取最新榜线记录
 async def get_latest_ranking(ctx: SekaiHandlerContext, event_id: int, query_ranks: List[int] = ALL_RANKS) -> List[Ranking]:
@@ -253,10 +300,8 @@ async def get_latest_ranking(ctx: SekaiHandlerContext, event_id: int, query_rank
         latest_rankings_cache.setdefault(ctx.region, {})[event_id] = rankings
         latest_rankings_mtime.setdefault(ctx.region, {})[event_id] = db_mtime
         return [r for r in rankings if r.rank in query_ranks]
-    # 从API获取
-    url = get_gameapi_config(ctx).ranking_api_url
-    assert_and_reply(url, f"暂不支持获取{ctx.region}榜线数据")
-    data = await request_gameapi(url.format(event_id=event_id % 1000))
+    # 从API获取（自动兼容单接口/双接口）
+    data = await request_ranking_data(ctx, event_id)
     assert_and_reply(data, "获取榜线数据失败")
     logger.info(f"从API获取 {ctx.region}_{event_id} 最新榜线数据")
     return [r for r in await parse_rankings(ctx, event_id, data) if r.rank in query_ranks]

@@ -1,6 +1,8 @@
 server:
   host: 'x.x.x.x'
   port: 123456
+  # Prefer setting CHATROOM_RPC_TOKEN in .env
+  # token here is fallback only
   token: xxx
   log_url: "https://x.x.x.x/log"
   
