@@ -1,0 +1,163 @@
+.bar-line {
+    stroke: #4f83cc;
+    stroke-width: 4;
+}
+
+.bar-count-flag {
+    stroke: #5f8ee6;
+    stroke-width: 4;
+}
+
+.bar-count-text {
+    font-size: 12px;
+    font-weight: 900;
+    font-family: Avenir;
+    fill: #1f3558;
+    text-anchor: start;
+}
+
+.beat-line {
+    stroke: #9eb9de;
+    stroke-width: 1;
+}
+
+.lane-line {
+    stroke: #8aa8d1;
+    stroke-width: 1;
+}
+
+.event-flag {
+    stroke: #f59e0b;
+    stroke-width: 4;
+}
+
+.event-text {
+    font-size: 12px;
+    font-weight: 900;
+    font-family: Avenir;
+    fill: #b45309;
+    text-anchor: start;
+}
+
+.speed-line {
+    stroke: #0284c7;
+    stroke-width: 1;
+}
+
+.speed-text {
+    font-size: 12px;
+    font-family: Avenir;
+    fill: #075985;
+    text-anchor: end;
+}
+
+.lyric-text {
+    font-size: 12px;
+    font-family: "Hiragino Kaku Gothic Pro", Osaka, Meiryo, "MS PGothic", "Noto Sans CJK JP", sans-serif;
+    fill: #243b63;
+    text-anchor: start;
+}
+
+.slide {
+    fill: #34d39988;
+}
+
+.slide-critical {
+    fill: #fbbf2488;
+}
+
+.decoration {
+    fill: url(#decoration-gradient);
+}
+
+#decoration-gradient {
+    --color-start: #34d39966;
+    --color-stop: #34d39922;
+}
+
+.decoration-critical {
+    fill: url(#decoration-critical-gradient);
+}
+
+#decoration-critical-gradient {
+    --color-start: #fbbf2466;
+    --color-stop: #fbbf2422;
+}
+
+.tick-text {
+    font-size: 12px;
+    font-family: Avenir;
+    fill: #4b638a;
+    text-anchor: end;
+}
+
+.tick-line {
+    stroke: #8eaed8;
+    stroke-width: 1;
+}
+
+.meta-line {
+    stroke: #88a6d0;
+    stroke-width: 2;
+}
+
+.title {
+    font-size: 96px;
+    font-weight: 900;
+    font-family: "Hiragino Kaku Gothic Pro", Osaka, Meiryo, "MS PGothic", "Noto Sans CJK JP", sans-serif;
+    fill: #1f3761;
+    text-anchor: start;
+}
+
+.subtitle {
+    font-size: 48px;
+    font-weight: 700;
+    font-family: "Hiragino Kaku Gothic Pro", Osaka, Meiryo, "MS PGothic", "Noto Sans CJK JP", sans-serif;
+    fill: #35548b;
+    text-anchor: start;
+}
+
+.lane {
+    fill: #d7e6fb;
+}
+
+.background {
+    fill: #edf4ff;
+}
+
+.meta {
+    fill: #e3efff;
+}
+
+/* skill */
+
+.skill-duration {
+    fill: #ef444440;
+    stroke: #dc2626;
+    stroke-width: 1;
+}
+
+.skill-perfect {
+    fill: #a855f740;
+    stroke: #9333ea;
+    stroke-width: 1;
+}
+
+.skill-great {
+    fill: #f59e0b40;
+    stroke: #d97706;
+    stroke-width: 1;
+}
+
+.skill-score {
+    font-size: 38px;
+    font-family: Osaka;
+    fill: #1b3a65;
+    text-anchor: start;
+}
+
+.fever-duration {
+    fill: #0ea5e940;
+    stroke: #0284c7;
+    stroke-width: 1;
+}

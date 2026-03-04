@@ -721,7 +721,14 @@ async def compose_sk_image(ctx: SekaiHandlerContext, qtype: str, qval: Union[str
         case _:
             raise ReplyException(f"不支持的查询类型: {qtype}")
     
-    assert_and_reply(ret_ranks, f"找不到{format_sk_query_params(qtype, qval)}的榜线数据")
+    if not ret_ranks:
+        if qtype in ('self', 'uid'):
+            raise ReplyException(
+                f"找不到{format_sk_query_params(qtype, qval)}的榜线数据\n"
+                "说明：/sk 默认只查询当前快照内有记录的玩家（通常是 T100 和常见档线）\n"
+                "如果你不在快照里，请改用 /sk 1k、/sk 5k、/sk 1w 等档线查询"
+            )
+        raise ReplyException(f"找不到{format_sk_query_params(qtype, qval)}的榜线数据")
 
     # 查询单个
     if len(ret_ranks) == 1:
@@ -811,6 +818,12 @@ async def compose_cf_image(ctx: SekaiHandlerContext, qtype: str, qval: Union[str
     def calc(ranks: List[Ranking]) -> Dict[str, float]:
         if not ranks:
             return { 'status': 'no_found' }
+        if len(ranks) < 2:
+            return { 'status': 'no_enough' }
+
+        span_seconds = (ranks[-1].time - ranks[0].time).total_seconds()
+        if span_seconds <= 0:
+            return { 'status': 'no_enough' }
 
         pts = []
         abnormal = False
@@ -833,14 +846,16 @@ async def compose_cf_image(ctx: SekaiHandlerContext, qtype: str, qval: Union[str
             'cur_score': ranks[-1].score,
             'start_time': ranks[0].time,
             'end_time': ranks[-1].time,
-            'hour_speed': int((ranks[-1].score - ranks[0].score) / (ranks[-1].time - ranks[0].time).total_seconds() * 3600),
+            'hour_speed': int((ranks[-1].score - ranks[0].score) / span_seconds * 3600),
             'last_pt': pts[-1] if pts else 0,
             'avg_pt_n': min(10, len(pts)),
             'avg_pt': sum(pts[-min(10, len(pts)):]) / min(10, len(pts)) if pts else 0,
             'pts': pts,
         }
         if last_20min_rank := find_by_predicate(ranks, lambda x: x.time <= ranks[-1].time - timedelta(minutes=20), mode='last'):
-            ret['last_20min_speed'] = int((ranks[-1].score - last_20min_rank.score) / (ranks[-1].time - last_20min_rank.time).total_seconds() * 3600)
+            last_20min_seconds = (ranks[-1].time - last_20min_rank.time).total_seconds()
+            if last_20min_seconds > 0:
+                ret['last_20min_speed'] = int((ranks[-1].score - last_20min_rank.score) / last_20min_seconds * 3600)
         if prev_rank := find_prev_ranking(skl_ranks, ret['cur_rank']):
             ret['prev_score'] = prev_rank.score
             ret['prev_rank'] = prev_rank.rank
@@ -858,7 +873,7 @@ async def compose_cf_image(ctx: SekaiHandlerContext, qtype: str, qval: Union[str
         # 单个
         d = calc(ranks)
         assert_and_reply(d['status'] != 'no_found', f"找不到{format_sk_query_params(qtype, qval)}的榜线数据")
-        assert_and_reply(d['status'] != 'no_enough', f"{format_sk_query_params(qtype, qval)}的最近游玩次数少于1，无法查询")
+        assert_and_reply(d['status'] != 'no_enough', f"{format_sk_query_params(qtype, qval)}的最近榜线样本不足（可能刚换人或同一时间点记录），无法查询")
         texts.append((f"{d['name']}", style1_hr if check_ranking_is_high_res(ctx.region, ranks[-1]) else style1))
         texts.append((f"排名 {get_board_rank_str(d['cur_rank'])}  -  {get_board_score_str(d['cur_score'])}", style2))
         if 'prev_rank' in d:
@@ -885,7 +900,7 @@ async def compose_cf_image(ctx: SekaiHandlerContext, qtype: str, qval: Union[str
                 texts.append((f"找不到{format_sk_query_params('rank', qval[i])}的榜线数据", style1))
                 continue
             if d['status'] == 'no_enough':
-                texts.append((f"{format_sk_query_params('rank', qval[i])}的最近游玩次数少于1，无法查询", style1))
+                texts.append((f"{format_sk_query_params('rank', qval[i])}的最近榜线样本不足（可能刚换人或同一时间点记录），无法查询", style1))
                 continue
             texts.append((f"{d['name']}", style1_hr if check_ranking_is_high_res(ctx.region, d['last_rank_item']) else style1))
             texts.append((f"排名 {get_board_rank_str(d['cur_rank'])}  -  {get_board_score_str(d['cur_score'])}", style2))

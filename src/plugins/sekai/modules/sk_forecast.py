@@ -454,10 +454,17 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
-        for line in stdout.decode().splitlines():
-            logger.info(f"[Forecast] {line}")
+        output_lines = stdout.decode(errors='replace').splitlines()
+        output_text = "\n".join(output_lines)
         if proc.returncode != 0:
+            if "Not enough history profiles" in output_text:
+                logger.info("[Forecast] Not enough history profiles to perform forecasting.")
+                raise GetForecastException("本地预测历史样本不足（需要更多往期活动样本）")
+            for line in output_lines:
+                logger.info(f"[Forecast] {line}")
             raise Exception(f"returncode={proc.returncode}")
+        for line in output_lines:
+            logger.info(f"[Forecast] {line}")
         
         logger.info(f"本地预测完成")
         

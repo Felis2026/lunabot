@@ -609,6 +609,39 @@ def normalize_upload_time_inplace(data: dict, key: str='upload_time') -> dict:
         data[key] = ts_ms
     return data
 
+def is_aux_user_data_file(file_path: str) -> bool:
+    # Ignore helper artifacts like "<uid>.from_suite_api.*.json" when scanning user_data.
+    return ".from_suite_api." in os.path.basename(file_path).lower()
+
+def get_uid_from_user_data_file(file_path: str) -> str:
+    file_name = os.path.basename(file_path)
+    if ".from_suite_api." in file_name:
+        return file_name.split(".from_suite_api.", 1)[0]
+    return os.path.splitext(file_name)[0]
+
+def load_user_data_json_auto(file_path: str) -> dict:
+    with open(file_path, 'rb') as file:
+        raw = file.read()
+    # zstd frame magic: 28 B5 2F FD
+    if len(raw) >= 4 and raw[:4] == b'\x28\xb5\x2f\xfd':
+        return load_json_zstd(file_path)
+    # plain json (with/without UTF-8 BOM)
+    try:
+        return loads_json(raw)
+    except Exception:
+        return loads_json(raw.decode('utf-8-sig'))
+
+def get_user_data_local_source(file_path: str) -> str:
+    try:
+        data = load_user_data_json_auto(file_path)
+    except Exception as e:
+        logger.warning(f"读取用户抓包文件失败，已跳过: {file_path} ({get_exc_desc(e)})")
+        return "读取失败"
+    if not isinstance(data, dict):
+        logger.warning(f"用户抓包文件不是对象结构，已跳过: {file_path}")
+        return "未知"
+    return data.get('local_source', '未知')
+
 # 根据获取玩家详细信息，返回(profile, err_msg)
 async def get_detailed_profile(
     ctx: SekaiHandlerContext, 
@@ -1917,14 +1950,20 @@ async def _(ctx: HandlerContext):
                     uids.add(uid)
         qid_set.update(qids)
 
-        suites = glob.glob(config.get("suite_path").format(region=region))
+        suites = [
+            s for s in glob.glob(config.get("suite_path").format(region=region))
+            if os.path.isfile(s) and not is_aux_user_data_file(s)
+        ]
         if group_mode:
-            suites = [s for s in suites if s.split('/')[-1].split('.')[0] in uids]
+            suites = [s for s in suites if get_uid_from_user_data_file(s) in uids]
         suite_total += len(suites)
 
-        mysekais = glob.glob(config.get("mysekai_path").format(region=region))
+        mysekais = [
+            m for m in glob.glob(config.get("mysekai_path").format(region=region))
+            if os.path.isfile(m) and not is_aux_user_data_file(m)
+        ]
         if group_mode:
-            mysekais = [m for m in mysekais if m.split('/')[-1].split('.')[0] in uids]
+            mysekais = [m for m in mysekais if get_uid_from_user_data_file(m) in uids]
         mysekai_total += len(mysekais)
 
         msg += f"【{get_region_name(region)}】\n绑定 {len(qids)} | Suite {len(suites)} | MySekai {len(mysekais)}\n"
@@ -1934,12 +1973,12 @@ async def _(ctx: HandlerContext):
             mysekai_source_num: dict[str, int] = {}
             def get_detail():
                 for p in suites:
-                    local_source = load_json_zstd(p).get('local_source', '未知')
+                    local_source = get_user_data_local_source(p)
                     suite_source_num[local_source] = suite_source_num.get(local_source, 0) + 1
                 for k, v in suite_source_num.items():
                     suite_source_total[k] = suite_source_total.get(k, 0) + v
                 for p in mysekais:
-                    local_source = load_json_zstd(p).get('local_source', '未知')
+                    local_source = get_user_data_local_source(p)
                     mysekai_source_num[local_source] = mysekai_source_num.get(local_source, 0) + 1
                 for k, v in mysekai_source_num.items():
                     mysekai_source_total[k] = mysekai_source_total.get(k, 0) + v

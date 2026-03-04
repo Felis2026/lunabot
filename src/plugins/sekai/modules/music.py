@@ -19,6 +19,9 @@ from .event import extract_ban_event
 from .resbox import get_res_icon
 import rapidfuzz
 import pandas as pd
+import csv
+import io
+import math
 
 
 music_group_sub = SekaiGroupSubHelper("music", "新曲通知", ALL_SERVER_REGIONS)
@@ -641,6 +644,137 @@ async def search_music(ctx: SekaiHandlerContext, query: str, options: MusicSearc
 
 _music_constants: dict[tuple[int, str], float] = {}
 _music_constants_mtime: int = None
+MUSIC_CONSTANT_ALLOWED_DIFFS = {"easy", "normal", "hard", "expert", "master", "append"}
+MUSIC_CONSTANT_DIFF_ORDER = {
+    "easy": 0,
+    "normal": 1,
+    "hard": 2,
+    "expert": 3,
+    "master": 4,
+    "append": 5,
+}
+
+def reset_music_constants_cache():
+    global _music_constants, _music_constants_mtime
+    _music_constants = {}
+    _music_constants_mtime = None
+
+def get_music_constant_source_urls() -> tuple[str, str]:
+    base_url = (config.get('music.constant.base_url', "", raise_exc=False) or "").strip()
+    override_url = (config.get('music.constant.override_url', "", raise_exc=False) or "").strip()
+    if not base_url or not override_url:
+        raise ReplyException(
+            "定数源URL未配置。\n"
+            "请在 config/sekai/sekai.yaml 的 music.constant 下新增并填写以下字段：\n"
+            "- base_url\n"
+            "- override_url\n"
+            "可参考：example_config/sekai/sekai.yaml"
+        )
+    return base_url, override_url
+
+async def download_music_constant_csv_text(url: str) -> str:
+    headers = {
+        'Accept-Language': 'en',
+    }
+    async with get_client_session().get(url, headers=headers, verify_ssl=False) as resp:
+        if resp.status != 200:
+            detail = ""
+            try:
+                detail = (await resp.text()).strip()
+            except:
+                detail = ""
+            detail = truncate(detail.replace("\n", " "), 200)
+            raise Exception(f"{resp.status} {resp.reason} {detail}".strip())
+        return await resp.text(encoding='utf-8')
+
+def parse_music_constant_csv(content: str, source_name: str) -> tuple[dict[tuple[int, str], float], dict]:
+    reader = csv.DictReader(io.StringIO(content))
+    fieldnames = set(reader.fieldnames or [])
+    required_fields = {"Song ID", "Difficulty", "Constant"}
+    missing = required_fields - fieldnames
+    if missing:
+        raise Exception(f"{source_name} 缺少字段: {', '.join(sorted(missing))}")
+    
+    data: dict[tuple[int, str], float] = {}
+    rows_total = 0
+    valid_rows = 0
+    skipped_rows = 0
+    fallback_rows = 0
+
+    for row_no, row in enumerate(reader, start=2):
+        rows_total += 1
+
+        raw_sid = str((row.get("Song ID") or "")).strip()
+        raw_diff = str((row.get("Difficulty") or "")).strip()
+        raw_const = str((row.get("Constant") or "")).strip()
+
+        if not raw_sid or not raw_diff or not raw_const:
+            skipped_rows += 1
+            continue
+
+        try:
+            if "." in raw_sid:
+                sid_float = float(raw_sid)
+                if not sid_float.is_integer():
+                    raise ValueError(raw_sid)
+                sid = int(sid_float)
+            else:
+                sid = int(raw_sid)
+        except:
+            skipped_rows += 1
+            logger.warning(f"{source_name} 第{row_no}行 Song ID 无效，已跳过: {raw_sid}")
+            continue
+
+        try:
+            constant = float(raw_const)
+            if not math.isfinite(constant):
+                raise ValueError(raw_const)
+        except:
+            skipped_rows += 1
+            logger.warning(f"{source_name} 第{row_no}行 Constant 无效，已跳过: {raw_const}")
+            continue
+
+        diff = raw_diff.lower()
+        if diff not in MUSIC_CONSTANT_ALLOWED_DIFFS:
+            logger.warning(f"{source_name} 第{row_no}行 Difficulty 异常({raw_diff})，按 master 处理")
+            diff = "master"
+            fallback_rows += 1
+
+        data[(sid, diff)] = constant
+        valid_rows += 1
+
+    stats = {
+        "rows_total": rows_total,
+        "valid_rows": valid_rows,
+        "skipped_rows": skipped_rows,
+        "fallback_rows": fallback_rows,
+    }
+    return data, stats
+
+def merge_music_constants(
+    base_data: dict[tuple[int, str], float],
+    override_data: dict[tuple[int, str], float],
+) -> tuple[dict[tuple[int, str], float], int]:
+    merged = dict(base_data)
+    override_count = 0
+    for key, value in override_data.items():
+        if key in merged:
+            override_count += 1
+        merged[key] = value
+    return merged, override_count
+
+def write_music_constants_csv_atomic(csv_path: str, data: dict[tuple[int, str], float]):
+    create_parent_folder(csv_path)
+    tmp_path = csv_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "difficulty", "constant"])
+        for (sid, diff), constant in sorted(
+            data.items(),
+            key=lambda item: (item[0][0], MUSIC_CONSTANT_DIFF_ORDER.get(item[0][1], 99)),
+        ):
+            writer.writerow([sid, diff, f"{constant:g}"])
+    os.replace(tmp_path, csv_path)
 
 # 获取定数表
 def get_music_constants() -> dict[tuple[int, str], float]:
@@ -2262,6 +2396,59 @@ async def _(ctx: HandlerContext):
     await ctx.asend_reply_msg("开始同步歌曲别名...")
     await sync_music_alias()
     await ctx.asend_reply_msg("同步完成")
+
+# 手动更新定数表（无定时任务）
+pjsk_update_music_constant = SekaiCmdHandler([
+    "/定数更新",
+    "/pjsk 定数更新",
+    "/update music constant",
+    "/update_music_constant",
+])
+pjsk_update_music_constant.check_cdrate(cd).check_wblist(gbl).check_superuser()
+@pjsk_update_music_constant.handle()
+async def _(ctx: SekaiHandlerContext):
+    await ctx.block(timeout=0)
+
+    csv_path = config.get('music.constant.csv_path')
+    assert_and_reply(csv_path, "未配置 music.constant.csv_path，无法更新定数表")
+    base_url, override_url = get_music_constant_source_urls()
+
+    await ctx.asend_reply_msg("开始更新定数表，请稍候...")
+
+    try:
+        base_text = await download_music_constant_csv_text(base_url)
+        override_text = await download_music_constant_csv_text(override_url)
+
+        base_data, base_stats = parse_music_constant_csv(base_text, "base")
+        override_data, override_stats = parse_music_constant_csv(override_text, "override")
+        merged_data, override_count = merge_music_constants(base_data, override_data)
+
+        write_music_constants_csv_atomic(csv_path, merged_data)
+
+        reset_music_constants_cache()
+        loaded_count = None
+        load_err = None
+        try:
+            loaded_count = len(get_music_constants())
+        except Exception as e:
+            load_err = get_exc_desc(e)
+
+        msg = (
+            "定数更新完成\n"
+            f"base: 行数 {base_stats['rows_total']} | 有效 {base_stats['valid_rows']} | 跳过 {base_stats['skipped_rows']} | fallback-master {base_stats['fallback_rows']}\n"
+            f"override: 行数 {override_stats['rows_total']} | 有效 {override_stats['valid_rows']} | 跳过 {override_stats['skipped_rows']} | fallback-master {override_stats['fallback_rows']}\n"
+            f"合并结果: 最终记录 {len(merged_data)} | 覆盖 {override_count}"
+        )
+        if loaded_count is not None:
+            msg += f"\n已热加载 {loaded_count} 条定数记录"
+        elif load_err:
+            msg += f"\n文件已更新，但热加载失败: {load_err}"
+
+        return await ctx.asend_reply_msg(msg)
+
+    except Exception as e:
+        logger.print_exc("更新定数表失败")
+        return await ctx.asend_reply_msg(f"定数更新失败: {get_exc_desc(e)}\n旧定数文件未被破坏")
 
 
 # 歌曲奖励

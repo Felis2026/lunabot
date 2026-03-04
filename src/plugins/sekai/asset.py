@@ -826,6 +826,27 @@ class RegionRipAssetManger:
         self.cache_dir = pjoin(DEFAULT_RIP_ASSET_DIR, region)
         self.cached_images: Dict[str, Image.Image] = {}
         create_folder(self.cache_dir)
+
+    def _iter_local_cache_paths(self, path: str) -> List[str]:
+        candidates: List[str] = [path]
+
+        # _rip -> 非 _rip
+        if "_rip/" in path:
+            alt_path = path.replace("_rip/", "/")
+            if alt_path not in candidates:
+                candidates.append(alt_path)
+
+        # 非 _rip -> _rip（仅处理最后一层目录，适配 xxx/dir/file 与 xxx/dir_rip/file）
+        parts = path.split("/")
+        if len(parts) >= 2:
+            parent = parts[-2]
+            if not parent.endswith("_rip"):
+                alt_parent = parent + "_rip"
+                alt_path = "/".join(parts[:-2] + [alt_parent, parts[-1]])
+                if alt_path not in candidates:
+                    candidates.append(alt_path)
+
+        return candidates
     
     @classmethod
     def get(cls, region: str) -> "RegionRipAssetManger":
@@ -872,14 +893,17 @@ class RegionRipAssetManger:
         cache_path = pjoin(self.cache_dir, path)
         # 首先尝试从缓存加载
         if use_cache:
-            try:
-                assert os.path.exists(cache_path)
-                if cache_expire_secs is not None:
-                    assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
-                with open(cache_path, "rb") as f:
-                    return f.read()
-            except:
-                pass
+            for cache_rel_path in self._iter_local_cache_paths(path):
+                cache_path = pjoin(self.cache_dir, cache_rel_path)
+                try:
+                    assert os.path.exists(cache_path)
+                    if cache_expire_secs is not None:
+                        assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
+                    with open(cache_path, "rb") as f:
+                        return f.read()
+                except:
+                    pass
+            cache_path = pjoin(self.cache_dir, path)
         
         # 尝试从网络下载
         error_list: List[Tuple[str, str]] = []
@@ -932,13 +956,16 @@ class RegionRipAssetManger:
         """
         cache_path = pjoin(self.cache_dir, path)
         # 首先尝试从缓存加载
-        try:
-            assert os.path.exists(cache_path)
-            if cache_expire_secs is not None:
-                assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
-            return cache_path
-        except:
-            pass
+        for cache_rel_path in self._iter_local_cache_paths(path):
+            cache_path = pjoin(self.cache_dir, cache_rel_path)
+            try:
+                assert os.path.exists(cache_path)
+                if cache_expire_secs is not None:
+                    assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
+                return cache_path
+            except:
+                pass
+        cache_path = pjoin(self.cache_dir, path)
         
         # 尝试从网络下载
         error_list: List[Tuple[str, str]] = []

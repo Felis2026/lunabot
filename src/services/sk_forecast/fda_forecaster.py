@@ -22,7 +22,8 @@ class FDAForecaster:
         
         # 重采样到1小时粒度
         data.index = pd.to_timedelta(data['from_start_hour'], unit='h')
-        resampled = data.resample('1H').agg({
+        # pandas 2.2+ recommends lowercase offset aliases; uppercase may fail on newer versions.
+        resampled = data.resample('1h').agg({
             'score': 'max',
             'to_end_hour': 'mean',
             'date': 'first'

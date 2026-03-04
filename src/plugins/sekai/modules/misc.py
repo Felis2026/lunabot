@@ -98,7 +98,6 @@ async def _(ctx: SekaiHandlerContext):
             rarity = card['cardRarityType']
             attr = card['attr']
             assetbundle_name = card['assetbundleName']
-            img_dir = 'data/sekai/assets/rip/jp/thumbnail/chara_rip'
             if not only_has_after_training(card):
                 normal_path = await ctx.rip.get_asset_cache_path(f'thumbnail/chara_rip/{assetbundle_name}_normal.png')
                 if normal_path:
@@ -107,7 +106,7 @@ async def _(ctx: SekaiHandlerContext):
                         rarity=rarity,
                         attr=attr,
                         is_aftertraining=False,
-                        img_path=os.path.join(img_dir, f"{assetbundle_name}_normal.png"),
+                        img_path=normal_path,
                     ))
             if has_after_training(card):
                 aftertraining_path = await ctx.rip.get_asset_cache_path(f'thumbnail/chara_rip/{assetbundle_name}_after_training.png')
@@ -117,7 +116,7 @@ async def _(ctx: SekaiHandlerContext):
                         rarity=rarity,
                         attr=attr,
                         is_aftertraining=True,
-                        img_path=os.path.join(img_dir, f"{assetbundle_name}_after_training.png"),
+                        img_path=aftertraining_path,
                     ))
         t = datetime.now()
         await run_in_pool(card_extractor.init, card_thumbs)

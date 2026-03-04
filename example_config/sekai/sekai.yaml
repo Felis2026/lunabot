@@ -251,5 +251,8 @@ music:
   constant:
     enabled: true # 禁用后使用相关功能会直接提示不可用
     csv_path: ""  # 歌曲定数csv路径，需包含 id,difficulty,constant 三列
+    # 新增字段：请自行填写定数源URL，否则 /定数更新 会提示未配置
+    base_url: ""
+    override_url: ""
     info_text: |
       该bot的定数表未配置

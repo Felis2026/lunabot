@@ -27,6 +27,13 @@ from ..common.config import *
 from ..common.process_pool import *
 from .img_utils import adjust_image_alpha_inplace
 
+try:
+    from ...private.felis_local_emoji_source import LocalThenRemoteEmojiSource
+except Exception:
+    LocalThenRemoteEmojiSource = None
+
+EMOJI_SOURCE_CLS = LocalThenRemoteEmojiSource or GoogleEmojiSource
+
 
 def debug_print(*args, **kwargs):
     if global_config.get('painter.debug', False):
@@ -669,16 +676,22 @@ class Painter:
             pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
             draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         else:
-            with Pilmoji(self.img, source=GoogleEmojiSource) as pilmoji:
-                text_offset = (0, -std_size[1])
-                offset = global_config.get('painter.emoji.offset')
-                scale = global_config.get('painter.emoji.scale')
-                offset = (int(offset[0] * std_size[1] / 32), int(offset[1] * std_size[1] / 32) - std_size[1])
-                pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
-                pilmoji.text(
-                    pos, text, font=font, fill=fill, align=align, 
-                    emoji_position_offset=offset, emoji_scale_factor=scale,
-                    anchor='ls')
+            text_offset = (0, -std_size[1])
+            offset = global_config.get('painter.emoji.offset')
+            scale = global_config.get('painter.emoji.scale')
+            offset = (int(offset[0] * std_size[1] / 32), int(offset[1] * std_size[1] / 32) - std_size[1])
+            pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
+            try:
+                with Pilmoji(self.img, source=EMOJI_SOURCE_CLS) as pilmoji:
+                    pilmoji.text(
+                        pos, text, font=font, fill=fill, align=align,
+                        emoji_position_offset=offset, emoji_scale_factor=scale,
+                        anchor='ls')
+            except Exception as e:
+                # Keep drawing path available even if emoji source fails.
+                debug_print(f"pilmoji failed, fallback to plain text: {e}")
+                draw = ImageDraw.Draw(self.img)
+                draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         return self
     
     def _get_aa_roundrect(
