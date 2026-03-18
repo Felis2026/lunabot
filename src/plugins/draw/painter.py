@@ -3,14 +3,11 @@ from PIL import Image, ImageFont, ImageDraw, ImageFilter, ImageChops
 from PIL.ImageFont import ImageFont as Font
 from dataclasses import dataclass, is_dataclass, fields
 import os
+import emoji
 import emoji.unicode_codes
 import numpy as np
 from copy import deepcopy
 import math
-from pilmoji import Pilmoji
-from pilmoji import getsize as getsize_emoji
-from pilmoji.source import GoogleEmojiSource
-import emoji
 from datetime import datetime, timedelta
 import asyncio
 from typing import get_type_hints
@@ -23,6 +20,31 @@ import io
 import colour
 import struct
 
+
+_original_get_emoji_unicode_dict = getattr(emoji.unicode_codes, 'get_emoji_unicode_dict', None)
+_emoji_status = getattr(emoji, 'STATUS', {})
+_fully_qualified_emoji_status = _emoji_status.get('fully_qualified') if isinstance(_emoji_status, dict) else None
+
+
+def _get_emoji_unicode_dict_compat(lang: str = 'en'):
+    if lang != 'en' and _original_get_emoji_unicode_dict is not None:
+        return _original_get_emoji_unicode_dict(lang)
+    return {
+        data[lang]: emj
+        for emj, data in emoji.EMOJI_DATA.items()
+        if lang in data and (
+            _fully_qualified_emoji_status is None
+            or data.get('status', _fully_qualified_emoji_status) <= _fully_qualified_emoji_status
+        )
+    }
+
+
+emoji.unicode_codes.get_emoji_unicode_dict = _get_emoji_unicode_dict_compat
+
+from pilmoji import Pilmoji
+from pilmoji import getsize as getsize_emoji
+from pilmoji.source import GoogleEmojiSource
+
 from ..common.config import *
 from ..common.process_pool import *
 from .img_utils import adjust_image_alpha_inplace
@@ -33,6 +55,22 @@ except Exception:
     LocalThenRemoteEmojiSource = None
 
 EMOJI_SOURCE_CLS = LocalThenRemoteEmojiSource or GoogleEmojiSource
+_painter_pool: Optional[ProcessPool] = None
+_painter_pool_disabled = False
+
+
+def _get_painter_pool() -> Optional[ProcessPool]:
+    global _painter_pool, _painter_pool_disabled
+    if PAINTER_PROCESS_NUM <= 0 or not is_main_process() or _painter_pool_disabled:
+        return None
+    if _painter_pool is None:
+        try:
+            _painter_pool = ProcessPool(PAINTER_PROCESS_NUM, name='draw')
+        except Exception as e:
+            _painter_pool_disabled = True
+            print(f"[WARNING] 绘图进程池初始化失败，将回退到线程执行: {e}", flush=True)
+            return None
+    return _painter_pool
 
 
 def debug_print(*args, **kwargs):
@@ -849,9 +887,16 @@ class Painter:
         # 执行绘图操作
         t = datetime.now()
 
-        if PAINTER_PROCESS_NUM > 0:
-            global _painter_pool
-            self.img = await _painter_pool.submit(Painter._execute, self.operations, self.img, self.size, image_dict)
+        pool = _get_painter_pool()
+        if pool is not None:
+            try:
+                self.img = await pool.submit(Painter._execute, self.operations, self.img, self.size, image_dict)
+            except Exception as e:
+                global _painter_pool, _painter_pool_disabled
+                _painter_pool = None
+                _painter_pool_disabled = True
+                print(f"[WARNING] 绘图进程池执行失败，将回退到线程执行: {e}", flush=True)
+                self.img = await asyncio.to_thread(Painter._execute, self.operations, self.img, self.size, image_dict)
         else:
             self.img = await asyncio.to_thread(Painter._execute, self.operations, self.img, self.size, image_dict)
 
@@ -1683,8 +1728,3 @@ class Painter:
         rand_tri(int(100 * dense_factor), (100 * size_factor, 16 * size_factor))
 
         self.img.paste(bg, self.offset)
-
-
-if PAINTER_PROCESS_NUM > 0 and is_main_process():
-    _painter_pool: ProcessPool = ProcessPool(PAINTER_PROCESS_NUM, name='draw')
-

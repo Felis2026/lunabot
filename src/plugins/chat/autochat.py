@@ -8,6 +8,17 @@ config = Config('chat.autochat')
 logger = get_logger("Chat")
 file_db = get_file_db("data/chat/db.json", logger)
 
+JSON_RESTRAINT_TYPE_MAP = {
+    'str': str,
+    'int': int,
+    'float': float,
+    'bool': bool,
+    'list': list,
+    'dict': dict,
+    'tuple': tuple,
+    'NoneType': type(None),
+}
+
 chat_gwl = get_group_white_list(file_db, logger, 'chat')
 autochat_gwl = get_group_white_list(file_db, logger, 'autochat', is_service=False)
 
@@ -141,8 +152,14 @@ async def handle_query_llm(cid: str, model: str | list[str], text: str, images: 
                 if k not in value:
                     raise Exception(f"回复的json缺少字段: {restraint['key']}")
                 value = value[k]
-            if dtypes and not any(isinstance(value, eval(dt)) for dt in dtypes):
-                raise Exception(f"字段 {restraint['key']} 类型错误，期望类型: {dtypes}")
+            if dtypes:
+                expected_types = []
+                for dt in dtypes:
+                    if dt not in JSON_RESTRAINT_TYPE_MAP:
+                        raise Exception(f"字段 {restraint['key']} 包含不支持的类型约束: {dt}")
+                    expected_types.append(JSON_RESTRAINT_TYPE_MAP[dt])
+                if not isinstance(value, tuple(expected_types)):
+                    raise Exception(f"字段 {restraint['key']} 类型错误，期望类型: {dtypes}")
             if isinstance(value, (str, list)):
                 if min_length and len(value) < min_length:
                     raise Exception(f"字段 {restraint['key']} 长度过短，最小长度: {min_length}")

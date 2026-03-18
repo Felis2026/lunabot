@@ -107,6 +107,7 @@ class ApiProviderManager:
         if not provider_name:
             res: List[Tuple[ApiProvider, LlmModel]] = []
             for provider in self.providers:
+                provider.update_models()
                 for model in provider.models:
                     if model.name == model_name:
                         res.append((provider, model))

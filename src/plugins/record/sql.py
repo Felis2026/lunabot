@@ -83,6 +83,12 @@ async def insert_msgs(msgs: list):
     await conn.commit()
 
 
+async def rollback_conn():
+    global _conn
+    if _conn is not None:
+        await _conn.rollback()
+
+
 # 消息表row转换为返回值
 def msg_row_to_ret(row):
     return {

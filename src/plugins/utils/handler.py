@@ -19,6 +19,7 @@ from nonebot.adapters.onebot.v11.message import MessageSegment, Message
 import nonebot.adapters.onebot.v11.bot as bot_module
 from argparse import ArgumentParser
 import requests
+from .control_plane import register_group_toggle
 
 
 SUPERUSER_CFG = global_config.item('superuser')
@@ -1505,37 +1506,24 @@ class GroupWhiteList:
                 group_desc = f'本群'
             return int(group_id), group_desc
 
-        # 开启命令
         switch_on = CmdHandler([f'/{name} on'], utils_logger, help_command='/{服务名} on')
         switch_on.check_superuser(superuser)
         @switch_on.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            white_list = db.get(self.white_list_name, [])
-            if group_id in white_list:
+            if not await self.aadd(group_id):
                 return await ctx.asend_reply_msg(f'{group_desc}的{name}已经是开启状态')
-            white_list.append(group_id)
-            db.set(self.white_list_name, white_list)
-            if self.on_func is not None: 
-                await self.on_func(ctx.group_id)
             return await ctx.asend_reply_msg(f'成功开启{group_desc}的{name}')
         
-        # 关闭命令
         switch_off = CmdHandler([f'/{name} off'], utils_logger, help_command='/{服务名} off')
         switch_off.check_superuser(superuser)
         @switch_off.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            white_list = db.get(self.white_list_name, [])
-            if group_id not in white_list:
+            if not await self.aremove(group_id):
                 return await ctx.asend_reply_msg(f'{group_desc}的{name}已经是关闭状态')
-            white_list.remove(group_id)
-            db.set(self.white_list_name, white_list)
-            if self.off_func is not None:  
-                await self.off_func(ctx.group_id)
             return await ctx.asend_reply_msg(f'成功关闭{group_desc}的{name}')
             
-        # 查询命令
         switch_query = CmdHandler([f'/{name} status'], utils_logger, help_command='/{服务名} status')
         @switch_query.handle()
         async def _(ctx: HandlerContext):
@@ -1558,37 +1546,72 @@ class GroupWhiteList:
                 if gid not in current_groups:
                     self.remove(gid)
 
-            
     def get(self) -> List[int]:
         """
         获取白名单群id列表
         """
         return self.db.get(self.white_list_name, [])
-    
-    def add(self, group_id: int) -> bool:
-        """
-        添加群到白名单，返回是否成功添加
-        """
+
+    def _run_side_effect_nowait(self, func, group_id: int):
+        if func is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.logger.warning(f'{self.white_list_name} 在无事件循环环境中跳过异步副作用 group_id={group_id}')
+            return
+        loop.create_task(call_common_or_async(func, int(group_id)))
+
+    async def aadd(self, group_id: int) -> bool:
+        group_id = int(group_id)
         white_list = self.db.get(self.white_list_name, [])
         if group_id in white_list:
             return False
         white_list.append(group_id)
         self.db.set(self.white_list_name, white_list)
         self.logger.info(f'添加群 {group_id} 到 {self.white_list_name}')
-        if self.on_func is not None: self.on_func(group_id)
+        if self.on_func is not None:
+            await call_common_or_async(self.on_func, group_id)
         return True
-    
-    def remove(self, group_id: int) -> bool:
-        """
-        从白名单移除群，返回是否成功移除
-        """
+
+    async def aremove(self, group_id: int) -> bool:
+        group_id = int(group_id)
         white_list = self.db.get(self.white_list_name, [])
         if group_id not in white_list:
             return False
         white_list.remove(group_id)
         self.db.set(self.white_list_name, white_list)
         self.logger.info(f'从 {self.white_list_name} 删除群 {group_id}')
-        if self.off_func is not None: self.off_func(group_id)
+        if self.off_func is not None:
+            await call_common_or_async(self.off_func, group_id)
+        return True
+    
+    def add(self, group_id: int) -> bool:
+        """
+        添加群到白名单，返回是否成功添加
+        """
+        group_id = int(group_id)
+        white_list = self.db.get(self.white_list_name, [])
+        if group_id in white_list:
+            return False
+        white_list.append(group_id)
+        self.db.set(self.white_list_name, white_list)
+        self.logger.info(f'添加群 {group_id} 到 {self.white_list_name}')
+        self._run_side_effect_nowait(self.on_func, group_id)
+        return True
+    
+    def remove(self, group_id: int) -> bool:
+        """
+        从白名单移除群，返回是否成功移除
+        """
+        group_id = int(group_id)
+        white_list = self.db.get(self.white_list_name, [])
+        if group_id not in white_list:
+            return False
+        white_list.remove(group_id)
+        self.db.set(self.white_list_name, white_list)
+        self.logger.info(f'从 {self.white_list_name} 删除群 {group_id}')
+        self._run_side_effect_nowait(self.off_func, group_id)
         return True
             
     def check_id(self, group_id: int) -> bool:
@@ -1596,8 +1619,7 @@ class GroupWhiteList:
         检查群id是否在白名单中
         """
         white_list = self.db.get(self.white_list_name, [])
-        # self.logger.debug(f'白名单{self.white_list_name}检查{group_id}: {"允许通过" if group_id in white_list else "不允许通过"}')
-        return group_id in white_list
+        return int(group_id) in white_list
 
     def check(self, event: MessageEvent, allow_private=False, allow_super=True) -> bool:
         """
@@ -1605,10 +1627,8 @@ class GroupWhiteList:
         """
         if is_group_msg(event):
             if allow_super and check_superuser(event, self.superuser): 
-                # self.logger.debug(f'白名单{self.white_list_name}检查: 允许超级用户{event.user_id}')
                 return True
             return self.check_id(event.group_id)
-        # self.logger.debug(f'白名单{self.white_list_name}检查: {"允许私聊" if allow_private else "不允许私聊"}')
         return allow_private
     
 class GroupBlackList:
@@ -1643,37 +1663,24 @@ class GroupBlackList:
                 group_desc = f'本群'
             return int(group_id), group_desc
 
-        # 关闭命令
         switch_off = CmdHandler([f'/{name} off'], utils_logger, help_command='/{服务名} off')
         switch_off.check_superuser(superuser)
         @switch_off.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            black_list = db.get(self.black_list_name, [])
-            if group_id in black_list:
+            if not await self.aadd(group_id):
                 return await ctx.asend_reply_msg(f'成功关闭{group_desc}的{name}')
-            black_list.append(group_id)
-            db.set(self.black_list_name, black_list)
-            if self.off_func is not None: 
-                await self.off_func(ctx.group_id)
             return await ctx.asend_reply_msg(f'{group_desc}的{name}已关闭')
         
-        # 开启命令
         switch_on = CmdHandler([f'/{name} on'], utils_logger, help_command='/{服务名} on')
         switch_on.check_superuser(superuser)
         @switch_on.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            black_list = db.get(self.black_list_name, [])
-            if group_id not in black_list:
+            if not await self.aremove(group_id):
                 return await ctx.asend_reply_msg(f'成功开启{group_desc}的{name}')
-            black_list.remove(group_id)
-            db.set(self.black_list_name, black_list)
-            if self.on_func is not None: 
-                await self.on_func(ctx.group_id)
             return await ctx.asend_reply_msg(f'{group_desc}的{name}已开启')
             
-        # 查询命令
         switch_query = CmdHandler([f'/{name} status'], utils_logger, help_command='/{服务名} status')
         @switch_query.handle()
         async def _(ctx: HandlerContext):
@@ -1701,31 +1708,67 @@ class GroupBlackList:
         获取黑名单群id列表
         """
         return self.db.get(self.black_list_name, [])
-    
-    def add(self, group_id: int) -> bool:
-        """
-        添加群到黑名单，返回是否成功添加
-        """
+
+    def _run_side_effect_nowait(self, func, group_id: int):
+        if func is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.logger.warning(f'{self.black_list_name} 在无事件循环环境中跳过异步副作用 group_id={group_id}')
+            return
+        loop.create_task(call_common_or_async(func, int(group_id)))
+
+    async def aadd(self, group_id: int) -> bool:
+        group_id = int(group_id)
         black_list = self.db.get(self.black_list_name, [])
         if group_id in black_list:
             return False
         black_list.append(group_id)
         self.db.set(self.black_list_name, black_list)
         self.logger.info(f'添加群 {group_id} 到 {self.black_list_name}')
-        if self.off_func is not None: self.off_func(group_id)
+        if self.off_func is not None:
+            await call_common_or_async(self.off_func, group_id)
         return True
-    
-    def remove(self, group_id: int) -> bool:
-        """
-        从黑名单移除群，返回是否成功移除
-        """
+
+    async def aremove(self, group_id: int) -> bool:
+        group_id = int(group_id)
         black_list = self.db.get(self.black_list_name, [])
         if group_id not in black_list:
             return False
         black_list.remove(group_id)
         self.db.set(self.black_list_name, black_list)
         self.logger.info(f'从 {self.black_list_name} 删除群 {group_id}')
-        if self.on_func is not None: self.on_func(group_id)
+        if self.on_func is not None:
+            await call_common_or_async(self.on_func, group_id)
+        return True
+    
+    def add(self, group_id: int) -> bool:
+        """
+        添加群到黑名单，返回是否成功添加
+        """
+        group_id = int(group_id)
+        black_list = self.db.get(self.black_list_name, [])
+        if group_id in black_list:
+            return False
+        black_list.append(group_id)
+        self.db.set(self.black_list_name, black_list)
+        self.logger.info(f'添加群 {group_id} 到 {self.black_list_name}')
+        self._run_side_effect_nowait(self.off_func, group_id)
+        return True
+    
+    def remove(self, group_id: int) -> bool:
+        """
+        从黑名单移除群，返回是否成功移除
+        """
+        group_id = int(group_id)
+        black_list = self.db.get(self.black_list_name, [])
+        if group_id not in black_list:
+            return False
+        black_list.remove(group_id)
+        self.db.set(self.black_list_name, black_list)
+        self.logger.info(f'从 {self.black_list_name} 删除群 {group_id}')
+        self._run_side_effect_nowait(self.on_func, group_id)
         return True
     
     def check_id(self, group_id) -> bool:
@@ -1733,8 +1776,7 @@ class GroupBlackList:
         检查群id是否不在黑名单中
         """
         black_list = self.db.get(self.black_list_name, [])
-        # self.logger.debug(f'黑名单{self.black_list_name}检查{group_id}: {"允许通过" if group_id not in black_list else "不允许通过"}')
-        return group_id not in black_list
+        return int(group_id) not in black_list
     
     def check(self, event, allow_private=False, allow_super=True) -> bool:
         """
@@ -1744,9 +1786,7 @@ class GroupBlackList:
             if allow_super and check_superuser(event, self.superuser): 
                 self.logger.debug(f'黑名单{self.black_list_name}检查: 允许超级用户{event.user_id}')
                 return True
-            # self.logger.debug(f'黑名单{self.black_list_name}检查: {"允许通过" if self.check_id(event.group_id) else "不允许通过"}')
             return self.check_id(event.group_id)
-        # self.logger.debug(f'黑名单{self.black_list_name}检查: {"允许私聊" if allow_private else "不允许私聊"}')
         return allow_private
     
 
@@ -1764,8 +1804,11 @@ def get_group_white_list(
         global _gwls
         if name not in _gwls:
             _gwls[name] = GroupWhiteList(db, logger, name, superuser, on_func, off_func)
-        return _gwls[name]
-    return GroupWhiteList(db, logger, name, superuser, on_func, off_func)
+        toggle = _gwls[name]
+    else:
+        toggle = GroupWhiteList(db, logger, name, superuser, on_func, off_func)
+    register_group_toggle(toggle, name=name, mode='whitelist', is_service=is_service, db_key=toggle.white_list_name)
+    return toggle
 
 _gbls: Dict[str, GroupBlackList] = {}
 def get_group_black_list(
@@ -1781,8 +1824,11 @@ def get_group_black_list(
         global _gbls
         if name not in _gbls:
             _gbls[name] = GroupBlackList(db, logger, name, superuser, on_func, off_func)
-        return _gbls[name]
-    return GroupBlackList(db, logger, name, superuser, on_func, off_func)
+        toggle = _gbls[name]
+    else:
+        toggle = GroupBlackList(db, logger, name, superuser, on_func, off_func)
+    register_group_toggle(toggle, name=name, mode='blacklist', is_service=is_service, db_key=toggle.black_list_name)
+    return toggle
 
 
 
@@ -2869,4 +2915,5 @@ async def _(ctx: HandlerContext):
 
     except Exception as e:
         await ctx.asend_fold_msg_adaptive(f"执行代码失败\n{traceback.format_exc()}")
+
 

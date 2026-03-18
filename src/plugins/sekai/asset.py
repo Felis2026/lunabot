@@ -9,8 +9,16 @@ ASSET_DEBUG_CFG = asset_config.item('debug')
 
 DEFAULT_VERSION = "0.0.0.0"
 MASTER_DB_CACHE_DIR = f"{SEKAI_ASSET_DIR}/masterdata/"
+# compact 区服的 costume3ds 可能缺少 assetbundleName，
+# 这里使用独立的 sidecar 补丁目录持久化补全结果，不改写上游原始 masterdata 文件。
+MASTER_DB_PATCH_DIR = f"{SEKAI_ASSET_DIR}/masterdata_patch/"
 DEFAULT_INDEX_KEYS = ['id']
 DEFAULT_SORT_KEYS = []
+
+# 运行期缓存：按区服缓存 costume3ds 资源名补丁，避免重复读取和重复生成。
+_costume3ds_asset_patch_cache: Dict[str, Dict[int, str]] = {}
+_costume3ds_asset_patch_meta: Dict[str, Tuple[str, str]] = {}
+_costume3ds_asset_patch_lock = threading.Lock()
 
 def get_multi_keys(data: dict, keys: List[Any]):
     for key in keys:
@@ -20,6 +28,130 @@ def get_multi_keys(data: dict, keys: List[Any]):
 
 def get_version_order(version: str) -> tuple:
     return tuple(map(int, version.split(".")))
+
+def get_masterdata_cache_version(region: str, name: str) -> str:
+    return file_db.get_copy("master_data_cache_versions", {}).get(region, {}).get(name, DEFAULT_VERSION)
+
+def get_masterdata_cache_path(region: str, name: str) -> str:
+    return pjoin(MASTER_DB_CACHE_DIR, region, f"{name}.json")
+
+def get_masterdata_patch_path(region: str, name: str) -> str:
+    return pjoin(MASTER_DB_PATCH_DIR, region, f"{name}.json")
+
+def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
+    # 为 compact 区服生成 costume3ds 的资源名补丁：
+    # 仅对本区服缺少 assetbundleName 的条目，尝试用 JP 同 id 的资源名补齐。
+    region_path = get_masterdata_cache_path(region, "costume3ds")
+    jp_path = get_masterdata_cache_path("jp", "costume3ds")
+    if not os.path.exists(region_path):
+        logger.warning(f"MasterData [{region}.costume3ds] 补丁生成失败: 区服数据不存在")
+        return {}
+    if not os.path.exists(jp_path):
+        logger.warning(f"MasterData [{region}.costume3ds] 补丁生成失败: JP 数据不存在")
+        return {}
+
+    region_costume3ds = load_json(region_path)
+    jp_costume3ds = load_json(jp_path)
+
+    jp_asset_map: Dict[int, str] = {}
+    for item in jp_costume3ds:
+        asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
+        if asset_name:
+            jp_asset_map[item["id"]] = asset_name
+
+    patch: Dict[int, str] = {}
+    missing_count = 0
+    for item in region_costume3ds:
+        asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
+        if asset_name:
+            continue
+        missing_count += 1
+        jp_asset_name = jp_asset_map.get(item["id"])
+        if jp_asset_name:
+            patch[item["id"]] = jp_asset_name
+
+    logger.info(
+        f"MasterData [{region}.costume3ds] 补丁生成完成: 缺失{missing_count}条, "
+        f"JP补齐{len(patch)}条, 仍缺失{missing_count - len(patch)}条"
+    )
+    return patch
+
+def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
+    # 按区服版本 + JP 版本加载补丁；版本未变化时直接复用缓存，
+    # 版本变化时重新生成并写入 sidecar 文件。
+    region_version = get_masterdata_cache_version(region, "costume3ds")
+    jp_version = get_masterdata_cache_version("jp", "costume3ds")
+    current_meta = (region_version, jp_version)
+
+    with _costume3ds_asset_patch_lock:
+        if _costume3ds_asset_patch_meta.get(region) == current_meta:
+            return _costume3ds_asset_patch_cache.get(region, {})
+
+        patch_path = get_masterdata_patch_path(region, "costume3ds_assetbundle_patch")
+        patch: Dict[int, str] | None = None
+
+        if os.path.exists(patch_path):
+            try:
+                patch_data = load_json(patch_path)
+                if (
+                    patch_data.get("region_version") == region_version
+                    and patch_data.get("jp_version") == jp_version
+                ):
+                    patch = {
+                        int(costume3d_id): asset_name
+                        for costume3d_id, asset_name in patch_data.get("assetbundle_map", {}).items()
+                        if asset_name
+                    }
+            except Exception as e:
+                logger.warning(f"MasterData [{region}.costume3ds] 读取补丁缓存失败: {get_exc_desc(e)}")
+
+        if patch is None:
+            patch = build_costume3ds_assetbundle_patch(region)
+            dump_json({
+                "region_version": region_version,
+                "jp_version": jp_version,
+                "assetbundle_map": {str(costume3d_id): asset_name for costume3d_id, asset_name in patch.items()},
+            }, patch_path, indent=False)
+
+        _costume3ds_asset_patch_cache[region] = patch
+        _costume3ds_asset_patch_meta[region] = current_meta
+        return patch
+
+def make_costume3ds_map_fn(region: str):
+    def costume3ds_map_fn(costume3ds: List[Dict[str, Any]]):
+        # 第一步：把 compact 数据中的 _assetbundleName 统一归一化到 assetbundleName。
+        # 第二步：对仍然缺失资源名的条目，应用 sidecar 补丁进行补全。
+        normalized_count = 0
+        missing_count = 0
+        for item in costume3ds:
+            asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
+            if asset_name and item.get("assetbundleName") != asset_name:
+                item["assetbundleName"] = asset_name
+                normalized_count += 1
+            if not item.get("assetbundleName"):
+                missing_count += 1
+
+        if missing_count == 0:
+            return costume3ds
+
+        patch = load_costume3ds_assetbundle_patch(region)
+        patched_count = 0
+        for item in costume3ds:
+            if item.get("assetbundleName"):
+                continue
+            asset_name = patch.get(item["id"])
+            if asset_name:
+                item["assetbundleName"] = asset_name
+                patched_count += 1
+
+        remaining_count = sum(1 for item in costume3ds if not item.get("assetbundleName"))
+        logger.info(
+            f"MasterData [{region}.costume3ds] 映射完成: 本地归一化{normalized_count}条, "
+            f"补丁补齐{patched_count}条, 剩余缺失{remaining_count}条"
+        )
+        return costume3ds
+
+    return costume3ds_map_fn
 
 @dataclass
 class RegionMasterDbSource:
@@ -607,6 +739,11 @@ MasterDataManager.set_sort_keys('events', ['startAt'])
 
 COMPACT_DATA_REGIONS = ['kr', 'cn', 'tw']
 
+# 为 compact 区服注册 costume3ds 的专用映射：
+# 在数据加载阶段完成字段归一化和补丁补全，业务层按正常字段读取即可。
+for compact_region in COMPACT_DATA_REGIONS:
+    MasterDataManager.register_map_fn("costume3ds", make_costume3ds_map_fn(compact_region), compact_region)
+
 def convert_compact_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     enums = data.get('__ENUM__', {})
     ret = []
@@ -650,6 +787,7 @@ async def resource_boxes_download_fn(base_url):
 
 
 # ================================ MasterData自定义转换 ================================ #
+
 
 @MasterDataManager.map_function("virtualLives")
 def vlives_map_fn(vlives):
@@ -847,7 +985,7 @@ class RegionRipAssetManger:
                     candidates.append(alt_path)
 
         return candidates
-    
+
     @classmethod
     def get(cls, region: str) -> "RegionRipAssetManger":
         if region not in cls._all_mgrs:

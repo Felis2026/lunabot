@@ -2023,14 +2023,19 @@ pjsk_mysekai_res.check_cdrate(cd).check_wblist(gbl)
 @pjsk_mysekai_res.handle()
 async def _(ctx: SekaiHandlerContext):
     with ProfileTimer("msr.total"):
-        if ctx.region in bd_msr_sub.regions and not bd_msr_sub.is_subbed(ctx.region, ctx.group_id): 
-            raise ReplyException(f"不支持{get_region_name(ctx.region)}的msr查询")
-        args = ctx.get_args().strip()
-        show_harvested = 'all' in args
-        check_time = not 'force' in args
-        imgs = await compose_mysekai_res_image(ctx, ctx.user_id, show_harvested, check_time)
-        imgs = [await get_image_cq(img, low_quality=True) for img in imgs]
-        await ctx.asend_reply_msg("".join(imgs))
+        # 原手动 MSR 查询逻辑保留如下；如需恢复，删除下面的临时拦截并取消注释即可。
+        # if ctx.region in bd_msr_sub.regions and not bd_msr_sub.is_subbed(ctx.region, ctx.group_id): 
+        #     raise ReplyException(f"不支持{get_region_name(ctx.region)}的msr查询")
+        # args = ctx.get_args().strip()
+        # show_harvested = 'all' in args
+        # check_time = not 'force' in args
+        # imgs = await compose_mysekai_res_image(ctx, ctx.user_id, show_harvested, check_time)
+        # imgs = [await get_image_cq(img, low_quality=True) for img in imgs]
+        # await ctx.asend_reply_msg("".join(imgs))
+
+        # 临时关闭手动 MSR 查询入口。
+        # 这里只拦截 /msr、/msmap、/msa 等手动别名，不影响自动推送和其他 MySekai 指令。
+        raise ReplyException("暂不支持 /MSR 查询")
 
 
 # 查询mysekai蓝图

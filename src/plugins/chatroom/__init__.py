@@ -1,4 +1,5 @@
 import os
+import re
 
 from ..record.sql import query_recent_msg
 from ..record import before_record_hook
@@ -9,6 +10,8 @@ from ..utils.rpc import *
 config = Config('chatroom')
 logger = get_logger("Chatroom")
 file_db = get_file_db("data/chatroom/db.json", logger)
+CLIENT_DATA_DIR = 'data/chatroom/client_data'
+CLIENT_DATA_NAME_RE = re.compile(r'[^0-9A-Za-z._-]+')
 
 def process_msg(msg):
     if isinstance(msg['time'], datetime):
@@ -20,6 +23,16 @@ def get_md5(s):
     m = hashlib.md5()
     m.update(s.encode())
     return m.hexdigest()
+
+
+def get_client_data_path(name):
+    raw_name = str(name)
+    safe_name = CLIENT_DATA_NAME_RE.sub('_', raw_name).strip('._')
+    if not safe_name:
+        safe_name = 'client'
+    if safe_name != raw_name or raw_name in {'.', '..'} or len(safe_name) > 64:
+        safe_name = f'{safe_name[:48]}_{get_md5(raw_name)[:8]}'
+    return create_parent_folder(os.path.join(CLIENT_DATA_DIR, f'{safe_name}.json'))
 
 # ------------------------------ 新聊天 ------------------------------ #
 
@@ -121,14 +134,14 @@ async def handle_get_group_new_msg(cid, group_id):
 @rpc_method(RPC_SERVICE, 'get_client_data')
 async def handle_get_client_data(cid, name):
     try:
-        return load_json(f'data/chatroom/client_data/{name}.json')
+        return load_json(get_client_data_path(name))
     except:
         return None
     
 # 设置客户端数据
 @rpc_method(RPC_SERVICE, 'set_client_data')
 async def handle_set_client_data(cid, name, data):
-    dump_json(data, f'data/chatroom/client_data/{name}.json')
+    dump_json(data, get_client_data_path(name))
     return True
 
 # 获取消息

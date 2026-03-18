@@ -178,4 +178,8 @@ docker-compose*.bak*
 # napcat
 napcat/
 
+# local desktop/browser shortcut files
+*.url
 
+# keep per-instance startup helpers local; preserve tracked start.sh
+start_v*.sh

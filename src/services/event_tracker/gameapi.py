@@ -39,7 +39,12 @@ class GameApiConfig:
 
 # 获取游戏api相关配置
 def get_gameapi_config(region: str) -> GameApiConfig:
-    return GameApiConfig(**(gameapi_config.get(region, {})))
+    # 事件追踪服务只关心自己声明过的字段，忽略配置文件里其他模块新增的键，
+    # 避免管理/展示类配置扩展后导致这里在启动阶段因参数不匹配而崩溃。
+    raw_config = gameapi_config.get(region, {})
+    allowed_keys = set(GameApiConfig.__annotations__.keys())
+    filtered_config = {k: v for k, v in raw_config.items() if k in allowed_keys}
+    return GameApiConfig(**filtered_config)
 
 
 # 请求游戏API data_type: json/bytes/None
@@ -60,11 +65,14 @@ async def request_gameapi(url: str, method: str = 'GET', data_type: str | None =
     try:
         async with get_session().request(method, url, headers=headers, verify_ssl=False, **kwargs) as resp:
             if resp.status != 200:
+                detail = ""
                 try:
                     detail = await resp.text()
                     detail = loads_json(detail)['detail']
                 except:
                     pass
+                # 统一摘要化上游错误体，避免 HTML 拦截页把日志打成超长单行。
+                detail = summarize_http_error_detail(detail, resp.content_type)
                 error(f"请求游戏API后端 {url} 失败: {resp.status} {detail}")
                 raise Exception(f"请求游戏API后端失败: {resp.status} {detail}")
             

@@ -118,13 +118,19 @@ async def record_message(bot: Bot, event: GroupMessageEvent):
 # 插入数据库消息定时任务
 @repeat_with_interval(config.item('insert_msg_loop_interval_seconds'), '插入消息到数据库', logger)
 async def insert_msg_task():
+    pending_msgs = msgs_to_insert.copy()
+    if not pending_msgs:
+        return
     try:
-        if msgs_to_insert:
-            await insert_msgs(msgs_to_insert)
-    except Exception as e:
-        logger.print_exc(f"插入 {len(msgs_to_insert)} 条消息到数据库失败")
-    finally:
-        msgs_to_insert.clear()
+        await insert_msgs(pending_msgs)
+    except Exception:
+        try:
+            await rollback_conn()
+        except Exception:
+            logger.print_exc("回滚消息数据库事务失败")
+        logger.print_exc(f"插入 {len(pending_msgs)} 条消息到数据库失败")
+    else:
+        del msgs_to_insert[:len(pending_msgs)]
 
 # 记录消息
 add = on_message(block=False, priority=-1)

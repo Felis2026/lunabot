@@ -158,6 +158,8 @@ async def _(bot: Bot, event: NoticeEvent):
             return
         if not is_group_msg(event):
             return
+        if not check_superuser(event):
+            return
             
         if str(event.target_id) != str(event.self_id) or str(event.user_id) == str(event.self_id):
             return

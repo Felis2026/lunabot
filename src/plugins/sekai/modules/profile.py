@@ -1,9 +1,10 @@
-from ...utils import *
+﻿from ...utils import *
 from ..common import *
 from ..handler import *
 from ..asset import *
 from ..draw import *
 from ..gameapi import get_gameapi_config, request_gameapi
+from .. import account_api as cloud_account_api
 from .honor import compose_full_honor_image
 from .resbox import get_res_box_info, get_res_icon
 from ...utils.safety import *
@@ -28,6 +29,266 @@ class PlayerAvatarInfo:
 
 DEFAULT_DATA_MODE = 'latest'
 VALID_DATA_MODES = ['latest', 'default', 'local', 'haruki']
+
+
+# ================================ 云端账号同步 ================================ #
+# 云端账号服务是可选增强能力。
+# 当环境变量未配置或远端异常时，Sekai 指令必须自动回退到本地数据路径。
+def is_cloud_account_enabled() -> bool:
+    return cloud_account_api.is_account_cloud_enabled()
+
+
+def _get_cloud_state(ctx: SekaiHandlerContext, qid: int | str) -> dict | None:
+    if not is_cloud_account_enabled():
+        return None
+    try:
+        return cloud_account_api.get_state(ctx.region, qid)
+    except Exception as e:
+        logger.warning(f"[sekai] failed to load cloud account state region={ctx.region} qid={qid}: {e}")
+        return None
+
+
+def _get_cloud_snapshot(region: str | None = None) -> dict | None:
+    if not is_cloud_account_enabled():
+        return None
+    try:
+        return cloud_account_api.get_snapshot(region)
+    except Exception as e:
+        logger.warning(f"[sekai] failed to load cloud account snapshot region={region or '*'}: {e}")
+        return None
+
+
+# ================================ 快照兼容回退 ================================ #
+# 优先读取云端快照，但也要兼容单实例部署下沿用的本地旧结构。
+def _get_local_qid_blacklist() -> list[str]:
+    return [str(qid) for qid in profile_db.get("qid_blacklist", [])]
+
+
+def _get_uid_blacklist_snapshot() -> dict[str, list[str]]:
+    if snapshot := _get_cloud_snapshot():
+        data = snapshot.get("uid_blacklist", {})
+        result: dict[str, list[str]] = {}
+        if isinstance(data, dict):
+            for region, uids in data.items():
+                if isinstance(uids, list):
+                    normalized = sorted({str(uid) for uid in uids if str(uid).strip()})
+                    if normalized:
+                        result[str(region)] = normalized
+        return result
+    legacy = sorted({str(item) for item in profile_db.get("blacklist", []) if str(item).strip()})
+    return {"legacy": legacy} if legacy else {}
+
+
+def _get_qid_blacklist_snapshot() -> list[str]:
+    if snapshot := _get_cloud_snapshot():
+        data = snapshot.get("qid_blacklist", [])
+        if isinstance(data, list):
+            return sorted({str(qid) for qid in data if str(qid).strip()}, key=lambda x: int(x))
+    return sorted({str(qid) for qid in _get_local_qid_blacklist() if str(qid).strip()}, key=lambda x: int(x))
+
+
+def get_uid_blacklist_snapshot() -> dict[str, list[str]]:
+    return _get_uid_blacklist_snapshot()
+
+
+def get_qid_blacklist_snapshot() -> list[str]:
+    return _get_qid_blacklist_snapshot()
+
+
+def _format_blacklist_entry_meta(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return "原因: 无"
+    reason = (entry.get("reason") or "").strip() or "无"
+    operator = (entry.get("operator") or "").strip()
+    created_at = (entry.get("created_at") or "").strip()
+    parts = [f"原因: {reason}"]
+    if operator:
+        parts.append(f"操作者: {operator}")
+    if created_at:
+        try:
+            created_at = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        parts.append(f"时间: {created_at}")
+    return " | ".join(parts)
+
+
+def _format_uid_blacklist_list_text() -> str:
+    uid_blacklist = _get_uid_blacklist_snapshot()
+    if not uid_blacklist:
+        return "当前没有游戏ID黑名单"
+
+    lines = ["当前游戏ID黑名单:"]
+    for region in sorted(uid_blacklist.keys()):
+        uids = uid_blacklist.get(region, [])
+        if not uids:
+            continue
+        region_name = "未分区(本地兼容)" if region == "legacy" else get_region_name(region)
+        lines.append(f"【{region_name}】{len(uids)} 个")
+        for uid in uids:
+            meta = "原因: 无"
+            if region != "legacy" and is_cloud_account_enabled():
+                try:
+                    status = cloud_account_api.get_blacklist_status("uid", uid, region=region)
+                    meta = _format_blacklist_entry_meta(status.get("entry"))
+                except Exception as e:
+                    logger.warning(f"[sekai] failed to format cloud uid blacklist meta region={region} uid={uid}: {e}")
+            lines.append(f"{uid} | {meta}")
+    return "\n".join(lines)
+
+
+def _format_qid_blacklist_list_text() -> str:
+    qids = _get_qid_blacklist_snapshot()
+    if not qids:
+        return "当前没有QQ黑名单"
+    lines = [f"当前QQ黑名单: {len(qids)} 个"]
+    for qid in qids:
+        meta = "原因: 无"
+        if is_cloud_account_enabled():
+            try:
+                status = cloud_account_api.get_blacklist_status("qid", qid)
+                meta = _format_blacklist_entry_meta(status.get("entry"))
+            except Exception as e:
+                logger.warning(f"[sekai] failed to format cloud qid blacklist meta qid={qid}: {e}")
+        lines.append(f"{qid} | {meta}")
+    return "\n".join(lines)
+
+
+def _resolve_uid_blacklist_region(uid: str, region: str | None = None) -> str | None:
+    if region:
+        return region
+    hit_regions = []
+    for r in ALL_SERVER_REGIONS:
+        try:
+            if validate_uid(SekaiHandlerContext.from_region(r), uid):
+                hit_regions.append(r)
+        except Exception:
+            continue
+    if len(hit_regions) == 1:
+        return hit_regions[0]
+    return None
+
+
+def _get_bind_list_snapshot(region: str | None = None) -> dict:
+    if snapshot := _get_cloud_snapshot(region):
+        return snapshot.get("bind_list", {})
+    bind_list = profile_db.get("bind_list", {})
+    if region:
+        return {region: bind_list.get(region, {})}
+    return bind_list
+
+
+def get_bind_list_snapshot(region: str | None = None) -> dict:
+    return _get_bind_list_snapshot(region)
+
+
+def add_uid_blacklist_entry(region: str, uid: str, reason: str = '', operator: str | None = None) -> bool:
+    region = str(region).lower().strip()
+    uid = str(uid).strip()
+    assert region in ALL_SERVER_REGIONS, f'未知区服: {region}'
+    assert validate_uid(SekaiHandlerContext.from_region(region), uid), f'无效的{region.upper()}游戏ID: {uid}'
+    if is_cloud_account_enabled():
+        status = cloud_account_api.get_blacklist_status('uid', uid, region=region)
+        if status.get('active'):
+            return False
+        cloud_account_api.add_blacklist('uid', uid, region=region, reason=reason or None, operator=operator)
+        return True
+    blacklist = [str(item) for item in profile_db.get('blacklist', [])]
+    if uid in blacklist:
+        return False
+    blacklist.append(uid)
+    profile_db.set('blacklist', blacklist)
+    return True
+
+
+def remove_uid_blacklist_entry(region: str, uid: str, operator: str | None = None) -> bool:
+    region = str(region).lower().strip()
+    uid = str(uid).strip()
+    assert region in ALL_SERVER_REGIONS, f'未知区服: {region}'
+    if is_cloud_account_enabled():
+        status = cloud_account_api.get_blacklist_status('uid', uid, region=region)
+        if not status.get('active'):
+            return False
+        removed = cloud_account_api.remove_blacklist('uid', uid, region=region, operator=operator)
+        return removed is not None
+    blacklist = [str(item) for item in profile_db.get('blacklist', [])]
+    if uid not in blacklist:
+        return False
+    blacklist.remove(uid)
+    profile_db.set('blacklist', blacklist)
+    return True
+
+
+def add_qid_blacklist_entry(qid: str | int, reason: str = '', operator: str | None = None) -> bool:
+    qid = str(qid).strip()
+    assert qid.isdigit(), f'无效的QQ号: {qid}'
+    if is_cloud_account_enabled():
+        status = cloud_account_api.get_blacklist_status('qid', qid)
+        if status.get('active'):
+            return False
+        cloud_account_api.add_blacklist('qid', qid, reason=reason or None, operator=operator)
+        return True
+    blacklist = _get_local_qid_blacklist()
+    if qid in blacklist:
+        return False
+    blacklist.append(qid)
+    profile_db.set('qid_blacklist', blacklist)
+    return True
+
+
+def remove_qid_blacklist_entry(qid: str | int, operator: str | None = None) -> bool:
+    qid = str(qid).strip()
+    assert qid.isdigit(), f'无效的QQ号: {qid}'
+    if is_cloud_account_enabled():
+        status = cloud_account_api.get_blacklist_status('qid', qid)
+        if not status.get('active'):
+            return False
+        removed = cloud_account_api.remove_blacklist('qid', qid, operator=operator)
+        return removed is not None
+    blacklist = _get_local_qid_blacklist()
+    if qid not in blacklist:
+        return False
+    blacklist.remove(qid)
+    profile_db.set('qid_blacklist', blacklist)
+    return True
+
+
+def _parse_uid_blacklist_args(args: str) -> tuple[str, str, str]:
+    parts = args.strip().split(maxsplit=2)
+    assert_and_reply(parts, "请提供要操作的游戏ID")
+
+    explicit_region = None
+    uid = ""
+    reason = ""
+
+    if parts[0].lower() in ALL_SERVER_REGIONS:
+        explicit_region = parts[0].lower()
+        assert_and_reply(len(parts) >= 2, "请在区服后提供游戏ID")
+        uid = parts[1].strip()
+        reason = parts[2].strip() if len(parts) >= 3 else ""
+    else:
+        uid = parts[0].strip()
+        reason = parts[1].strip() if len(parts) >= 2 else ""
+
+    target_region = _resolve_uid_blacklist_region(uid, explicit_region)
+    assert_and_reply(
+        target_region is not None,
+        f"无法自动判断游戏ID {uid} 的区服，请使用“/pjsk blacklist add cn {uid} 原因”或“/pjsk blacklist add jp {uid} 原因”",
+    )
+    assert_and_reply(
+        validate_uid(SekaiHandlerContext.from_region(target_region), uid),
+        f"无效的{target_region.upper()}游戏ID: {uid}",
+    )
+    return target_region, uid, reason
+
+
+def _parse_qid_blacklist_args(args: str) -> tuple[str, str]:
+    parts = args.strip().split(maxsplit=1)
+    assert_and_reply(parts, "请提供要操作的QQ号")
+    qid = parts[0].strip()
+    assert_and_reply(qid.isdigit(), f"无效的QQ号: {qid}")
+    reason = parts[1].strip() if len(parts) >= 2 else ""
+    return qid, reason
 
 
 @dataclass
@@ -205,6 +466,8 @@ def validate_uid(ctx: SekaiHandlerContext, uid: str) -> bool:
 
 # 获取用户绑定的账号数量
 def get_player_bind_count(ctx: SekaiHandlerContext, qid: int) -> int:
+    if state := _get_cloud_state(ctx, qid):
+        return len(state.get("bindings", []))
     bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(ctx.region, {})
     uids = to_list(bind_list.get(str(qid), []))
     return len(uids)
@@ -216,9 +479,14 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
 
     bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(ctx.region, {})
     main_bind_list: Dict[str, str] = profile_db.get("main_bind_list", {}).get(ctx.region, {})
+    state_qid = str(qid) if qid is not None else str(ctx.user_id)
+    cloud_state = _get_cloud_state(ctx, state_qid) if (qid or not ctx.uid_arg) else None
 
     def get_uid_by_index(qid: str, index: int) -> str | None:
-        uids = bind_list.get(qid, [])
+        if cloud_state and qid == state_qid:
+            uids = [str(item) for item in cloud_state.get("bindings", [])]
+        else:
+            uids = bind_list.get(qid, [])
         if not uids:
             return None
         uids = to_list(uids)
@@ -228,8 +496,10 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
     # 指定qid/没有ctx.uid_arg的情况则直接获取qid绑定的账号
     if qid or not ctx.uid_arg:
         qid = str(qid) if qid is not None else str(ctx.user_id)
+        if not is_super:
+            assert_and_reply(not check_qid_in_blacklist(qid), f"该QQ号({qid})已被拉入黑名单")
         if index is None:
-            uid = main_bind_list.get(qid, None) or get_uid_by_index(qid, 0)
+            uid = (cloud_state or {}).get("main_uid") or main_bind_list.get(qid, None) or get_uid_by_index(qid, 0)
         else:
             uid = get_uid_by_index(qid, index)
     # 从ctx.uid_arg中获取
@@ -251,11 +521,16 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
         region = "" if ctx.region == "jp" else ctx.region
         raise ReplyException(f"请使用\"/{region}绑定 你的游戏ID\"绑定账号")
     if not is_super:
-        assert_and_reply(not check_uid_in_blacklist(uid), f"该游戏ID({uid})已被拉入黑名单")
+        assert_and_reply(not check_uid_in_blacklist(uid, ctx.region), f"该游戏ID({uid})已被拉入黑名单")
     return uid
 
 # 获取某个id在用户绑定的账号中的索引，找不到返回None
 def get_player_bind_id_index(ctx: SekaiHandlerContext, qid: str, uid: str) -> int | None:
+    if state := _get_cloud_state(ctx, qid):
+        try:
+            return [str(item) for item in state.get("bindings", [])].index(str(uid))
+        except ValueError:
+            return None
     bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(ctx.region, {})
     uids = to_list(bind_list.get(str(qid), []))
     try:
@@ -271,6 +546,37 @@ def add_player_bind_id(ctx: SekaiHandlerContext, qid: str, uid: str, set_main: b
     region = ctx.region
     region_name = get_region_name(region)
     additional_info = ""
+
+    if is_cloud_account_enabled():
+        state = _get_cloud_state(ctx, qid) or {
+            "bindings": [],
+            "main_uid": None,
+        }
+        uids = [str(item) for item in state.get("bindings", [])]
+        if uid not in uids:
+            total_bind_limit = TOTAL_BIND_LIMITS.get().get(ctx.region, 1e9)
+            while len(uids) >= total_bind_limit:
+                removed_uid = uids.pop(0)
+                try:
+                    cloud_account_api.remove_binding(region, qid, removed_uid, operator=str(ctx.user_id))
+                except Exception as e:
+                    raise ReplyException(f"云端解绑旧账号失败: {e}")
+                additional_info += f"你绑定的{region_name}账号数量已达上限({total_bind_limit})，已自动解绑最早绑定的账号\n"
+            try:
+                state = cloud_account_api.add_binding(region, qid, uid, set_main=set_main, operator=str(ctx.user_id))
+            except Exception as e:
+                raise ReplyException(f"云端绑定失败: {e}")
+            uids = [str(item) for item in state.get("bindings", [])]
+        elif set_main:
+            try:
+                state = cloud_account_api.set_main_binding(region, qid, uid, operator=str(ctx.user_id))
+            except Exception as e:
+                raise ReplyException(f"云端设置主绑定失败: {e}")
+            uids = [str(item) for item in state.get("bindings", [])]
+        if set_main and uid in uids:
+            uid_index = uids.index(uid) + 1
+            additional_info += f"已将该账号u{uid_index}设为你的{region_name}主账号\n"
+        return additional_info.strip()
 
     if region not in all_bind_list:
         all_bind_list[region] = {}
@@ -309,6 +615,32 @@ def remove_player_bind_id(ctx: SekaiHandlerContext, qid: str, index: int | None)
     region = ctx.region
     region_name = get_region_name(region)
     ret_info = ""
+
+    if is_cloud_account_enabled():
+        state = _get_cloud_state(ctx, qid) or {
+            "bindings": [],
+            "main_uid": None,
+        }
+        uids = [str(item) for item in state.get("bindings", [])]
+        assert_and_reply(uids, f"你还没有绑定任何{region_name}账号")
+        assert_and_reply(index is None or index < 1e9, f"需要指定账号序号（按绑定时间顺序）而不是账号ID")
+        if index is not None:
+            assert_and_reply(0 <= index < len(uids), f"指定的账号序号大于已绑定的{region_name}账号数量({len(uids)})")
+            removed_uid = uids[index]
+        else:
+            removed_uid = state.get("main_uid") or uids[0]
+        try:
+            next_state = cloud_account_api.remove_binding(region, qid, removed_uid, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端解绑失败: {e}")
+        next_uids = [str(item) for item in next_state.get("bindings", [])]
+        ret_info += f"已解除绑定你的{region_name}账号{process_hide_uid(ctx, removed_uid, keep=6)}\n"
+        if next_uids and next_state.get("main_uid") and next_state.get("main_uid") != removed_uid:
+            ret_info += f"已将你的{region_name}主账号切换为当前第一个账号({process_hide_uid(ctx, next_state.get("main_uid"), keep=6)})\n"
+        elif not next_uids:
+            ret_info += f"你目前没有绑定任何{region_name}账号，主账号已清除\n"
+        return ret_info.strip()
+
 
     if region not in all_bind_list:
         all_bind_list[region] = {}
@@ -353,6 +685,18 @@ def set_player_main_bind_id(ctx: SekaiHandlerContext, qid: str, index: int) -> s
     qid = str(qid)
     region = ctx.region
     region_name = get_region_name(region)
+    if is_cloud_account_enabled():
+        state = _get_cloud_state(ctx, qid) or {"bindings": []}
+        uids = [str(item) for item in state.get("bindings", [])]
+        assert_and_reply(uids, f"你还没有绑定任何{region_name}账号")
+        assert_and_reply(index < 1e9, f"需要指定账号序号（按绑定时间顺序）而不是账号ID")
+        assert_and_reply(0 <= index < len(uids), f"指定的账号序号大于已绑定的{region_name}账号数量({len(uids)})")
+        new_main_uid = uids[index]
+        try:
+            cloud_account_api.set_main_binding(region, qid, new_main_uid, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端设置主绑定失败: {e}")
+        return f"已将你的{region_name}主账号修改为{process_hide_uid(ctx, new_main_uid, keep=6)}"
 
     if region not in all_bind_list:
         all_bind_list[region] = {}
@@ -376,6 +720,20 @@ def swap_player_bind_id(ctx: SekaiHandlerContext, qid: str, index1: int, index2:
     qid = str(qid)
     region = ctx.region
     region_name = get_region_name(region)
+
+    if is_cloud_account_enabled():
+        state = _get_cloud_state(ctx, qid) or {"bindings": []}
+        uids = [str(item) for item in state.get("bindings", [])]
+        assert_and_reply(uids, f"你还没有绑定任何{region_name}账号")
+        assert_and_reply(index1 < 1e9, f"需要指定账号序号（按绑定时间顺序）而不是账号ID")
+        assert_and_reply(index2 < 1e9, f"需要指定账号序号（按绑定时间顺序）而不是账号ID")
+        assert_and_reply(0 <= index1 < len(uids), f"指定的账号序号1大于已绑定的{region_name}账号数量({len(uids)})")
+        assert_and_reply(0 <= index2 < len(uids), f"指定的账号序号2大于已绑定的{region_name}账号数量({len(uids)})")
+        try:
+            cloud_account_api.swap_bindings(region, qid, uids[index1], uids[index2], operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端交换绑定顺序失败: {e}")
+        return f"已交换你的{region_name}第{index1 + 1}个账号和第{index2 + 1}个账号的顺序"
 
     if region not in all_bind_list:
         all_bind_list[region] = {}
@@ -461,15 +819,23 @@ async def verify_user_game_account(ctx: SekaiHandlerContext, triggered_by_not_ve
 
     try:
         # 验证成功
-        verify_accounts = profile_db.get(f"verify_accounts_{ctx.region}", {})
-        verify_accounts.setdefault(str(qid), []).append(info.uid)
-        profile_db.set(f"verify_accounts_{ctx.region}", verify_accounts)
+        if is_cloud_account_enabled():
+            try:
+                cloud_account_api.add_verified_account(ctx.region, qid, info.uid, operator=str(ctx.user_id))
+            except Exception as e:
+                raise ReplyException(f"云端写入验证状态失败: {e}")
+        else:
+            verify_accounts = profile_db.get(f"verify_accounts_{ctx.region}", {})
+            verify_accounts.setdefault(str(qid), []).append(info.uid)
+            profile_db.set(f"verify_accounts_{ctx.region}", verify_accounts)
         raise ReplyException(f"验证成功！使用\"/{ctx.region}pjsk验证列表\"可以查看你验证过的游戏ID")
     finally:
         _region_qid_verify_codes[ctx.region].pop(qid, None)
 
 # 获取用户验证过的游戏ID列表
 def get_user_verified_uids(ctx: SekaiHandlerContext) -> List[str]:
+    if state := _get_cloud_state(ctx, ctx.user_id):
+        return [str(uid) for uid in state.get("verified_uids", [])]
     return profile_db.get_copy(f"verify_accounts_{ctx.region}", {}).get(str(ctx.user_id), [])
 
 # 获取游戏id并检查用户是否验证过当前的游戏id，失败抛出异常
@@ -488,9 +854,29 @@ async def get_uid_and_check_verified(ctx: SekaiHandlerContext, force: bool = Fal
 
 
 # 检测游戏id是否在黑名单中
-def check_uid_in_blacklist(uid: str) -> bool:
+def check_uid_in_blacklist(uid: str, region: str | None = None) -> bool:
+    if is_cloud_account_enabled():
+        target_region = _resolve_uid_blacklist_region(str(uid), region)
+        if target_region:
+            try:
+                status = cloud_account_api.get_blacklist_status("uid", str(uid), region=target_region)
+                if status.get("active"):
+                    return True
+            except Exception as e:
+                logger.warning(f"[sekai] failed to check cloud uid blacklist region={target_region} uid={uid}: {e}")
     blacklist = profile_db.get("blacklist", [])
-    return uid in blacklist
+    return str(uid) in [str(item) for item in blacklist]
+
+
+def check_qid_in_blacklist(qid: int | str) -> bool:
+    if is_cloud_account_enabled():
+        try:
+            status = cloud_account_api.get_blacklist_status("qid", str(qid))
+            if status.get("active"):
+                return True
+        except Exception as e:
+            logger.warning(f"[sekai] failed to check cloud qid blacklist qid={qid}: {e}")
+    return str(qid) in _get_local_qid_blacklist()
 
 
 # ======================= 处理逻辑 ======================= #
@@ -565,16 +951,23 @@ def get_user_data_mode(ctx: SekaiHandlerContext, qid: int) -> str:
     if ctx.data_mode_arg:
         assert_and_reply(ctx.data_mode_arg in VALID_DATA_MODES, f"错误的抓包数据获取模式: {ctx.data_mode_arg}")
         return ctx.data_mode_arg
+    if state := _get_cloud_state(ctx, qid):
+        return state.get("preferences", {}).get("data_mode", DEFAULT_DATA_MODE)
     data_modes = profile_db.get("data_modes", {})
     return data_modes.get(ctx.region, {}).get(str(qid), DEFAULT_DATA_MODE)
 
 # 用户是否隐藏抓包信息
 def is_user_hide_suite(ctx: SekaiHandlerContext, qid: int) -> bool:
+    if state := _get_cloud_state(ctx, qid):
+        return bool(state.get("preferences", {}).get("hide_suite", False))
     hide_list = profile_db.get("hide_suite_list", {}).get(ctx.region, [])
     return qid in hide_list
 
 # 用户是否隐藏id
 def is_user_hide_id(region: str, qid: int) -> bool:
+    region_ctx = SekaiHandlerContext.from_region(region)
+    if state := _get_cloud_state(region_ctx, qid):
+        return bool(state.get("preferences", {}).get("hide_id", False))
     hide_list = profile_db.get("hide_id_list", {}).get(region, [])
     return qid in hide_list
 
@@ -610,7 +1003,7 @@ def normalize_upload_time_inplace(data: dict, key: str='upload_time') -> dict:
     return data
 
 def is_aux_user_data_file(file_path: str) -> bool:
-    # Ignore helper artifacts like "<uid>.from_suite_api.*.json" when scanning user_data.
+    # 扫描 user_data 时忽略类似 "<uid>.from_suite_api.*.json" 的辅助文件。
     return ".from_suite_api." in os.path.basename(file_path).lower()
 
 def get_uid_from_user_data_file(file_path: str) -> str:
@@ -622,10 +1015,10 @@ def get_uid_from_user_data_file(file_path: str) -> str:
 def load_user_data_json_auto(file_path: str) -> dict:
     with open(file_path, 'rb') as file:
         raw = file.read()
-    # zstd frame magic: 28 B5 2F FD
+    # zstd 帧头魔数: 28 B5 2F FD
     if len(raw) >= 4 and raw[:4] == b'\x28\xb5\x2f\xfd':
         return load_json_zstd(file_path)
-    # plain json (with/without UTF-8 BOM)
+    # 普通 json（兼容带或不带 UTF-8 BOM 的情况）
     try:
         return loads_json(raw)
     except Exception:
@@ -643,6 +1036,13 @@ def get_user_data_local_source(file_path: str) -> str:
     return data.get('local_source', '未知')
 
 # 根据获取玩家详细信息，返回(profile, err_msg)
+# ================================ Suite 数据获取兼容层 ================================ #
+# 这里只按 URL 形态判断接口契约，避免把任何第三方服务域名硬编码进仓库。
+def use_suite_public_contract(url: str) -> bool:
+    normalized = (url or "").lower()
+    return "/public/" in normalized and "{uid}" in normalized
+
+
 async def get_detailed_profile(
     ctx: SekaiHandlerContext, 
     qid: int, 
@@ -671,7 +1071,7 @@ async def get_detailed_profile(
         url = get_gameapi_config(ctx).suite_api_url
         if not url:
             raise ReplyException(f"暂不支持查询{get_region_name(ctx.region)}的抓包数据")
-        use_suite_api_public = "suite-api.haruki.seiunx.com/public/" in url
+        use_suite_api_public = use_suite_public_contract(url)
         
         # 数据获取模式
         mode = mode or get_user_data_mode(ctx, qid)
@@ -721,8 +1121,8 @@ async def get_detailed_profile(
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
             raise e
 
-        # suite-api may return scalar for single-key requests (e.g. key=upload_time).
-        # Coerce it to dict so downstream code can access fields consistently.
+        # 某些 suite 后端在只请求单字段时，可能直接返回标量值而不是对象。
+        # 这里统一包成 dict，避免下游继续区分两种返回结构。
         if filter and not isinstance(profile, dict):
             filter_keys = sorted(filter) if isinstance(filter, set) else list(filter)
             if len(filter_keys) == 1:
@@ -977,7 +1377,7 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
                             chara_img = ctx.static_imgs.get(f'chara_rank_icon/{chara}.png')
                             ImageBox(chara_img, size=(gw, gh), use_alphablend=True)
                             t = TextBox(str(rank), TextStyle(font=DEFAULT_FONT, size=20, color=(40, 40, 40, 255)))
-                            t.set_size((60, 48)).set_content_align('c').set_offset((36, 4))
+                            t.set_size((60, 48)).set_content_align('c').set_offset((34, 0))
                 
                 # 挑战Live等级
                 if 'userChallengeLiveSoloResult' in basic_profile:
@@ -995,7 +1395,7 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
                             chara_img = ctx.static_imgs.get(f'chara_rank_icon/{get_character_first_nickname(cid)}.png')
                             ImageBox(chara_img, size=(100, 50), use_alphablend=True)
                             t = TextBox(str(stage_rank), TextStyle(font=DEFAULT_FONT, size=22, color=(40, 40, 40, 255)), overflow='clip')
-                            t.set_size((50, 50)).set_content_align('c').set_offset((40, 5))
+                            t.set_size((50, 50)).set_content_align('c').set_offset((40, 0))
                         t = TextBox(f"SCORE {score}", TextStyle(font=DEFAULT_FONT, size=18, color=(50, 50, 50, 255)))
                         t.set_bg(roundrect_bg(radius=6)).set_padding((10, 7))
 
@@ -1021,10 +1421,7 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
                 (await draw_play(vertical)).set_bg(None)
                 (await draw_chara(vertical)).set_bg(None).set_omit_parent_bg(True)
 
-    if 'update_time' in basic_profile:
-        update_time = datetime.fromtimestamp(basic_profile['update_time'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
-    else:
-        update_time = "?"
+    update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     text = f"DT: {update_time}  " + DEFAULT_WATERMARK_CFG.get()
     if bg_settings.image:
         text = text + f"  This background is user-uploaded."
@@ -1361,13 +1758,21 @@ async def _(ctx: SekaiHandlerContext):
         msg += f"\n你的默认服务器为{get_region_name(default_region)}，查询{get_region_name(region)}需加前缀{region}，或使用\"/pjsk服务器\"修改默认服务器"
 
     # 如果该区服以前没有绑定过，设置默认隐藏id
+    assert_and_reply(not check_qid_in_blacklist(ctx.user_id), f"该QQ号({ctx.user_id})已被拉入黑名单，无法绑定")
+
     if not last_bind_main_id:
-        lst = profile_db.get("hide_id_list", {})
-        if region not in lst:
-            lst[region] = []
-        if ctx.user_id not in lst[ctx.region]:
-            lst[region].append(ctx.user_id)
-        profile_db.set("hide_id_list", lst)
+        if is_cloud_account_enabled():
+            try:
+                cloud_account_api.set_preferences(region, ctx.user_id, hide_id=True, operator=str(ctx.user_id))
+            except Exception as e:
+                raise ReplyException(f"云端写入默认隐藏ID设置失败: {e}")
+        else:
+            lst = profile_db.get("hide_id_list", {})
+            if region not in lst:
+                lst[region] = []
+            if ctx.user_id not in lst[region]:
+                lst[region].append(ctx.user_id)
+            profile_db.set("hide_id_list", lst)
 
     # 进行绑定
     bind_msg = add_player_bind_id(region_ctx, ctx.user_id, uid, set_main=True)
@@ -1462,12 +1867,18 @@ pjsk_hide_suite = SekaiCmdHandler([
 pjsk_hide_suite.check_cdrate(cd).check_wblist(gbl)
 @pjsk_hide_suite.handle()
 async def _(ctx: SekaiHandlerContext):
-    lst = profile_db.get("hide_suite_list", {})
-    if ctx.region not in lst:
-        lst[ctx.region] = []
-    if ctx.user_id not in lst[ctx.region]:
-        lst[ctx.region].append(ctx.user_id)
-    profile_db.set("hide_suite_list", lst)
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.set_preferences(ctx.region, ctx.user_id, hide_suite=True, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端设置隐藏抓包失败: {e}")
+    else:
+        lst = profile_db.get("hide_suite_list", {})
+        if ctx.region not in lst:
+            lst[ctx.region] = []
+        if ctx.user_id not in lst[ctx.region]:
+            lst[ctx.region].append(ctx.user_id)
+        profile_db.set("hide_suite_list", lst)
     return await ctx.asend_reply_msg(f"已隐藏{get_region_name(ctx.region)}抓包信息")
     
 
@@ -1479,12 +1890,18 @@ pjsk_show_suite = SekaiCmdHandler([
 pjsk_show_suite.check_cdrate(cd).check_wblist(gbl)
 @pjsk_show_suite.handle()
 async def _(ctx: SekaiHandlerContext):
-    lst = profile_db.get("hide_suite_list", {})
-    if ctx.region not in lst:
-        lst[ctx.region] = []
-    if ctx.user_id in lst[ctx.region]:
-        lst[ctx.region].remove(ctx.user_id)
-    profile_db.set("hide_suite_list", lst)
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.set_preferences(ctx.region, ctx.user_id, hide_suite=False, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端取消隐藏抓包失败: {e}")
+    else:
+        lst = profile_db.get("hide_suite_list", {})
+        if ctx.region not in lst:
+            lst[ctx.region] = []
+        if ctx.user_id in lst[ctx.region]:
+            lst[ctx.region].remove(ctx.user_id)
+        profile_db.set("hide_suite_list", lst)
     return await ctx.asend_reply_msg(f"已展示{get_region_name(ctx.region)}抓包信息")
 
 
@@ -1496,12 +1913,18 @@ pjsk_hide_id = SekaiCmdHandler([
 pjsk_hide_id.check_cdrate(cd).check_wblist(gbl)
 @pjsk_hide_id.handle()
 async def _(ctx: SekaiHandlerContext):
-    lst = profile_db.get("hide_id_list", {})
-    if ctx.region not in lst:
-        lst[ctx.region] = []
-    if ctx.user_id not in lst[ctx.region]:
-        lst[ctx.region].append(ctx.user_id)
-    profile_db.set("hide_id_list", lst)
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.set_preferences(ctx.region, ctx.user_id, hide_id=True, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端设置隐藏ID失败: {e}")
+    else:
+        lst = profile_db.get("hide_id_list", {})
+        if ctx.region not in lst:
+            lst[ctx.region] = []
+        if ctx.user_id not in lst[ctx.region]:
+            lst[ctx.region].append(ctx.user_id)
+        profile_db.set("hide_id_list", lst)
     return await ctx.asend_reply_msg(f"已隐藏{get_region_name(ctx.region)}ID信息")
 
 
@@ -1514,12 +1937,18 @@ pjsk_show_id = SekaiCmdHandler([
 pjsk_show_id.check_cdrate(cd).check_wblist(gbl)
 @pjsk_show_id.handle()
 async def _(ctx: SekaiHandlerContext):
-    lst = profile_db.get("hide_id_list", {})
-    if ctx.region not in lst:
-        lst[ctx.region] = []
-    if ctx.user_id in lst[ctx.region]:
-        lst[ctx.region].remove(ctx.user_id)
-    profile_db.set("hide_id_list", lst)
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.set_preferences(ctx.region, ctx.user_id, hide_id=False, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端取消隐藏ID失败: {e}")
+    else:
+        lst = profile_db.get("hide_id_list", {})
+        if ctx.region not in lst:
+            lst[ctx.region] = []
+        if ctx.user_id in lst[ctx.region]:
+            lst[ctx.region].remove(ctx.user_id)
+        profile_db.set("hide_id_list", lst)
     return await ctx.asend_reply_msg(f"已展示{get_region_name(ctx.region)}ID信息")
 
 
@@ -1596,7 +2025,7 @@ pjsk_data_mode.check_cdrate(cd).check_wblist(gbl)
 @pjsk_data_mode.handle()
 async def _(ctx: SekaiHandlerContext):
     data_modes = profile_db.get("data_modes", {})
-    cur_mode = data_modes.get(ctx.region, {}).get(str(ctx.user_id), DEFAULT_DATA_MODE)
+    cur_mode = get_user_data_mode(ctx, ctx.user_id)
     help_text = f"""
 你的{get_region_name(ctx.region)}抓包数据获取模式: {cur_mode} 
 ---
@@ -1622,10 +2051,16 @@ async def _(ctx: SekaiHandlerContext):
     args = ctx.get_args().strip().lower()
     assert_and_reply(args in VALID_DATA_MODES, help_text)
 
-    if ctx.region not in data_modes:
-        data_modes[ctx.region] = {}
-    data_modes[ctx.region][str(qid)] = args
-    profile_db.set("data_modes", data_modes)
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.set_preferences(ctx.region, qid, data_mode=args, operator=str(ctx.user_id))
+        except Exception as e:
+            raise ReplyException(f"云端切换抓包模式失败: {e}")
+    else:
+        if ctx.region not in data_modes:
+            data_modes[ctx.region] = {}
+        data_modes[ctx.region][str(qid)] = args
+        profile_db.set("data_modes", data_modes)
 
     if qid == ctx.user_id:
         return await ctx.asend_reply_msg(f"切换{get_region_name(ctx.region)}抓包数据获取模式:\n{cur_mode} -> {args}")
@@ -1645,31 +2080,35 @@ async def _(ctx: SekaiHandlerContext):
     qid = int(cqs['at'][0]['qq']) if 'at' in cqs else ctx.user_id
     uid = get_player_bind_id(ctx)
 
-    task1 = get_detailed_profile(ctx, qid, raise_exc=False, mode="local", filter=['upload_time'])
-    task2 = get_detailed_profile(ctx, qid, raise_exc=False, mode="haruki", filter=['upload_time'])
-    (local_profile, local_err), (haruki_profile, haruki_err) = await asyncio.gather(task1, task2)
-
     msg = f"{process_hide_uid(ctx, uid, keep=6)}({ctx.region.upper()}) Suite数据\n"
+    suite_status_sources = get_gameapi_config(ctx).suite_status_sources or ['local', 'haruki']
+    suite_status_sources = [x.lower() for x in suite_status_sources if x.lower() in ['local', 'haruki']]
+    if not suite_status_sources:
+        suite_status_sources = ['local', 'haruki']
 
-    if local_err:
-        local_err = local_err[local_err.find(']')+1:].strip()
-        msg += f"[本地数据]\n获取失败: {local_err}\n"
-    else:
-        msg += "[本地数据]\n"
-        upload_time = datetime.fromtimestamp(local_profile['upload_time'] / 1000)
-        upload_time_text = upload_time.strftime('%m-%d %H:%M:%S') + f"({get_readable_datetime(upload_time, show_original_time=False)})"
-        if local_source := local_profile.get('local_source'):
-            upload_time_text = local_source + " " + upload_time_text
-        msg += f"{upload_time_text}\n"
+    # 状态页展示的数据源由配置控制，避免把具体接口域名写死在公开仓库代码里。
+    source_meta = {
+        'local': ('本地数据', 'local'),
+        'haruki': ('Haruki工具箱', 'haruki'),
+    }
+    tasks = [
+        get_detailed_profile(ctx, qid, raise_exc=False, mode=source_meta[source_key][1], filter=["upload_time"])
+        for source_key in suite_status_sources
+    ]
+    results = await asyncio.gather(*tasks)
 
-    if haruki_err:
-        haruki_err = haruki_err[haruki_err.find(']')+1:].strip()
-        msg += f"[Haruki工具箱]\n获取失败: {haruki_err}\n"
-    else:
-        msg += "[Haruki工具箱]\n"
-        upload_time = datetime.fromtimestamp(haruki_profile['upload_time'] / 1000)
-        upload_time_text = upload_time.strftime('%m-%d %H:%M:%S') + f"({get_readable_datetime(upload_time, show_original_time=False)})"
-        msg += f"{upload_time_text}\n"
+    for source_key, (profile, err) in zip(suite_status_sources, results):
+        source_label = source_meta[source_key][0]
+        if err:
+            err = err[err.find(']')+1:].strip()
+            msg += f"[{source_label}]\n获取失败: {err}\n"
+        else:
+            msg += f"[{source_label}]\n"
+            upload_time = datetime.fromtimestamp(profile["upload_time"] / 1000)
+            upload_time_text = upload_time.strftime("%m-%d %H:%M:%S") + f"({get_readable_datetime(upload_time, show_original_time=False)})"
+            if local_source := profile.get("local_source"):
+                upload_time_text = local_source + " " + upload_time_text
+            msg += f"{upload_time_text}\n"
 
     mode = get_user_data_mode(ctx, ctx.user_id)
     msg += f"---\n"
@@ -1680,6 +2119,10 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(msg)
 
 
+
+
+
+
 # 添加游戏id到黑名单
 pjsk_blacklist = CmdHandler([
     "/pjsk blacklist add", "/pjsk add blacklist",
@@ -1688,7 +2131,26 @@ pjsk_blacklist = CmdHandler([
 pjsk_blacklist.check_cdrate(cd).check_wblist(gbl).check_superuser()
 @pjsk_blacklist.handle()
 async def _(ctx: HandlerContext):
-    args = ctx.get_args().strip()
+    region, uid, reason = _parse_uid_blacklist_args(ctx.get_args().strip())
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.add_blacklist(
+                "uid",
+                uid,
+                region=region,
+                reason=reason or None,
+                operator=str(ctx.user_id),
+            )
+        except Exception as e:
+            raise ReplyException(f"添加游戏ID黑名单失败: {e}")
+    else:
+        blacklist = [str(item) for item in profile_db.get("blacklist", [])]
+        if uid in blacklist:
+            return await ctx.asend_reply_msg(f"ID {uid} 已在黑名单中")
+        blacklist.append(uid)
+        profile_db.set("blacklist", blacklist)
+    extra = f"\n原因: {reason}" if reason else ""
+    return await ctx.asend_reply_msg(f"已将 {region.upper()} 游戏ID {uid} 加入黑名单{extra}")
     assert_and_reply(args, "请提供要添加的游戏ID")
     blacklist = profile_db.get("blacklist", [])
     if args in blacklist:
@@ -1706,7 +2168,26 @@ pjsk_blacklist_remove = CmdHandler([
 pjsk_blacklist_remove.check_cdrate(cd).check_wblist(gbl).check_superuser()
 @pjsk_blacklist_remove.handle()
 async def _(ctx: HandlerContext):
-    args = ctx.get_args().strip()
+    region, uid, _ = _parse_uid_blacklist_args(ctx.get_args().strip())
+    if is_cloud_account_enabled():
+        try:
+            removed = cloud_account_api.remove_blacklist(
+                "uid",
+                uid,
+                region=region,
+                operator=str(ctx.user_id),
+            )
+        except Exception as e:
+            raise ReplyException(f"移除游戏ID黑名单失败: {e}")
+        if not removed:
+            return await ctx.asend_reply_msg(f"{region.upper()} 游戏ID {uid} 不在黑名单中")
+    else:
+        blacklist = [str(item) for item in profile_db.get("blacklist", [])]
+        if uid not in blacklist:
+            return await ctx.asend_reply_msg(f"ID {uid} 不在黑名单中")
+        blacklist.remove(uid)
+        profile_db.set("blacklist", blacklist)
+    return await ctx.asend_reply_msg(f"已将 {region.upper()} 游戏ID {uid} 移出黑名单")
     assert_and_reply(args, "请提供要移除的游戏ID")
     blacklist = profile_db.get("blacklist", [])
     if args not in blacklist:
@@ -1717,6 +2198,83 @@ async def _(ctx: HandlerContext):
 
 
 # 验证用户游戏帐号
+pjsk_qid_blacklist = CmdHandler([
+    "/pjsk qid blacklist add", "/pjsk add qid blacklist",
+    "/pjsk qq blacklist add", "/pjsk add qq blacklist",
+], logger)
+pjsk_qid_blacklist.check_cdrate(cd).check_wblist(gbl).check_superuser()
+@pjsk_qid_blacklist.handle()
+async def _(ctx: HandlerContext):
+    qid, reason = _parse_qid_blacklist_args(ctx.get_args().strip())
+    if is_cloud_account_enabled():
+        try:
+            cloud_account_api.add_blacklist(
+                "qid",
+                qid,
+                reason=reason or None,
+                operator=str(ctx.user_id),
+            )
+        except Exception as e:
+            raise ReplyException(f"添加QQ黑名单失败: {e}")
+    else:
+        blacklist = _get_local_qid_blacklist()
+        if qid in blacklist:
+            return await ctx.asend_reply_msg(f"QQ {qid} 已在黑名单中")
+        blacklist.append(qid)
+        profile_db.set("qid_blacklist", blacklist)
+    extra = f"\n原因: {reason}" if reason else ""
+    return await ctx.asend_reply_msg(f"已将 QQ {qid} 加入黑名单{extra}")
+
+
+pjsk_qid_blacklist_remove = CmdHandler([
+    "/pjsk qid blacklist remove", "/pjsk qid blacklist del",
+    "/pjsk remove qid blacklist", "/pjsk del qid blacklist",
+    "/pjsk qq blacklist remove", "/pjsk qq blacklist del",
+], logger)
+pjsk_qid_blacklist_remove.check_cdrate(cd).check_wblist(gbl).check_superuser()
+@pjsk_qid_blacklist_remove.handle()
+async def _(ctx: HandlerContext):
+    qid, _ = _parse_qid_blacklist_args(ctx.get_args().strip())
+    if is_cloud_account_enabled():
+        try:
+            removed = cloud_account_api.remove_blacklist(
+                "qid",
+                qid,
+                operator=str(ctx.user_id),
+            )
+        except Exception as e:
+            raise ReplyException(f"移除QQ黑名单失败: {e}")
+        if not removed:
+            return await ctx.asend_reply_msg(f"QQ {qid} 不在黑名单中")
+    else:
+        blacklist = _get_local_qid_blacklist()
+        if qid not in blacklist:
+            return await ctx.asend_reply_msg(f"QQ {qid} 不在黑名单中")
+        blacklist.remove(qid)
+        profile_db.set("qid_blacklist", blacklist)
+    return await ctx.asend_reply_msg(f"已将 QQ {qid} 移出黑名单")
+
+
+pjsk_blacklist_list = CmdHandler([
+    "/pjsk blacklist list", "/pjsk list blacklist",
+    "/pjsk黑名单列表", "/pjsk查看黑名单",
+], logger)
+pjsk_blacklist_list.check_cdrate(cd).check_wblist(gbl).check_superuser()
+@pjsk_blacklist_list.handle()
+async def _(ctx: HandlerContext):
+    return await ctx.asend_fold_msg_adaptive(_format_uid_blacklist_list_text())
+
+
+pjsk_qid_blacklist_list = CmdHandler([
+    "/pjsk qid blacklist list", "/pjsk list qid blacklist",
+    "/pjsk qq blacklist list", "/pjsk list qq blacklist",
+], logger)
+pjsk_qid_blacklist_list.check_cdrate(cd).check_wblist(gbl).check_superuser()
+@pjsk_qid_blacklist_list.handle()
+async def _(ctx: HandlerContext):
+    return await ctx.asend_fold_msg_adaptive(_format_qid_blacklist_list_text())
+
+
 verify_game_account = SekaiCmdHandler([
     "/pjsk verify", "/pjsk验证",
 ])
@@ -1932,7 +2490,7 @@ async def _(ctx: HandlerContext):
         group_mode = True
     if '详细' in args or 'detail' in args:
         detail_mode = True
-    bind_list: Dict[str, Dict[str, str]] = profile_db.get("bind_list", {})
+    bind_list: Dict[str, Dict[str, str | list[str]]] = _get_bind_list_snapshot()
     suite_total, mysekai_total, qid_set = 0, 0, set()
     suite_source_total: dict[str, int] = {}
     mysekai_source_total: dict[str, int] = {}
@@ -2020,8 +2578,9 @@ async def _(ctx: HandlerContext):
         # 游戏ID查QQ号
         has_any = False
         msg = f"当前绑定游戏ID{uid}的QQ用户:\n"
+        bind_list_snapshot = _get_bind_list_snapshot()
         for region in ALL_SERVER_REGIONS:
-            bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(region, {})
+            bind_list: Dict[str, str | list[str]] = bind_list_snapshot.get(region, {})
             for qid, items in bind_list.items():
                 if uid in to_list(items):
                     msg += f"{qid}\n"
@@ -2091,3 +2650,4 @@ async def _(ctx: SekaiHandlerContext):
         data['inherit_id'],
         data['inherit_pw'],
     ])
+

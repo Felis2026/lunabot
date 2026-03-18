@@ -20,8 +20,8 @@
 ### 3.1 克隆仓库
 
 ```powershell
-git clone <your_repo_url> nekobot_v2
-cd .\nekobot_v2
+git clone <your_repo_url> your_bot_dir
+cd .\your_bot_dir
 ```
 
 ### 3.2 生成本地 compose 文件（不要直接改 example）
@@ -73,6 +73,33 @@ Copy-Item .\example_config\* .\config\ -Recurse -Force
 
 - LLM、图搜、邮件等功能的 `api_key` / SMTP 配置在对应 yaml 文件中，默认均为占位值。
 
+## 4.4 Sekai 账号云同步（可选）
+
+如果你部署了配套的 Sekai 账号云端 API，可以让多个 bot 实例共享 `sekai` 账号状态。
+
+可选环境变量如下：
+
+```env
+SEKAI_ACCOUNT_API_BASE_URL=https://your-account-api.example.com
+SEKAI_ACCOUNT_API_TOKEN=replace_me
+SEKAI_ACCOUNT_API_TIMEOUT=10
+SEKAI_ACCOUNT_CACHE_TTL=120
+```
+
+说明：
+
+- 如果这些环境变量未配置，bot 会继续使用本地 `data/sekai/profile/db.json`。
+- 如果你有多实例（例如 `bot_a` / `bot_b`）并希望共享 `sekai` 账号数据，再考虑启用该能力。
+
+相关管理命令：
+
+- `/pjsk blacklist add [cn|jp] <uid> [reason]`
+- `/pjsk blacklist remove [cn|jp] <uid>`
+- `/pjsk blacklist list`
+- `/pjsk qid blacklist add <qid> [reason]`
+- `/pjsk qid blacklist remove <qid>`
+- `/pjsk qid blacklist list`
+
 ## 5. 启动
 
 ```powershell
@@ -118,6 +145,12 @@ docker logs --tail 200 napcat_container
 - 确保项目根目录存在 `fonts`，并包含可用中文字体（例如 Microsoft YaHei）。
 - compose 已将 `./fonts` 挂载到容器 `/root/.fonts`。
 
+### 8.3 新版 emoji / pilmoji 兼容性
+
+- 当前仓库已经内置了对新版 `emoji` 依赖的兼容处理。
+- **不需要**再手动去修改 `site-packages/pilmoji/helpers.py`。
+- 如果你参考了旧教程中“手改 `pilmoji` 源码”的步骤，请忽略那部分旧说明。
+
 
 ## 9. 升级流程（建议）
 
@@ -127,4 +160,3 @@ docker compose -f .\docker-compose.yml up -d --build
 ```
 
 如结构有变化，先重新对比 `docker-compose.example.yml` 与 `example_config/` 新增项。
-

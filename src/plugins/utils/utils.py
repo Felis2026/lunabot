@@ -1,5 +1,13 @@
 from ..common.config import *
 from datetime import datetime, timedelta, timezone
+from .control_plane import (
+    mark_periodic_task_cancelled,
+    mark_periodic_task_loop_started,
+    mark_periodic_task_run_failed,
+    mark_periodic_task_run_started,
+    mark_periodic_task_run_succeeded,
+    register_periodic_task,
+)
 
 # ============================ 启动时性能分析 ============================ #
 
@@ -95,6 +103,41 @@ def get_exc_desc(e: Exception) -> str:
     e = str(e)
     if et and e: return f"{et}: {e}"
     else: return et + e
+
+# 上游异常响应体摘要化：
+# 1. 普通短错误信息保持可读；
+# 2. 若返回整页 HTML / WAF 拦截页，则只记录类型、长度和预览，
+#    避免把整页内容直接打进日志，导致 Docker Desktop Logs 被超长单行拖垮。
+def summarize_http_error_detail(detail: Any, content_type: str = "", preview_limit: int = 256) -> str:
+    if detail is None:
+        return ""
+    detail = str(detail).strip()
+    if not detail:
+        return ""
+
+    compact = " ".join(detail.split())
+    body_len = len(detail)
+    content_type = (content_type or "").strip()
+    detail_lower = compact.lower()
+    is_html_page = (
+        detail_lower.startswith("<!doctype html")
+        or detail_lower.startswith("<html")
+        or "<html" in detail_lower[:256]
+        or "safeline" in detail_lower
+        or "challenge.rivers.chaitin.cn" in detail_lower
+    )
+
+    if is_html_page:
+        parts = ["[suspected_html_block_page]"]
+        if content_type:
+            parts.append(f"content_type={content_type}")
+        parts.append(f"body_len={body_len}")
+        parts.append(f"preview={truncate(compact, preview_limit)}")
+        return " ".join(parts)
+
+    if content_type:
+        return f"content_type={content_type} detail={truncate(compact, preview_limit)}"
+    return truncate(compact, preview_limit)
 
 class ProfileTimer:
     def __init__(self, name: str = None):
@@ -316,9 +359,9 @@ def start_repeat_with_interval(
     func: Callable,
     logger: 'Logger',
     name: str,
-    every_output=False, 
-    error_output=True, 
-    error_limit=5, 
+    every_output=False,
+    error_output=True,
+    error_limit=5,
     delay=None
 ):
     """
@@ -326,11 +369,21 @@ def start_repeat_with_interval(
     """
     if delay is None:
         delay = random.uniform(STARTUP_TASK_MIN_DELAY, STARTUP_TASK_MAX_DELAY)
+    task_key = register_periodic_task(
+        func,
+        interval=interval,
+        name=name,
+        every_output=every_output,
+        error_output=error_output,
+        error_limit=error_limit,
+        delay=delay,
+    )
     async def task():
         await asyncio.sleep(delay)
         try:
             error_count = 0
             logger.info(f'开始循环执行 {name} 任务', flush=True)
+            mark_periodic_task_loop_started(task_key)
             next_time = datetime.now() + timedelta(seconds=1)
             while True:
                 now_time = datetime.now()
@@ -338,10 +391,12 @@ def start_repeat_with_interval(
                     try:
                         await asyncio.sleep((next_time - now_time).total_seconds())
                     except asyncio.exceptions.CancelledError:
+                        mark_periodic_task_cancelled(task_key)
                         return
                     except Exception as e:
                         logger.print_exc(f'循环执行 {name} sleep失败')
                 next_time = next_time + timedelta(seconds=get_cfg_or_value(interval))
+                mark_periodic_task_run_started(task_key, started_at=datetime.now(), next_run_at=next_time)
                 try:
                     if every_output:
                         logger.debug(f'开始执行 {name}')
@@ -351,16 +406,23 @@ def start_repeat_with_interval(
                     if error_output and error_count > 0:
                         logger.info(f'循环执行 {name} 从错误中恢复, 累计错误次数: {error_count}')
                     error_count = 0
+                    mark_periodic_task_run_succeeded(task_key)
                 except Exception as e:
+                    mark_periodic_task_run_failed(task_key, e)
                     if error_output and error_count < error_limit - 1:
                         logger.warning(f'循环执行 {name} 失败: {e} (失败次数 {error_count + 1})')
                     elif error_output and error_count == error_limit - 1:
                         logger.print_exc(f'循环执行 {name} 失败 (达到错误次数输出上限)')
                     error_count += 1
 
+        except asyncio.exceptions.CancelledError:
+            mark_periodic_task_cancelled(task_key)
+            return
         except Exception as e:
+            mark_periodic_task_run_failed(task_key, e)
             logger.print_exc(f'循环执行 {name} 任务失败')
     _pending_startup_tasks.append(task)
+
 
 def repeat_with_interval(
     interval_secs: int | ConfigItem, 
@@ -683,13 +745,16 @@ async def download_file(url, file_path):
     """
     async with get_client_session().get(url, verify_ssl=False) as resp:
         if resp.status != 200:
-            raise Exception(f"下载文件 {truncate(url, 32)} 失败: {resp.status} {resp.reason}")
-        with open(file_path, 'wb') as f:
-            f.write(await resp.read())
-
-class TempDownloadFilePath(TempFilePath):
-    def __init__(self, url, ext: str = None, remove_after: timedelta = None):
-        self.url = url
+            detail = ""
+            try:
+                detail = await resp.text()
+                detail = loads_json(detail)['detail']
+            except:
+                pass
+            # 统一摘要化上游错误体，避免 HTML 拦截页把日志打成超长单行。
+            detail = summarize_http_error_detail(detail, resp.content_type)
+            utils_logger.error(f"下载 {url} 失败: {resp.status} {detail}")
+            raise HttpError(resp.status, detail)
         if ext is None:
             ext = url.split('.')[-1]
         super().__init__(ext, remove_after)
@@ -1435,3 +1500,4 @@ if _memray_at_startup:
         _memray_tracker.__exit__(None, None, None)
         print(f"启动时内存分析已保存到 {_memray_save_path}")
         _memray_tracker = None
+

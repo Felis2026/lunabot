@@ -11,6 +11,7 @@ class GameApiConfig:
     api_status_url: Optional[str] = None
     profile_api_url: Optional[str] = None 
     suite_api_url: Optional[str] = None
+    suite_status_sources: Optional[list[str]] = None
     mysekai_api_url: Optional[str] = None  
     mysekai_photo_api_url: Optional[str] = None 
     mysekai_upload_time_api_url: Optional[str] = None 
@@ -49,13 +50,25 @@ async def request_gameapi(url: str, method: str = 'GET', data_type: str | None =
     try:
         async with get_client_session().request(method, url, headers=headers, verify_ssl=False, **kwargs) as resp:
             if resp.status != 200:
+                raw_detail = ""
+                body_text = ""
                 try:
-                    detail = await resp.text()
-                    detail = loads_json(detail)['detail']
+                    body_text = await resp.text()
+                    # 统一保留原始结构化错误体：
+                    # 1. 若上游返回 {"detail": ...}，沿用 detail 字段；
+                    # 2. 若上游直接返回 JSON 对象（如 suite-api 的 404 message），保留整个对象；
+                    # 3. 非 JSON 时再退回原始文本。
+                    parsed_body = loads_json(body_text)
+                    if isinstance(parsed_body, dict) and 'detail' in parsed_body:
+                        raw_detail = parsed_body['detail']
+                    else:
+                        raw_detail = parsed_body
                 except:
-                    pass
-                utils_logger.error(f"请求游戏API后端 {url} 失败: {resp.status} {detail}")
-                raise HttpError(resp.status, detail)
+                    raw_detail = body_text
+                # 保留原始 detail 供上层业务判断；日志仍使用摘要文本，避免超长错误体刷爆日志。
+                log_detail = summarize_http_error_detail(raw_detail, resp.content_type)
+                utils_logger.error(f"请求游戏API后端 {url} 失败: {resp.status} {log_detail}")
+                raise HttpError(resp.status, raw_detail)
             
             # 记录服务器实际返回的压缩格式（aiohttp会自动解压）
             content_encoding = (resp.headers.get('Content-Encoding') or '').lower()

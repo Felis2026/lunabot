@@ -200,6 +200,41 @@ def get_exc_desc(e: Exception) -> str:
         return f"{et}: {e}"
     return et or e
 
+# 上游异常响应体摘要化：
+# 1. 普通短错误信息保持可读；
+# 2. 若返回整页 HTML / WAF 拦截页，则只记录类型、长度和预览，
+#    避免把整页内容直接打进日志，导致 Docker Desktop Logs 被超长单行拖垮。
+def summarize_http_error_detail(detail: Any, content_type: str = "", preview_limit: int = 256) -> str:
+    if detail is None:
+        return ""
+    detail = str(detail).strip()
+    if not detail:
+        return ""
+
+    compact = " ".join(detail.split())
+    body_len = len(detail)
+    content_type = (content_type or "").strip()
+    detail_lower = compact.lower()
+    is_html_page = (
+        detail_lower.startswith("<!doctype html")
+        or detail_lower.startswith("<html")
+        or "<html" in detail_lower[:256]
+        or "safeline" in detail_lower
+        or "challenge.rivers.chaitin.cn" in detail_lower
+    )
+
+    if is_html_page:
+        parts = ["[suspected_html_block_page]"]
+        if content_type:
+            parts.append(f"content_type={content_type}")
+        parts.append(f"body_len={body_len}")
+        parts.append(f"preview={truncate(compact, preview_limit)}")
+        return " ".join(parts)
+
+    if content_type:
+        return f"content_type={content_type} detail={truncate(compact, preview_limit)}"
+    return truncate(compact, preview_limit)
+
 def create_parent_folder(path: str) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path
@@ -388,7 +423,7 @@ class Config:
         mtime = int(os.path.getmtime(self.path))
         if self.name not in Config._data or Config._data[self.name].mtime != mtime:
             try:
-                with open(self.path, 'r') as f:
+                with open(self.path, 'r', encoding='utf-8') as f:
                     data = yaml.safe_load(f)
                 Config._data[self.name] = ConfigData(mtime=mtime, data=data)
             except Exception as e:
