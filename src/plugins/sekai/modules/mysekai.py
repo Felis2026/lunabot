@@ -6,6 +6,7 @@ from ..asset import *
 from ..draw import *
 from ..sub import SekaiUserSubHelper, SekaiGroupSubHelper
 from ..gameapi import get_gameapi_config, request_gameapi
+from ..oauth import _normalize_suite_source_mode
 from .profile import (
     get_player_bind_id, 
     get_player_bind_count,
@@ -14,7 +15,6 @@ from .profile import (
     get_basic_profile,
     get_player_avatar_info_by_basic_profile,
     get_player_avatar_info_by_detailed_profile,
-    get_user_data_mode,
     get_detailed_profile,
     get_detailed_profile_card,
     get_detailed_profile_card_filter,
@@ -22,6 +22,8 @@ from .profile import (
     get_player_frames,
     get_avatar_widget_with_frame,
     process_sensitive_cmd_source,
+    get_suite_source_display_name,
+    get_user_suite_source_mode,
 )
 from .music import get_music_cover_thumb, is_valid_music
 from .card import get_character_sd_image
@@ -96,6 +98,105 @@ harvest_point_image_offsets_cache: dict[int, Tuple[Image.Image, tuple[int, int]]
 
 MYSEKAI_ICON_CACHE_RES = 64 * 64
 
+
+# ================================ MySekai来源展示映射 ================================ #
+# 云端实际存储的 `source` / `local_source` 是机器值；
+# 这里统一做成人类可读名称，避免卡面和 `/msd` 继续直接展示内部标识。
+MYSEKAI_LOCAL_SOURCE_DISPLAY = {
+    "shadowrocket": "iOS模块上传",
+    "mysekaiproxy_android": "Mysekai-Proxy上传",
+    "group_sync": "群文件同步上传",
+    "sync": "群文件同步上传",
+    "web": "网页手动上传",
+    "module_raw": "模块上传",
+}
+
+
+def get_mysekai_local_source_display_name(local_source: str | None) -> str:
+    normalized = str(local_source or "").strip().lower()
+    if not normalized:
+        return ""
+    return MYSEKAI_LOCAL_SOURCE_DISPLAY.get(normalized, str(local_source).strip())
+
+
+def get_mysekai_source_display_name(source: str | None, local_source: str | None = None) -> str:
+    normalized = str(source or "").strip().lower()
+    if normalized in {"local"}:
+        base = "Felis Cloud"
+        detail = get_mysekai_local_source_display_name(local_source)
+        return f"{base}（{detail}）" if detail else base
+    if normalized in {"haruki", "remote"}:
+        return "Haruki工具箱"
+    return str(source or "?")
+
+
+# ================================ MySekai状态页查询策略 ================================ #
+# `/msd` 不再继续沿用旧“双查 local + haruki”的展示世界观。
+# 当前第一阶段直接按区服固定来源：
+def get_mysekai_status_sources(region: str) -> list[tuple[str, str]]:
+    normalized = str(region or "").strip().lower()
+    if normalized == "cn":
+        return [("Felis Cloud", "local")]
+    if normalized == "jp":
+        return [("Haruki工具箱", "haruki")]
+    return [("本地数据", "local"), ("Haruki工具箱", "haruki")]
+
+
+# ================================ MySekai区服来源策略 ================================ #
+# MySekai 这一轮整改的目标不是再给用户暴露一套 mode 选择器，
+# 而是按区服固定收口成单一路径：
+# - CN：只走 本地上传链路
+# - JP：只走 Haruki工具箱
+#
+# 关键约束：
+# 1. 展示层已经不再向用户暴露 MySekai 的旧 latest/default/local/haruki
+# 2. 运行时也必须同步收口，不能继续偷偷读取用户旧 data_mode
+# 3. 仅在未来重新开放其他区服时，才允许回退到 legacy_data_mode
+MYSEKAI_SOURCE_POLICY_BY_REGION = {
+    "cn": "cloud_only",
+    "jp": "haruki_only",
+}
+
+MYSEKAI_POLICY_FETCH_MODE = {
+    "cloud_only": "local",
+    "haruki_only": "haruki",
+}
+
+
+def get_mysekai_source_policy(region: str) -> str:
+    """返回当前区服的 MySekai 固定来源策略。"""
+    normalized = str(region or "").strip().lower()
+    return MYSEKAI_SOURCE_POLICY_BY_REGION.get(normalized, "legacy_data_mode")
+
+
+def get_effective_mysekai_fetch_mode(
+    ctx: SekaiHandlerContext,
+    qid: int | None = None,
+    requested_mode: str | None = None,
+) -> str:
+    """
+    统一计算 MySekai 实际取数 mode。
+
+    设计目的：
+    - CN/JP 已经进入固定来源策略，不再读取旧 data_mode
+    - 显式传入的 mode 也不能突破区服固定策略，避免旧调用链把 latest/default/local/haruki 带回来
+    - 仅未收口区服才保留 legacy data_mode 兼容
+    """
+    policy = get_mysekai_source_policy(ctx.region)
+    if policy in MYSEKAI_POLICY_FETCH_MODE:
+        return MYSEKAI_POLICY_FETCH_MODE[policy]
+
+    normalized_mode = str(requested_mode or "").strip().lower()
+    if normalized_mode:
+        return normalized_mode
+
+    # 未收口区服才允许继续复用旧 data_mode。
+    from .profile import get_user_data_mode
+
+    owner_qid = qid if qid is not None else ctx.user_id
+    return get_user_data_mode(ctx, owner_qid)
+
+
 # ======================= 处理逻辑 ======================= #
 
 # 获取ms自然刷新小时
@@ -147,8 +248,12 @@ async def get_mysekai_info(
         if not url:
             raise ReplyException(f"暂不支持{get_region_name(ctx.region)}的Mysekai抓包数据查询")
 
-        # 获取模式
-        mode = mode or get_user_data_mode(ctx, qid)
+        # ================================ 运行时来源收口 ================================ #
+        # MySekai 现在按区服固定来源策略取数：
+        # - CN 固定 local（Felis Cloud）
+        # - JP 固定 haruki
+        # 这里不能再默认读取旧 data_mode，否则展示层虽然改了，底层仍会被历史值带偏。
+        mode = get_effective_mysekai_fetch_mode(ctx, qid=qid, requested_mode=mode)
 
         # 尝试下载
         try:
@@ -211,10 +316,10 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
                     mysekai_game_data = mysekai_info['updatedResources']['userMysekaiGamedata']
                     if ctx.region in BD_MYSEKAI_REGIONS:
                         process_sensitive_cmd_source(mysekai_info)
-                    source = mysekai_info.get('source', '?')
-                    if local_source := mysekai_info.get('local_source'):
-                        source += f"({local_source})"
-                    mode = get_user_data_mode(ctx, ctx.user_id)
+                    source = get_mysekai_source_display_name(
+                        mysekai_info.get('source'),
+                        mysekai_info.get('local_source'),
+                    )
                     update_time = datetime.fromtimestamp(mysekai_info['upload_time'] / 1000)
                     update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(update_time, show_original_time=False)})"
                     with HSplit().set_content_align('lb').set_item_align('lb').set_sep(5):
@@ -232,7 +337,7 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
 
                     TextBox(f"{ctx.region.upper()}: {process_hide_uid(ctx, game_data['userId'], keep=6)} Mysekai数据", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
                     TextBox(f"更新时间: {update_time_text}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
-                    TextBox(f"数据来源: {source}  获取模式: {mode}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
+                    TextBox(f"数据来源: {source}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
             if err_msg:
                 TextBox(f"获取数据失败:{err_msg}", TextStyle(font=DEFAULT_FONT, size=20, color=RED), line_count=3).set_w(240)
     return f
@@ -249,10 +354,12 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = profile['userGamedata']
-                    source = profile.get('source', '?')
+                    source = get_suite_source_display_name(profile.get('source', '?'))
                     if local_source := profile.get('local_source'):
                         source += f"({local_source})"
-                    mode = mode or get_user_data_mode(ctx, ctx.user_id)
+                    # Suite 现在对外只展示新三态。
+                    # 这里额外做一次归一化，防止历史调用链把 latest/local/haruki 直接带进卡片头部。
+                    suite_mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
                     update_time = datetime.fromtimestamp(profile['upload_time'] / 1000)
                     update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(update_time, show_original_time=False)})"
                     user_id = process_hide_uid(ctx, game_data['userId'], keep=6)
@@ -260,9 +367,10 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                     mysekai_game_data = mysekai_info['updatedResources']['userMysekaiGamedata']
                     if ctx.region in BD_MYSEKAI_REGIONS:
                         process_sensitive_cmd_source(mysekai_info)
-                    ms_source = mysekai_info.get('source', '?')
-                    if ms_local_source := mysekai_info.get('local_source'):
-                        ms_source += f"({ms_local_source})"
+                    ms_source = get_mysekai_source_display_name(
+                        mysekai_info.get('source'),
+                        mysekai_info.get('local_source'),
+                    )
                     ms_update_time = datetime.fromtimestamp(mysekai_info['upload_time'] / 1000)
                     ms_update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(ms_update_time, show_original_time=False)})"
 
@@ -282,9 +390,9 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                     style = TextStyle(font=DEFAULT_FONT, size=16, color=BLACK)
                     TextBox(f"{ctx.region.upper()}: {user_id}", style)
                     TextBox(f"Suite更新时间: {update_time_text}", style)
-                    TextBox(f"数据来源: {source} 获取模式: {mode}", style)
+                    TextBox(f"Suite数据来源: {source} 获取模式: {suite_mode}", style)
                     TextBox(f"Mysekai更新时间: {ms_update_time_text}", style)
-                    TextBox(f"数据来源: {ms_source} 获取模式: {mode}", style)
+                    TextBox(f"Mysekai数据来源: {ms_source}", style)
             if err_msg:
                 TextBox(f"获取数据失败: {err_msg}", TextStyle(font=DEFAULT_FONT, size=20, color=RED), line_count=3).set_w(300)
     return f
@@ -2157,35 +2265,31 @@ async def _(ctx: SekaiHandlerContext):
     qid = int(cqs['at'][0]['qq']) if 'at' in cqs else ctx.user_id
     uid = get_player_bind_id(ctx)
 
-    task1 = get_mysekai_info(ctx, qid, raise_exc=False, mode="local", filter=['upload_time'])
-    task2 = get_mysekai_info(ctx, qid, raise_exc=False, mode="haruki", filter=['upload_time'])
-    (local_profile, local_err), (haruki_profile, haruki_err) = await asyncio.gather(task1, task2)
-
     msg = f"{process_hide_uid(ctx, uid, keep=6)}({ctx.region.upper()}) Mysekai数据\n"
+    status_sources = get_mysekai_status_sources(ctx.region)
+    tasks = [
+        get_mysekai_info(ctx, qid, raise_exc=False, mode=mode, filter=['upload_time'])
+        for _, mode in status_sources
+    ]
+    results = await asyncio.gather(*tasks)
 
-    if local_err:
-        local_err = local_err[local_err.find(']')+1:].strip()
-        msg += f"[本地数据]\n获取失败: {local_err}\n"
-    else:
-        msg += "[本地数据]\n"
-        upload_time = datetime.fromtimestamp(local_profile['upload_time'] / 1000)
+    for (source_label, mode), (profile, err) in zip(status_sources, results):
+        if err:
+            err = err[err.find(']')+1:].strip()
+            msg += f"[{source_label}]\n获取失败: {err}\n"
+            continue
+
+        msg += f"[{source_label}]\n"
+        upload_time = datetime.fromtimestamp(profile['upload_time'] / 1000)
         upload_time_text = upload_time.strftime('%m-%d %H:%M:%S') + f"({get_readable_datetime(upload_time, show_original_time=False)})"
-        if ctx.region in BD_MYSEKAI_REGIONS:
-            process_sensitive_cmd_source(local_profile)
-        if local_source := local_profile.get('local_source'):
-            upload_time_text = local_source + " " + upload_time_text
+
+        if mode == "local" and ctx.region in BD_MYSEKAI_REGIONS:
+            process_sensitive_cmd_source(profile)
+        if mode == "local" and (local_source := profile.get('local_source')):
+            upload_time_text = get_mysekai_local_source_display_name(local_source) + " " + upload_time_text
+
         msg += f"{upload_time_text}\n"
 
-    if haruki_err:
-        haruki_err = haruki_err[haruki_err.find(']')+1:].strip()
-        msg += f"[Haruki工具箱]\n获取失败: {haruki_err}\n"
-    else:
-        msg += "[Haruki工具箱]\n"
-        upload_time = datetime.fromtimestamp(haruki_profile['upload_time'] / 1000)
-        upload_time_text = upload_time.strftime('%m-%d %H:%M:%S') + f"({get_readable_datetime(upload_time, show_original_time=False)})"
-        msg += f"{upload_time_text}\n"
-
-    mode = get_user_data_mode(ctx, ctx.user_id)
     msg += f"---\n"
     msg += f"该指令查询Mysekai数据，查询Suite数据请使用\"/{ctx.region}抓包状态\"\n"
     # msg += f"数据获取模式: {mode}，使用\"/{ctx.region}抓包模式\"来切换模式\n"
@@ -2272,14 +2376,17 @@ async def msr_auto_push():
         if not get_upload_time_url: continue
         if region not in msr_sub.regions: continue
 
-        # 获取订阅的用户列表和抓包模式
+        # ================================ 订阅来源策略收口 ================================ #
+        # 自动推送和上传时间探测也必须与当前 MySekai 真实来源策略一致，
+        # 否则用户侧手动查询与定时任务会各走各的链路，造成“界面看起来正常、订阅却不触发”。
         qids = list(set([qid for qid, gid in msr_sub.get_all_gid_uid(region)]))
-        uid_modes: list[tuple[int, int]] = []
+        uid_modes: list[tuple[int, str]] = []
         for qid in qids:
+            fetch_mode = get_effective_mysekai_fetch_mode(ctx, qid=qid)
             for i in range(get_player_bind_count(ctx, qid)):
                 try:
                     if uid := get_player_bind_id(ctx, qid, index=i):
-                        uid_modes.append((uid, get_user_data_mode(ctx, qid)))
+                        uid_modes.append((uid, fetch_mode))
                 except:
                     pass
         if not uid_modes: continue
@@ -2298,7 +2405,7 @@ async def msr_auto_push():
         except Exception as e:
             logger.warning(f"获取{region_name}Mysekai上传时间失败: {get_exc_desc(e)}")
             continue
-        upload_times: dict[tuple[str, str], int] = { uid_mode: ts for uid_mode, ts in zip(uid_modes, upload_times) }
+        upload_times: dict[tuple[int, str], int] = { uid_mode: ts for uid_mode, ts in zip(uid_modes, upload_times) }
 
         need_push_uid_modes = [] # 需要推送的uid_mode（有及时更新数据并且没有距离太久的）
         last_refresh_time = get_mysekai_last_refresh_time_and_reason(ctx)[0]
@@ -2318,7 +2425,7 @@ async def msr_auto_push():
                 msr_last_push_time = file_db.get(f"{region}_msr_last_push_time", {})
 
                 uid = get_player_bind_id(ctx, qid, index=i)
-                mode = get_user_data_mode(ctx, qid)
+                mode = get_effective_mysekai_fetch_mode(ctx, qid=qid)
                 if not uid or (uid, mode) not in need_push_uid_modes:
                     continue
 

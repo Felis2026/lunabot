@@ -5,6 +5,13 @@ from ..asset import *
 from ..draw import *
 from ..gameapi import get_gameapi_config, request_gameapi
 from .. import account_api as cloud_account_api
+from ..oauth import (
+    _default_suite_source_policy,
+    _normalize_suite_source_mode,
+    build_authorize_url,
+    clear_oauth_runtime_cache,
+    get_oauth_game_data,
+)
 from .honor import compose_full_honor_image
 from .resbox import get_res_box_info, get_res_icon
 from ...utils.safety import *
@@ -29,6 +36,282 @@ class PlayerAvatarInfo:
 
 DEFAULT_DATA_MODE = 'latest'
 VALID_DATA_MODES = ['latest', 'default', 'local', 'haruki']
+VALID_SUITE_SOURCE_MODES = ['default', 'oauth', 'public']
+
+
+# ================================ Suite 来源策略 ================================ #
+# suite 已经不再复用旧 data_mode 的真实来源语义，而是改成独立的三态：
+# - default：自己查自己时先走 OAuth，失败再回退 Public-API
+# - oauth：自己查自己时只走 OAuth
+# - public：统一只走 Public-API
+#
+# 但升级前写进本地 / 云端的旧值仍可能是 latest / local / haruki，
+# 所以读取时必须集中做一次兼容归一化，不能把判断散落到各条命令里。
+def get_user_suite_source_mode(ctx: SekaiHandlerContext, qid: int) -> str:
+    """读取用户的 suite 来源模式，并兼容旧 data_mode 残留值。"""
+    if state := _get_cloud_state(ctx, qid):
+        pref = state.get("preferences", {})
+        if isinstance(pref, dict):
+            if pref.get("suite_source_mode") is not None:
+                return _normalize_suite_source_mode(pref.get("suite_source_mode"))
+            if pref.get("data_mode") is not None:
+                return _normalize_suite_source_mode(pref.get("data_mode"))
+
+    suite_source_modes = profile_db.get("suite_source_modes", {})
+    raw_mode = suite_source_modes.get(ctx.region, {}).get(str(qid))
+    if raw_mode is not None:
+        return _normalize_suite_source_mode(raw_mode)
+
+    legacy_data_modes = profile_db.get("data_modes", {})
+    raw_mode = legacy_data_modes.get(ctx.region, {}).get(str(qid))
+    if raw_mode is not None:
+        return _normalize_suite_source_mode(raw_mode)
+
+    return _default_suite_source_policy()
+
+
+def can_use_oauth_suite(ctx: SekaiHandlerContext, qid: int, uid: str) -> bool:
+    """
+    只有“当前发起者查自己的 suite 远端数据”才允许先走 OAuth。
+
+    关键约束：
+    - `public` 模式下直接关闭 OAuth
+    - `u2 / u3` 这类“查自己其他绑定”允许走 OAuth
+    - `@别人`、直接输入游戏 UID、管理员代查都不允许走 OAuth
+    """
+    if get_user_suite_source_mode(ctx, qid) == 'public':
+        return False
+
+    requester_qid = str(ctx.user_id)
+    if str(qid) != requester_qid:
+        return False
+
+    uid_arg = (ctx.uid_arg or '').strip()
+    if uid_arg.startswith('@'):
+        return False
+    if uid_arg.isdigit():
+        return False
+
+    own_uids = set()
+    for index in range(get_player_bind_count(ctx, qid)):
+        own_uid = get_player_bind_id(ctx, qid, check_bind=False, index=index)
+        if own_uid:
+            own_uids.add(str(own_uid))
+    return str(uid) in own_uids
+
+
+def get_suite_source_display_name(source: str | None) -> str:
+    """将 suite 的机器来源值映射成面向用户的展示名称。"""
+    normalized = str(source or '').strip().lower()
+    if normalized in {'haruki_oauth'}:
+        return 'Haruki工具箱'
+    if normalized in {'haruki_public', 'haruki', 'public', 'remote'}:
+        return 'Haruki Public-API'
+    return source or '?'
+
+
+def normalize_suite_source_value(source: str | None, fallback: str) -> str:
+    """统一 suite 的来源机器值，避免旧字段混进展示层。"""
+    normalized = str(source or '').strip().lower()
+    if normalized in {'haruki_oauth', 'oauth'}:
+        return 'haruki_oauth'
+    if normalized in {'haruki_public', 'haruki', 'public', 'remote'}:
+        return 'haruki_public'
+    return fallback
+
+
+def get_suite_public_warning_text(ctx: SekaiHandlerContext, profile: dict | None) -> str:
+    """只在 self-query 且最终落到 Public-API 时给出额外提醒。"""
+    if not isinstance(profile, dict):
+        return ""
+
+    source = normalize_suite_source_value(profile.get('source'), 'haruki_public')
+    if source != 'haruki_public':
+        return ""
+
+    requested_qid = str(profile.get('_requested_qid') or ctx.user_id)
+
+    # Public-API / OAuth 兼容层有时只返回裁剪后的字段，`userGamedata.userId`
+    # 可能并不稳定存在；但“是否属于自己查询”不能因此误判丢掉红字提醒。
+    uid = (
+        _get_nested_uid_from_suite_profile(profile)
+        or str(profile.get('_requested_uid') or '').strip()
+        or _get_requested_suite_uid_for_warning(ctx, requested_qid)
+    )
+    if uid and can_use_oauth_suite(ctx, requested_qid, str(uid)):
+        return '公开API即将关闭，请尽快使用 /授权 使本Bot能够访问您的数据'
+    return ""
+
+
+def get_suite_expected_source_name(ctx: SekaiHandlerContext, qid: int, uid: str, suite_mode: str) -> str:
+    """在请求失败时，根据当前策略推断状态页应展示的数据源名称。"""
+    # `default` 模式下自己查自己时，本质上仍是“优先走 OAuth”。
+    # 因此错误态不能再一刀切显示 Public-API，否则会出现：
+    # - 实际已授权
+    # - 但状态页标题还写着 Haruki Public-API
+    # 这种明显互相打架的展示。
+    if suite_mode != 'public' and can_use_oauth_suite(ctx, qid, uid):
+        return 'Haruki工具箱'
+    return 'Haruki Public-API'
+
+
+# ================================ Suite 状态页授权摘要 ================================ #
+# `/抓包状态` 面向用户时只补一行“授权状态”摘要，不直接展开 OAuth 技术细节。
+# 这里的目标是回答：
+# 1. 是否已经授权
+# 2. 当前是否具备自动续期能力
+# 3. 如果本次已经回退到 Public，是否要提示“当前使用公开接口”
+def get_suite_oauth_status_text(
+    ctx: SekaiHandlerContext,
+    qid: int,
+    uid: str,
+    suite_mode: str,
+    profile: dict | None,
+    fetch_error: str = "",
+) -> str:
+    if not can_use_oauth_suite(ctx, qid, uid):
+        return ""
+
+    state = _get_cloud_state(ctx, qid)
+    if not isinstance(state, dict):
+        return ""
+
+    if not bool(state.get("oauth_authorized", False)):
+        return "授权状态: 未授权"
+
+    # 这里不要再根据一次失败擅自推断 “OAuth 不可用”。
+    # 当前 Bot 链路里很多 OAuth 失败会先被收口成 None 回退，
+    # 如果在状态页继续脑补失败原因，很容易和真实运行状态打架。
+    if fetch_error and suite_mode != 'public':
+        if not bool(state.get("oauth_has_refresh_token", False)):
+            return "授权状态: 已授权（需重新授权）"
+        return "授权状态: 已授权"
+
+    source = normalize_suite_source_value(
+        profile.get("source") if isinstance(profile, dict) else None,
+        "",
+    )
+    if source == "haruki_public" and suite_mode != "public":
+        return "授权状态: 已授权（暂时异常，当前使用公开接口）"
+
+    if not bool(state.get("oauth_has_refresh_token", False)):
+        return "授权状态: 已授权（需重新授权）"
+
+    return "授权状态: 已授权（自动续期正常）"
+
+
+def format_suite_missing_fields_error(
+    ctx: SekaiHandlerContext,
+    profile: dict | None,
+    missing_keys: list[str] | set[str] | tuple[str, ...],
+) -> str:
+    """统一格式化 suite 缺字段错误，避免各模块各写一份。"""
+    source = get_suite_source_display_name(profile.get('source', '?') if isinstance(profile, dict) else '?')
+    upload_time_ms = to_unix_millis(profile.get('upload_time') if isinstance(profile, dict) else None)
+    update_time = datetime.fromtimestamp(upload_time_ms / 1000).strftime('%m-%d %H:%M:%S') if upload_time_ms else "?"
+    missing_text = ', '.join(missing_keys)
+    return (f"你的{get_region_name(ctx.region)}Suite抓包数据中缺少必要的字段: {missing_text}"
+            f" (数据来源: {source} 更新时间: {update_time})")
+
+
+def _get_nested_uid_from_suite_profile(profile: dict | None) -> str | None:
+    """从 suite 数据里尽量提取 userId，用于 self-query 判断。"""
+    if not isinstance(profile, dict):
+        return None
+
+    for path in (
+        ('userGamedata', 'userId'),
+        ('user', 'userId'),
+        ('userGamedata', 'id'),
+    ):
+        cur = profile
+        for key in path:
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(key)
+        if cur is not None:
+            return str(cur)
+    return None
+
+
+def _get_requested_suite_uid_for_warning(ctx: SekaiHandlerContext, qid: int | str | None = None) -> str | None:
+    """
+    在 payload 缺少 userId 时，回退到“这次查询实际指向的 UID”。
+
+    这样即使 Public-API 只返回了极少数字段，self-query 的隐私提醒也不会静默消失。
+    """
+    try:
+        if qid is None:
+            uid = get_player_bind_id(ctx, check_bind=False)
+        else:
+            uid = get_player_bind_id(ctx, int(qid), check_bind=False)
+    except Exception:
+        return None
+    return str(uid) if uid else None
+
+
+def _get_suite_display_name_for_card(ctx: SekaiHandlerContext, detail_profile: dict) -> str:
+    """
+    获取 suite 简卡使用的昵称展示文本。
+
+    OAuth suite 当前实测不一定返回 `userGamedata.name`，因此这里必须做本地兜底，
+    否则头像卡片会因为单个展示字段缺失而整张图失败。
+    """
+    game_data = detail_profile.get('userGamedata', {})
+    if isinstance(game_data, dict):
+        name = str(game_data.get('name') or '').strip()
+        if name:
+            return name
+
+        uid = game_data.get('userId')
+        if uid:
+            return f"玩家 {process_hide_uid(ctx, uid, keep=6)}"
+    return "未获取到昵称"
+
+
+def _get_avatar_deck_from_detailed_profile(
+    ctx: SekaiHandlerContext,
+    detail_profile: dict,
+) -> tuple[int | str, dict]:
+    """
+    从详细 profile 里解析头像卡片应使用的 deck。
+
+    兼容约束：
+    - 旧公开接口：优先读取 `userGamedata.deck`
+    - 当前 OAuth suite：可能没有该字段，只能退化为首个可用 deck
+    """
+    user_gamedata = detail_profile.get('userGamedata')
+    user_decks = detail_profile.get('userDecks')
+    if not isinstance(user_gamedata, dict) or not isinstance(user_decks, list):
+        raise ReplyException(format_suite_missing_fields_error(ctx, detail_profile, ['userGamedata', 'userDecks']))
+
+    deck_id = user_gamedata.get('deck')
+    if deck_id not in (None, ''):
+        deck = find_by(user_decks, 'deckId', deck_id)
+        if isinstance(deck, dict):
+            return deck_id, deck
+
+    # OAuth suite 当前没有稳定返回“当前选中卡组”字段时，退化到首个可用 deck，
+    # 至少保证头像、头衔等前置信息能画出来，而不是整条命令直接 KeyError。
+    for deck in user_decks:
+        if isinstance(deck, dict) and deck.get('deckId') not in (None, ''):
+            return deck['deckId'], deck
+
+    raise ReplyException(format_suite_missing_fields_error(ctx, detail_profile, ['userDecks']))
+
+
+def _get_legacy_suite_request_mode(suite_mode: str) -> str:
+    """
+    兼容仍在使用旧双源后端的部署。
+
+    旧后端并不认识 `oauth / public`，只能退化成：
+    - default -> default
+    - oauth/public -> haruki
+    """
+    if suite_mode == 'default':
+        return 'default'
+    return 'haruki'
 
 
 # ================================ 云端账号同步 ================================ #
@@ -476,7 +759,7 @@ def get_player_bind_count(ctx: SekaiHandlerContext, qid: int) -> int:
 def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=True, index: int | None=None) -> str:
     is_super = check_superuser(ctx.event) if ctx.event else False
     region_name = get_region_name(ctx.region)
-
+    
     bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(ctx.region, {})
     main_bind_list: Dict[str, str] = profile_db.get("main_bind_list", {}).get(ctx.region, {})
     state_qid = str(qid) if qid is not None else str(ctx.user_id)
@@ -907,6 +1190,8 @@ async def get_basic_profile(ctx: SekaiHandlerContext, uid: int, use_cache=True, 
             logger.print_exc(f"获取 {ctx.region} {uid} 基本信息失败，使用缓存数据")
             profile = load_json(cache_path)
             return profile
+        if reply_msg := get_temporary_gameapi_reply("玩家信息服务", e):
+            raise ReplyException(reply_msg)
         raise e
 
 # 获取玩家基本信息的简单卡片控件，返回Frame
@@ -1043,6 +1328,39 @@ def use_suite_public_contract(url: str) -> bool:
     return "/public/" in normalized and "{uid}" in normalized
 
 
+# ================================ 上游临时异常收口 ================================ #
+# Public / Profile 旧链路在 5xx 或 HTML/WAF 错误页时，过去会把 HttpError 原样抛到指令层，
+# 最终在群里表现成“指令处理失败: HttpError: 502...”。这里集中做一次识别，
+# 只收口“明显是上游临时故障”的情况，保留 403/404 等已有业务语义分支。
+TEMPORARY_GAMEAPI_STATUS_CODES = {500, 502, 503, 504}
+
+
+def is_temporary_gameapi_http_error(exc: HttpError) -> bool:
+    if exc.status_code in TEMPORARY_GAMEAPI_STATUS_CODES:
+        return True
+    detail_summary = summarize_http_error_detail(exc.message)
+    return "[suspected_html_block_page]" in detail_summary
+
+
+def is_suspected_html_gameapi_exception(exc: Exception) -> bool:
+    exc_text = get_exc_desc(exc).lower()
+    return (
+        ("unexpected mimetype" in exc_text and "text/html" in exc_text)
+        or "<!doctype html" in exc_text
+        or "<html" in exc_text
+        or "safeline" in exc_text
+    )
+
+
+def get_temporary_gameapi_reply(service_name: str, exc: Exception) -> str | None:
+    if isinstance(exc, HttpError):
+        if not is_temporary_gameapi_http_error(exc):
+            return None
+    elif not is_suspected_html_gameapi_exception(exc):
+        return None
+    return f"{service_name}暂时不可用，请稍后再试"
+
+
 async def get_detailed_profile(
     ctx: SekaiHandlerContext, 
     qid: int, 
@@ -1054,8 +1372,9 @@ async def get_detailed_profile(
 ) -> Tuple[dict, str]:
     cache_path = None
     uid = None
+    use_suite_api_public = False
     try:
-        # 获取绑定的游戏id
+        # 获取绑定的游戏 id
         try:
             uid = get_player_bind_id(ctx)
         except Exception as e:
@@ -1072,54 +1391,85 @@ async def get_detailed_profile(
         if not url:
             raise ReplyException(f"暂不支持查询{get_region_name(ctx.region)}的抓包数据")
         use_suite_api_public = use_suite_public_contract(url)
-        
+
         # 数据获取模式
-        mode = mode or get_user_data_mode(ctx, qid)
+        suite_mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, qid))
+        profile = None
+        profile_source_fallback = 'haruki_public'
 
-        # 尝试下载
-        try:   
-            # 原逻辑（支持 mode/filter 的后端，保留便于回滚）
-            # url = url.format(uid=uid) + f"?mode={mode}"
-            # if filter:
-            #     url += f"&filter={','.join(filter)}"
-            # profile = await request_gameapi(url)
+        # ================================ 优先尝试 OAuth（仅 self-query） ================================ #
+        # OAuth 只允许“当前用户查自己的 suite 远端数据”命中。
+        # 其余情况（@别人、直接输 UID、管理员代查）统一保持公开接口行为。
+        if can_use_oauth_suite(ctx, qid, uid):
+            oauth_profile = await get_oauth_game_data(
+                str(qid),
+                ctx.region,
+                'suite',
+                str(uid),
+                filter=filter,
+            )
+            if oauth_profile is not None:
+                # 只要 OAuth 确实拿到了数据，就把真实 payload 交给下游。
+                # 注意这里不能再只接受 dict：
+                # - `/抓包状态` 这类单字段查询可能只拿到一个标量 `upload_time`
+                # - 如果这里把标量当失败吞掉，就会错误回退到 Public-API
+                profile = oauth_profile
+                profile_source_fallback = 'haruki_oauth'
+            elif suite_mode == 'oauth':
+                raise ReplyException("当前抓包模式为 oauth，但 OAuth2 数据暂不可用")
 
+        # ================================ 回退到公开 / 旧后端接口 ================================ #
+        # 当前主部署使用的是公开 suite 接口契约；但这里仍保留旧后端的 mode/filter 兼容，
+        # 这样其他沿用老链路的实例升级后不会立刻失效。
+        if profile is None:
             req_url = url.format(uid=uid)
-            if use_suite_api_public:
-                # suite-api 使用 key 参数做字段裁剪
-                if filter:
-                    if isinstance(filter, set):
-                        key_list = sorted(filter)
-                    else:
-                        key_list = list(filter)
-                    # 去重（保持原有顺序）
-                    seen = set()
-                    key_list = [k for k in key_list if not (k in seen or seen.add(k))]
-                    req_url += f"?key={','.join(key_list)}"
-                profile = await request_gameapi(req_url)
-            else:
-                req_url += f"?mode={mode}"
-                if filter:
-                    req_url += f"&filter={','.join(filter)}"
-                profile = await request_gameapi(req_url)
-        except HttpError as e:
-            logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
-            # suite-api 的 key 可能不支持某些字段，回退到全量请求
-            if use_suite_api_public and e.status_code == 400 and filter:
-                logger.warning(f"suite-api key参数请求失败，回退到全量请求: {req_url}")
-                profile = await request_gameapi(url.format(uid=uid))
-            elif e.status_code == 404:
-                local_err = e.message.get('local_err', None)
-                haruki_err = e.message.get('haruki_err', None)
-                msg = f"获取你的{get_region_name(ctx.region)}Suite抓包数据失败，发送\"/抓包\"指令可获取帮助\n"
-                if local_err is not None: msg += f"[本地数据] {local_err}\n"
-                if haruki_err is not None: msg += f"[Haruki工具箱] {haruki_err}\n"
-                raise ReplyException(msg.strip())
-            else:
+            try:
+                if use_suite_api_public:
+                    # suite Public-API 使用 key 参数做字段裁剪。
+                    if filter:
+                        if isinstance(filter, set):
+                            key_list = sorted(filter)
+                        else:
+                            key_list = list(filter)
+                        seen = set()
+                        key_list = [k for k in key_list if not (k in seen or seen.add(k))]
+                        req_url += f"?key={','.join(key_list)}"
+                    profile = await request_gameapi(req_url)
+                else:
+                    legacy_mode = _get_legacy_suite_request_mode(suite_mode)
+                    req_url += f"?mode={legacy_mode}"
+                    if filter:
+                        req_url += f"&filter={','.join(filter)}"
+                    profile = await request_gameapi(req_url)
+            except HttpError as e:
+                logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
+
+                # suite Public-API 的 key 裁剪并不保证所有字段都支持。
+                # 单字段裁剪报 400 时，回退到全量请求比直接判用户失败更稳。
+                if use_suite_api_public and e.status_code == 400 and filter:
+                    logger.warning(f"suite-api key参数请求失败，回退到全量请求: {req_url}")
+                    profile = await request_gameapi(url.format(uid=uid))
+                elif use_suite_api_public and e.status_code == 403:
+                    raise ReplyException("用户未开启允许公开API访问或无权访问该玩家数据")
+                elif e.status_code == 404:
+                    detail = e.message if isinstance(e.message, dict) else {}
+                    local_err = detail.get('local_err') if isinstance(detail, dict) else None
+                    haruki_err = detail.get('haruki_err') if isinstance(detail, dict) else None
+                    public_err = detail.get('message') if isinstance(detail, dict) else str(e.message or '').strip()
+
+                    msg = f"获取你的{get_region_name(ctx.region)}Suite抓包数据失败，发送\"/抓包\"指令可获取帮助\n"
+                    if local_err is not None:
+                        msg += f"[本地数据] {local_err}\n"
+                    if haruki_err is not None:
+                        msg += f"[Haruki工具箱] {haruki_err}\n"
+                    if not local_err and not haruki_err and public_err:
+                        msg += f"[Haruki Public-API] {public_err}\n"
+                    raise ReplyException(msg.strip())
+                else:
+                    raise e
+            except Exception as e:
+                logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
                 raise e
-        except Exception as e:
-            logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: {get_exc_desc(e)}")
-            raise e
 
         # 某些 suite 后端在只请求单字段时，可能直接返回标量值而不是对象。
         # 这里统一包成 dict，避免下游继续区分两种返回结构。
@@ -1127,14 +1477,16 @@ async def get_detailed_profile(
             filter_keys = sorted(filter) if isinstance(filter, set) else list(filter)
             if len(filter_keys) == 1:
                 profile = {filter_keys[0]: profile}
-            
+
         if not profile:
             logger.info(f"获取 {qid} {ctx.region} {uid} 抓包数据失败: 找不到该玩家")
             raise ReplyException(f"找不到ID为 {uid} 的玩家")
-        
-        # 补齐来源字段，避免界面显示“数据来源: ?”
-        if not profile.get('source'):
-            profile['source'] = 'haruki'
+
+        profile['source'] = normalize_suite_source_value(profile.get('source'), profile_source_fallback)
+        # 记录本次查询目标，供展示层判断“是否属于自己查询”使用。
+        # 这两个字段只在 Bot 进程内流转，不作为对外契约依赖。
+        profile['_requested_qid'] = str(qid)
+        profile['_requested_uid'] = str(uid)
 
         # 统一 upload_time 单位为毫秒（兼容秒级/毫秒级）
         normalize_upload_time_inplace(profile)
@@ -1149,13 +1501,22 @@ async def get_detailed_profile(
         # 获取失败的情况，尝试读取缓存
         if cache_path and os.path.exists(cache_path):
             profile = load_json(cache_path)
-            if not profile.get('source'):
-                profile['source'] = 'haruki'
+            profile['source'] = normalize_suite_source_value(profile.get('source'), 'haruki_public')
+            profile['_requested_qid'] = str(qid)
+            profile['_requested_uid'] = str(uid) if uid else str(profile.get('_requested_uid') or '')
             normalize_upload_time_inplace(profile)
             logger.info(f"从缓存获取 {qid} {ctx.region} {uid} 抓包数据")
             return profile, get_exc_desc(e) + "(使用先前的缓存数据)"
         else:
             logger.info(f"未找到 {qid} {ctx.region} {uid} 的缓存抓包数据")
+
+        if reply_msg := get_temporary_gameapi_reply(
+            "Haruki Public-API" if use_suite_api_public else "抓包数据服务",
+            e,
+        ):
+            if raise_exc:
+                raise ReplyException(reply_msg)
+            return None, reply_msg
 
         if raise_exc:
             raise e
@@ -1165,11 +1526,7 @@ async def get_detailed_profile(
     if strict and filter:
         missing_keys = [k for k in filter if k not in profile]
         if missing_keys:
-            source = profile.get('source', '?')
-            upload_time_ms = to_unix_millis(profile.get('upload_time'))
-            update_time = datetime.fromtimestamp(upload_time_ms / 1000).strftime('%m-%d %H:%M:%S') if upload_time_ms else "?"
-            raise ReplyException(f"你的{get_region_name(ctx.region)}Suite抓包数据中缺少必要的字段: {', '.join(missing_keys)}"
-                                 f" (数据来源: {source} 更新时间: {update_time})")
+            raise ReplyException(format_suite_missing_fields_error(ctx, profile, missing_keys))
         
     return profile, ""
 
@@ -1179,9 +1536,16 @@ def get_detailed_profile_card_filter(*s: str) -> set[str]:
 
 # 从玩家详细信息获取该玩家头像的PlayerAvatarInfo
 async def get_player_avatar_info_by_detailed_profile(ctx: SekaiHandlerContext, detail_profile: dict) -> PlayerAvatarInfo:
-    deck_id = detail_profile['userGamedata']['deck']
-    decks = find_by(detail_profile['userDecks'], 'deckId', deck_id)
-    pcards = [find_by(detail_profile['userCards'], 'cardId', decks[f'member{i}']) for i in range(1, 6)]
+    _, deck = _get_avatar_deck_from_detailed_profile(ctx, detail_profile)
+
+    member_card_ids = [deck.get(f'member{i}') for i in range(1, 6)]
+    if any(card_id in (None, '') for card_id in member_card_ids):
+        raise ReplyException(format_suite_missing_fields_error(ctx, detail_profile, ['userDecks']))
+
+    pcards = [find_by(detail_profile['userCards'], 'cardId', card_id) for card_id in member_card_ids]
+    if any(not pcard for pcard in pcards):
+        raise ReplyException(format_suite_missing_fields_error(ctx, detail_profile, ['userCards']))
+
     for pcard in pcards:
         pcard['after_training'] = pcard['defaultImage'] == "special_training" and pcard['specialTrainingStatus'] == "done"
     card_id = pcards[0]['cardId']
@@ -1202,20 +1566,22 @@ async def get_detailed_profile_card(ctx: SekaiHandlerContext, profile: dict, err
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = profile['userGamedata']
-                    source = profile.get('source', '?')
+                    source = get_suite_source_display_name(profile.get('source', '?'))
                     if local_source := profile.get('local_source'):
                         source += f"({local_source})"
-                    mode = mode or get_user_data_mode(ctx, ctx.user_id)
+                    mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
                     update_time = datetime.fromtimestamp(profile['upload_time'] / 1000)
                     update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(update_time, show_original_time=False)})"
                     user_id = process_hide_uid(ctx, game_data['userId'], keep=6)
                     colored_text_box(
-                        truncate(game_data['name'], 64),
+                        truncate(_get_suite_display_name_for_card(ctx, profile), 64),
                         TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=BLACK, use_shadow=True, shadow_offset=2),
                     )
                     TextBox(f"{ctx.region.upper()}: {user_id} Suite数据", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
                     TextBox(f"更新时间: {update_time_text}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
                     TextBox(f"数据来源: {source}  获取模式: {mode}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
+                    if warning_text := get_suite_public_warning_text(ctx, profile):
+                        TextBox(warning_text, TextStyle(font=DEFAULT_FONT, size=16, color=RED))
             if err_msg:
                 TextBox(f"获取数据失败: {err_msg}", TextStyle(font=DEFAULT_FONT, size=20, color=RED), line_count=3).set_w(300)
     return f
@@ -1634,7 +2000,6 @@ async def get_avatar_widget_with_frame(ctx: SekaiHandlerContext, avatar_img: Ima
             ImageBox(term_limit_frame_img, use_alphablend=True, shadow=True)
     return ret
 
-
 # ======================= 指令处理 ======================= #
 
 # 绑定id或查询绑定id
@@ -2016,59 +2381,154 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg("profile查询服务正常")
 
 
-# 设置抓包数据获取模式
+# ================================ Suite 用户命令 ================================ #
+# 这里统一收拢 suite 新链路相关的用户入口：
+# - `/抓包模式`：控制 suite_source_mode
+# - `/授权`：发起 Haruki OAuth2 授权
+# - `/抓包信息`：按“当前实际会走的单一链路”展示状态
+
+
+# 设置 suite 抓包来源模式
 pjsk_data_mode = SekaiCmdHandler([
-    "/pjsk data mode", 
+    "/pjsk data mode",
     "/pjsk抓包模式", "/pjsk抓包获取模式", "/抓包模式",
 ])
 pjsk_data_mode.check_cdrate(cd).check_wblist(gbl)
 @pjsk_data_mode.handle()
 async def _(ctx: SekaiHandlerContext):
-    data_modes = profile_db.get("data_modes", {})
-    cur_mode = get_user_data_mode(ctx, ctx.user_id)
+    suite_source_modes = profile_db.get("suite_source_modes", {})
+    cur_mode = get_user_suite_source_mode(ctx, ctx.user_id)
     help_text = f"""
-你的{get_region_name(ctx.region)}抓包数据获取模式: {cur_mode} 
+你的{get_region_name(ctx.region)}Suite数据获取模式: {cur_mode}
 ---
 使用\"{ctx.original_trigger_cmd} 模式名\"来切换模式，可用模式名如下:
-【latest】
-同时从所有数据源获取，使用最新的一个（推荐）
 【default】
-从本地数据获取失败才尝试从Haruki工具箱获取
-【local】
-仅从本地数据获取
-【haruki】
-仅从Haruki工具箱获取
+自己查自己时先走Haruki工具箱，失败再回退Haruki Public-API（推荐）
+【oauth】
+自己查自己时只走Haruki工具箱，不再回退Public-API
+【public】
+统一只走Haruki Public-API
 """.strip()
-    
+
     ats = ctx.get_at_qids()
     if ats and ats[0] != int(ctx.bot.self_id):
-        # 如果有at则使用at的qid
         qid = ats[0]
         assert_and_reply(check_superuser(ctx.event), "只有超级管理能修改别人的模式")
     else:
         qid = ctx.user_id
-    
-    args = ctx.get_args().strip().lower()
-    assert_and_reply(args in VALID_DATA_MODES, help_text)
 
+    raw_args = ctx.get_args().strip().lower()
+    if not raw_args:
+        return await ctx.asend_reply_msg(help_text)
+    assert_and_reply(raw_args in VALID_SUITE_SOURCE_MODES or raw_args in VALID_DATA_MODES, help_text)
+
+    normalized_mode = _normalize_suite_source_mode(raw_args)
     if is_cloud_account_enabled():
         try:
-            cloud_account_api.set_preferences(ctx.region, qid, data_mode=args, operator=str(ctx.user_id))
+            cloud_account_api.set_preferences(
+                ctx.region,
+                qid,
+                suite_source_mode=normalized_mode,
+                operator=str(ctx.user_id),
+            )
         except Exception as e:
-            raise ReplyException(f"云端切换抓包模式失败: {e}")
+            raise ReplyException(f"云端切换Suite抓包模式失败: {e}")
     else:
-        if ctx.region not in data_modes:
-            data_modes[ctx.region] = {}
-        data_modes[ctx.region][str(qid)] = args
-        profile_db.set("data_modes", data_modes)
+        if ctx.region not in suite_source_modes:
+            suite_source_modes[ctx.region] = {}
+        suite_source_modes[ctx.region][str(qid)] = normalized_mode
+        profile_db.set("suite_source_modes", suite_source_modes)
+
+    compat_note = ""
+    if raw_args != normalized_mode:
+        compat_note = f"\n（输入的旧模式 {raw_args} 已自动归一化为 {normalized_mode}）"
 
     if qid == ctx.user_id:
-        return await ctx.asend_reply_msg(f"切换{get_region_name(ctx.region)}抓包数据获取模式:\n{cur_mode} -> {args}")
-    else:
-        return await ctx.asend_reply_msg(f"切换 {qid} 的{get_region_name(ctx.region)}抓包数据获取模式:\n{cur_mode} -> {args}")
+        return await ctx.asend_reply_msg(
+            f"切换{get_region_name(ctx.region)}Suite抓包模式:\n{cur_mode} -> {normalized_mode}{compat_note}"
+        )
+    return await ctx.asend_reply_msg(
+        f"切换 {qid} 的{get_region_name(ctx.region)}Suite抓包模式:\n{cur_mode} -> {normalized_mode}{compat_note}"
+    )
 
 
-# 查询抓包数据
+async def reply_oauth_authorize_link(ctx: SekaiHandlerContext, url: str):
+    """
+    优先私聊授权链接。
+
+    当前阶段不做中转页，直接投递 Haruki 授权链接：
+    - 能私聊：群里只提示“已私发”
+    - 不能私聊：群里先明确建议走临时会话，再带风险提示后回落群内发链接
+    """
+    private_msg = f"请在浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
+
+    if not ctx.group_id:
+        return await ctx.asend_reply_msg(private_msg)
+
+    # 这里故意不走 `send_private_msg_by_bot()` 的好友预检查。
+    # 原因是 OAuth 授权链接是极少数“值得先试发一次私聊”的场景：
+    # - 某些实现下，即使不是好友，也可能允许群临时会话私聊
+    # - 如果我们先查好友列表，就会把这类可发送场景提前误判成失败
+    #
+    # 这里的策略是：
+    # 1. 先 best-effort 试发私聊
+    # 2. 成功则群里只提示“已私发”
+    # 3. 失败再按既定策略回落群内，并明确建议用户改走临时会话
+    async def try_send_private_once() -> bool:
+        candidate_bots = []
+        if getattr(ctx, "bot", None):
+            candidate_bots.append(ctx.bot)
+        try:
+            private_bot = await aget_private_bot(int(ctx.user_id))
+        except Exception as e:
+            logger.warning(f"[sekai] 获取可用私聊 Bot 失败 qid={ctx.user_id}: {e}")
+            private_bot = None
+        if private_bot and all(str(bot.self_id) != str(private_bot.self_id) for bot in candidate_bots):
+            candidate_bots.append(private_bot)
+
+        for bot in candidate_bots:
+            try:
+                await bot.send_private_msg(user_id=int(ctx.user_id), message=private_msg)
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"[sekai] OAuth 授权链接私聊发送失败 "
+                    f"qid={ctx.user_id} bot={getattr(bot, 'self_id', '?')}: {e}"
+                )
+        return False
+
+    sent = await try_send_private_once()
+    if sent:
+        return await ctx.asend_reply_msg(
+            "授权链接已私发，请注意查收。若未收到，建议点击 Bot 头像进入临时会话后重新发送 /授权。"
+        )
+
+    return await ctx.asend_reply_msg(
+        "建议优先点击 Bot 头像进入临时会话后发送 /授权 获取链接。\n"
+        "当前未能通过私聊发送授权链接，下面将直接在群内发送；若继续点击，即视为你已知晓公开发送带来的风险：\n"
+        f"{url}"
+    )
+
+
+sekai_oauth_authorize = SekaiCmdHandler([
+    "/授权", "/sekai授权", "/pjsk授权",
+], parse_uid_arg=False, parse_data_mode_arg=False)
+sekai_oauth_authorize.check_cdrate(cd).check_wblist(gbl)
+@sekai_oauth_authorize.handle()
+async def _(ctx: SekaiHandlerContext):
+    qid = str(ctx.user_id)
+    try:
+        # 授权前先清掉本进程中的旧状态，减少“刚授权成功但短时间还走旧缓存”的错觉。
+        clear_oauth_runtime_cache(qid)
+        cloud_account_api.invalidate_state_cache(qid=qid)
+        url = await build_authorize_url(qid)
+    except Exception as e:
+        raise ReplyException(f"生成授权链接失败: {e}")
+
+    return await reply_oauth_authorize_link(ctx, url)
+
+
+# 查询 suite 抓包数据状态
 pjsk_check_data = SekaiCmdHandler([
     "/pjsk check data",
     "/pjsk抓包", "/pjsk抓包状态", "/pjsk抓包数据", "/pjsk抓包查询", "/抓包数据", "/抓包状态", "/抓包信息",
@@ -2079,44 +2539,41 @@ async def _(ctx: SekaiHandlerContext):
     cqs = extract_cq_code(ctx.get_msg())
     qid = int(cqs['at'][0]['qq']) if 'at' in cqs else ctx.user_id
     uid = get_player_bind_id(ctx)
+    suite_mode = get_user_suite_source_mode(ctx, qid)
 
     msg = f"{process_hide_uid(ctx, uid, keep=6)}({ctx.region.upper()}) Suite数据\n"
-    suite_status_sources = get_gameapi_config(ctx).suite_status_sources or ['local', 'haruki']
-    suite_status_sources = [x.lower() for x in suite_status_sources if x.lower() in ['local', 'haruki']]
-    if not suite_status_sources:
-        suite_status_sources = ['local', 'haruki']
+    profile, err = await get_detailed_profile(
+        ctx,
+        qid,
+        raise_exc=False,
+        mode=suite_mode,
+        filter=["upload_time"],
+        strict=False,
+    )
 
-    # 状态页展示的数据源由配置控制，避免把具体接口域名写死在公开仓库代码里。
-    source_meta = {
-        'local': ('本地数据', 'local'),
-        'haruki': ('Haruki工具箱', 'haruki'),
-    }
-    tasks = [
-        get_detailed_profile(ctx, qid, raise_exc=False, mode=source_meta[source_key][1], filter=["upload_time"])
-        for source_key in suite_status_sources
-    ]
-    results = await asyncio.gather(*tasks)
+    if err:
+        source_label = get_suite_expected_source_name(ctx, qid, str(uid), suite_mode)
+        err = err[err.find(']') + 1:].strip() if ']' in err else err
+        msg += f"[{source_label}]\n获取失败: {err}\n"
+    else:
+        source_label = get_suite_source_display_name(profile.get("source"))
+        msg += f"[{source_label}]\n"
+        upload_time = datetime.fromtimestamp(profile["upload_time"] / 1000)
+        upload_time_text = upload_time.strftime("%m-%d %H:%M:%S") + f"({get_readable_datetime(upload_time, show_original_time=False)})"
+        if local_source := profile.get("local_source"):
+            upload_time_text = local_source + " " + upload_time_text
+        msg += f"{upload_time_text}\n"
+        if warning_text := get_suite_public_warning_text(ctx, profile):
+            msg += f"{warning_text}\n"
 
-    for source_key, (profile, err) in zip(suite_status_sources, results):
-        source_label = source_meta[source_key][0]
-        if err:
-            err = err[err.find(']')+1:].strip()
-            msg += f"[{source_label}]\n获取失败: {err}\n"
-        else:
-            msg += f"[{source_label}]\n"
-            upload_time = datetime.fromtimestamp(profile["upload_time"] / 1000)
-            upload_time_text = upload_time.strftime("%m-%d %H:%M:%S") + f"({get_readable_datetime(upload_time, show_original_time=False)})"
-            if local_source := profile.get("local_source"):
-                upload_time_text = local_source + " " + upload_time_text
-            msg += f"{upload_time_text}\n"
+    if oauth_status_text := get_suite_oauth_status_text(ctx, qid, str(uid), suite_mode, profile, err):
+        msg += f"{oauth_status_text}\n"
 
-    mode = get_user_data_mode(ctx, ctx.user_id)
     msg += f"---\n"
     msg += f"该指令查询Suite数据，查询Mysekai数据请使用\"/{ctx.region}msd\"\n"
-    # msg += f"数据获取模式: {mode}，使用\"/{ctx.region}抓包模式\"来切换模式\n"
     msg += f"发送\"/抓包\"获取抓包教程"
 
-    return await ctx.asend_reply_msg(msg)
+    return await ctx.asend_reply_msg(msg.strip())
 
 
 
@@ -2650,4 +3107,5 @@ async def _(ctx: SekaiHandlerContext):
         data['inherit_id'],
         data['inherit_pw'],
     ])
+
 

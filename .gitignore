@@ -183,3 +183,7 @@ napcat/
 
 # keep per-instance startup helpers local; preserve tracked start.sh
 start_v*.sh
+
+# local integration configs
+haruki/
+onebotfilter/

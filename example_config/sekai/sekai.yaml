@@ -1,6 +1,16 @@
-debug: false
+﻿debug: false
 
 gameapi_token: xxx
+
+# ================================ Suite OAuth2 ================================ #
+# 这里只放公开可提交的配置项与默认策略。
+# 真正的云端地址与内部鉴权 token 继续放在 .env，不要把 secret 写进 yaml。
+oauth2_client_id: "replace_me"
+oauth2_authorize_url: "https://example.com/api/oauth2/authorize"
+oauth2_redirect_uri: "https://example.com/oauth2/callback"
+oauth2_scope: "user:read bindings:read game-data:read offline_access"
+suite_source_policy: "default"
+suite_oauth_fail_cooldown_sec: 60
 
 fifth_anniv_regions: ["jp"]
 
@@ -256,3 +266,4 @@ music:
     override_url: ""
     info_text: |
       该bot的定数表未配置
+
