@@ -1206,6 +1206,65 @@ class TextBox(Widget):
         if full_width <= target_width:
             return None
 
+        if has_emoji(text):
+            units = list(get_inline_text_units(text))
+            unit_num = len(units)
+            if unit_num == 0:
+                return 0
+
+            unit_char_ends: list[int] = []
+            cur_char_idx = 0
+            unit_weight_sum = 0
+            for unit_text, is_emoji in units:
+                cur_char_idx += len(unit_text)
+                unit_char_ends.append(cur_char_idx)
+                if is_emoji:
+                    unit_weight_sum += 2
+                else:
+                    unit_weight_sum += 1 if ord(unit_text) < 128 else 2
+
+            if full_width > 0 and unit_weight_sum > 0:
+                avg_unit_width = full_width / unit_weight_sum
+                cur_w = 0.0
+                unit_idx = unit_num
+                for i, (unit_text, is_emoji) in enumerate(units):
+                    if is_emoji:
+                        cur_w += avg_unit_width * 2
+                    else:
+                        cur_w += avg_unit_width if ord(unit_text) < 128 else avg_unit_width * 2
+                    if cur_w >= target_width:
+                        unit_idx = i + 1
+                        break
+            else:
+                unit_idx = 0
+
+            unit_idx = max(0, min(unit_idx, unit_num))
+            current_idx = 0 if unit_idx == 0 else unit_char_ends[unit_idx - 1]
+            current_w = get_text_width(font, text[:current_idx])
+
+            if current_w < target_width:
+                while unit_idx < unit_num:
+                    next_idx = unit_char_ends[unit_idx]
+                    w = get_text_width(font, text[:next_idx])
+                    if w > target_width:
+                        return current_idx
+                    unit_idx += 1
+                    current_idx = next_idx
+                    current_w = w
+                return current_idx
+
+            elif current_w > target_width:
+                while unit_idx > 0:
+                    if current_w <= target_width:
+                        return current_idx
+                    unit_idx -= 1
+                    current_idx = 0 if unit_idx == 0 else unit_char_ends[unit_idx - 1]
+                    current_w = get_text_width(font, text[:current_idx])
+                return 0
+
+            else:
+                return current_idx
+
         text_len = len(text)
         
         # 3. 估算起点

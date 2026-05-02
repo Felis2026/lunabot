@@ -19,6 +19,7 @@ import glob
 import io
 import colour
 import struct
+from functools import lru_cache
 
 
 _original_get_emoji_unicode_dict = getattr(emoji.unicode_codes, 'get_emoji_unicode_dict', None)
@@ -444,17 +445,134 @@ def get_font_std_size(font: Font) -> Size:
         return std_size
     return font_std_size_cache[font]
 
-def has_emoji(text: str) -> bool:
+# ================================ Emoji混排测量与绘制 ================================ #
+
+# 旧实现会把整串混合文本直接交给 pilmoji。
+# 这会让“文字基线”和“emoji 图像”的排版逻辑耦合在一起，业务层只能靠手工拆分 TextBox 来修偏移。
+# 这里改为底层按 run 分段：普通文字继续走 PIL，emoji 单独走 pilmoji，
+# 这样可以统一复用同一条文本基线，并避免换行/裁剪时把 emoji 序列切坏。
+
+EMOJI_SEQUENCE_MARKERS = ("\ufe0f", "\u200d", "\u20e3")
+
+def _contains_possible_emoji(text: str) -> bool:
     for c in text:
+        code = ord(c)
         if c in emoji.EMOJI_DATA:
             return True
+        if c in EMOJI_SEQUENCE_MARKERS:
+            return True
+        if 0x1F1E6 <= code <= 0x1F1FF:
+            return True
     return False
+
+@lru_cache(maxsize=4096)
+def _get_inline_text_units(text: str) -> Tuple[Tuple[str, bool], ...]:
+    if not text:
+        return ()
+
+    if not _contains_possible_emoji(text):
+        return tuple((c, False) for c in text)
+
+    units: list[tuple[str, bool]] = []
+    for token in emoji.analyze(text, non_emoji=True, join_emoji=True):
+        if isinstance(token.value, str):
+            units.extend((c, False) for c in token.chars)
+        else:
+            units.append((token.chars, True))
+    return tuple(units)
+
+def get_inline_text_units(text: str) -> Tuple[Tuple[str, bool], ...]:
+    return _get_inline_text_units(text)
+
+@lru_cache(maxsize=4096)
+def _get_inline_text_segments(text: str) -> Tuple[Tuple[str, bool], ...]:
+    if not text:
+        return ()
+
+    segments: list[tuple[str, bool]] = []
+    text_buffer: list[str] = []
+    for unit_text, is_emoji in _get_inline_text_units(text):
+        if is_emoji:
+            if text_buffer:
+                segments.append(("".join(text_buffer), False))
+                text_buffer = []
+            segments.append((unit_text, True))
+        else:
+            text_buffer.append(unit_text)
+    if text_buffer:
+        segments.append(("".join(text_buffer), False))
+    return tuple(segments)
+
+def _get_text_bbox_ls(font: Font, text: str) -> Tuple[float, float, float, float]:
+    try:
+        bbox = font.getbbox(text, anchor='ls')
+        return bbox[0], bbox[1], bbox[2], bbox[3]
+    except TypeError:
+        bbox = font.getbbox(text)
+        std_size = get_font_std_size(font)
+        return bbox[0], bbox[1] - std_size[1], bbox[2], bbox[3] - std_size[1]
+
+def _get_emoji_position_offset(font: Font) -> Position:
+    std_size = get_font_std_size(font)
+    offset = global_config.get('painter.emoji.offset')
+    return (
+        int(offset[0] * std_size[1] / 32),
+        int(offset[1] * std_size[1] / 32) - std_size[1],
+    )
+
+def _get_inline_text_metrics(font: Font, text: str) -> Tuple[float, Tuple[float, float, float, float]]:
+    advance_total = 0.0
+    min_x = min_y = max_x = max_y = 0.0
+    has_bbox = False
+    emoji_scale = EMOJI_SCALE_CFG.get()
+    emoji_offset = _get_emoji_position_offset(font)
+
+    for segment_text, is_emoji in _get_inline_text_segments(text):
+        if not segment_text:
+            continue
+
+        if is_emoji:
+            seg_w, seg_h = getsize_emoji(segment_text, font=font, emoji_scale_factor=emoji_scale)
+            left = advance_total + emoji_offset[0]
+            top = emoji_offset[1]
+            right = left + seg_w
+            bottom = top + seg_h
+            advance = seg_w
+        else:
+            left, top, right, bottom = _get_text_bbox_ls(font, segment_text)
+            left += advance_total
+            right += advance_total
+            advance = font.getlength(segment_text)
+
+        if not has_bbox:
+            min_x, min_y, max_x, max_y = left, top, right, bottom
+            has_bbox = True
+        else:
+            min_x = min(min_x, left)
+            min_y = min(min_y, top)
+            max_x = max(max_x, right)
+            max_y = max(max_y, bottom)
+
+        advance_total += advance
+
+    if not has_bbox:
+        return 0.0, (0.0, 0.0, 0.0, 0.0)
+
+    max_x = max(max_x, advance_total)
+    min_x = min(min_x, 0.0)
+    return advance_total, (min_x, min_y, max_x, max_y)
+
+def has_emoji(text: str) -> bool:
+    if not text or not _contains_possible_emoji(text):
+        return False
+    return any(is_emoji for _, is_emoji in _get_inline_text_units(text))
 
 def get_text_size(font: Font, text: str) -> Size:
     if not text: 
         return (0, 0)
     if has_emoji(text):
-        return getsize_emoji(text, font=font, emoji_scale_factor=EMOJI_SCALE_CFG.get())
+        _, (min_x, min_y, max_x, max_y) = _get_inline_text_metrics(font, text)
+        return math.ceil(max_x - min_x), math.ceil(max_y - min_y)
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
     
@@ -462,11 +580,14 @@ def get_text_width(font: Font, text: str) -> int:
     if not text:
         return 0
     if has_emoji(text):
-        size = getsize_emoji(text, font=font, emoji_scale_factor=EMOJI_SCALE_CFG.get())
-        return size[0]
+        advance, _ = _get_inline_text_metrics(font, text)
+        return advance
     return font.getlength(text)
 
 def get_text_offset(font: Font, text: str) -> Position:
+    if has_emoji(text):
+        _, (min_x, min_y, _, _) = _get_inline_text_metrics(font, text)
+        return math.floor(min_x), math.floor(min_y)
     bbox = font.getbbox(text)
     return bbox[0], bbox[1]
 
@@ -708,27 +829,44 @@ class Painter:
         align: str = "left"
     ):
         std_size = get_font_std_size(font)
+        text_offset = (0, -std_size[1])
+        pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
+
         if not has_emoji(text):
             draw = ImageDraw.Draw(self.img)
-            text_offset = (0, -std_size[1])
-            pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
             draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         else:
-            text_offset = (0, -std_size[1])
-            offset = global_config.get('painter.emoji.offset')
+            # 按 run 分别绘制普通文字和 emoji，统一复用同一条 baseline，
+            # 避免整串交给 pilmoji 时出现的混排高度漂移问题。
+            draw = ImageDraw.Draw(self.img)
+            cursor_x = pos[0]
+            cursor_y = pos[1]
             scale = global_config.get('painter.emoji.scale')
-            offset = (int(offset[0] * std_size[1] / 32), int(offset[1] * std_size[1] / 32) - std_size[1])
-            pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
+            emoji_offset = _get_emoji_position_offset(font)
             try:
                 with Pilmoji(self.img, source=EMOJI_SOURCE_CLS) as pilmoji:
-                    pilmoji.text(
-                        pos, text, font=font, fill=fill, align=align,
-                        emoji_position_offset=offset, emoji_scale_factor=scale,
-                        anchor='ls')
+                    for segment_text, is_emoji in _get_inline_text_segments(text):
+                        if not segment_text:
+                            continue
+                        draw_pos = (int(round(cursor_x)), int(round(cursor_y)))
+                        if is_emoji:
+                            try:
+                                pilmoji.text(
+                                    draw_pos, segment_text, font=font, fill=fill, align=align,
+                                    emoji_position_offset=emoji_offset, emoji_scale_factor=scale,
+                                    anchor='ls'
+                                )
+                            except Exception as e:
+                                debug_print(f"pilmoji segment failed, fallback to plain text: {e}")
+                                draw.text(draw_pos, segment_text, font=font, fill=fill, align=align, anchor='ls')
+                            seg_w, _ = getsize_emoji(segment_text, font=font, emoji_scale_factor=scale)
+                            cursor_x += seg_w
+                        else:
+                            draw.text(draw_pos, segment_text, font=font, fill=fill, align=align, anchor='ls')
+                            cursor_x += font.getlength(segment_text)
             except Exception as e:
                 # Keep drawing path available even if emoji source fails.
                 debug_print(f"pilmoji failed, fallback to plain text: {e}")
-                draw = ImageDraw.Draw(self.img)
                 draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         return self
     
