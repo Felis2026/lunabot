@@ -1,4 +1,4 @@
-from ...utils import *
+﻿from ...utils import *
 from ...llm import get_text_retriever
 from ..common import *
 from ..handler import *
@@ -34,9 +34,41 @@ music_name_retriever = get_text_retriever(f"music_name")
 music_cn_titles = WebJsonRes("曲名中文翻译", "https://i18n-json.sekai.best/zh-CN/music_titles.json", update_interval=timedelta(days=1))
 music_en_titles = WebJsonRes("曲名英文翻译", "https://i18n-json.sekai.best/en/music_titles.json", update_interval=timedelta(days=1))
 
+# ================================ MusicMeta数据源配置 ================================ #
+# 这里兼容旧版单地址字段和新版多地址字段。
+# 当新版 music_meta_urls 已配置时，优先完全以它为准，避免旧字段残留导致实际请求顺序难以判断。
+def get_music_meta_urls() -> list[str]:
+    """
+    读取 MusicMeta 数据源配置，返回按优先级排序后的 URL 列表。
+    """
+    urls = config.get("deck.music_meta_urls", [], raise_exc=False)
+    legacy_url = (config.get("deck.music_meta_url", "", raise_exc=False) or "").strip()
+
+    if isinstance(urls, str):
+        raw_urls = [urls]
+    elif urls is None:
+        raw_urls = []
+    else:
+        raw_urls = list(urls)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_urls:
+        item = (item or "").strip()
+        if not item or item in seen:
+            continue
+        normalized.append(item)
+        seen.add(item)
+
+    if normalized:
+        return normalized
+    if legacy_url:
+        return [legacy_url]
+    return []
+
 musicmetas_json = WebJsonRes(
     name="MusicMeta", 
-    url = config.get("deck.music_meta_url"),
+    urls=get_music_meta_urls(),
     update_interval=timedelta(hours=1),
 )
 
@@ -373,6 +405,56 @@ class MusicSearchResult:
     candidate_msg: str = None
     search_type: str = None
     err_msg: str = None
+
+
+
+# ================================ 跨服Fallback辅助 ================================ #
+
+def should_try_music_jp_fallback(ctx: SekaiHandlerContext, exc: Exception) -> bool:
+    """
+    判断歌曲类查询是否应该在国服 miss 后补查日服。
+
+    这里只兜底“国服没搜到 / 国服没有该难度”这类结果缺失，
+    避免把参数错误或外部依赖故障误判成跨服查询场景。
+    """
+    if not ctx.can_fallback_to_jp():
+        return False
+
+    text = str(exc)
+    if not text:
+        return False
+    if "参数" in text or "请输入" in text:
+        return False
+
+    return (
+        "没有找到相关" in text
+        or "未找到歌曲" in text
+        or "找不到" in text
+        or ("没有" in text and "难度" in text)
+    )
+
+
+async def search_music_with_jp_fallback(
+    ctx: SekaiHandlerContext,
+    query: str,
+    options: MusicSearchOptions | None = None,
+) -> tuple[MusicSearchResult, SekaiHandlerContext, bool]:
+    """
+    先按当前区服搜歌；若满足无前缀 CN miss 条件，则自动补查 JP。
+    """
+    options = options or MusicSearchOptions()
+    try:
+        return await search_music(ctx, query, options), ctx, False
+    except Exception as exc:
+        if not should_try_music_jp_fallback(ctx, exc):
+            raise
+
+        jp_ctx = ctx.copy_for_region("jp")
+        try:
+            return await search_music(jp_ctx, query, options), jp_ctx, True
+        except Exception:
+            raise exc
+
 
 alias_mid_for_search: Dict[str, List[int]] = {}
 
@@ -1066,6 +1148,195 @@ async def get_music_cover_thumb(ctx: SekaiHandlerContext, mid: int) -> Image.Ima
     return await ctx.rip.img(f"music/jacket/{asset_name}_rip/{asset_name}.png", use_img_cache=True, img_cache_max_res=80*80)
 
 # 获取曲目翻译名 lang in ['cn', 'en']
+async def get_music_cover(ctx: SekaiHandlerContext, mid: int, max_res: int = 256 * 256) -> Image.Image:
+    """获取用于 Another Vocal 列表展示的曲绘。"""
+    music = await ctx.md.musics.find_by_id(mid)
+    assert_and_reply(music, f"歌曲ID={mid}不存在")
+    asset_name = music['assetbundleName']
+    return await ctx.rip.img(
+        f"music/jacket/{asset_name}_rip/{asset_name}.png",
+        use_img_cache=True,
+        img_cache_max_res=max_res,
+    )
+
+
+def parse_anvo_args(args: str) -> int:
+    """解析 /anvo 的角色参数，只接受单角色查询。"""
+    help_msg = """
+使用方式:
+1. /anvo 角色名
+""".strip()
+
+    s = args.strip()
+    assert_and_reply(s, help_msg)
+
+    nickname, rest = extract_nickname_from_args(s)
+    assert_and_reply(nickname, f"未识别到角色名称\n{help_msg}")
+    assert_and_reply(not rest.strip(), f"参数无法解析: {rest}\n{help_msg}")
+
+    cid = get_cid_by_nickname(nickname)
+    assert_and_reply(cid is not None, f"角色名无效: {nickname}")
+    return cid
+
+
+def get_owned_music_vocal_ids(profile: dict) -> set[int]:
+    """
+    兼容两类抓包结构：
+    1. 顶层 userMusicVocals
+    2. userMusics[*].userMusicVocals
+    同时兼容 musicVocalId / vocalId 两种字段名。
+    """
+    vocals = list(profile.get('userMusicVocals', []) or [])
+    if not vocals:
+        for item in profile.get('userMusics', []):
+            if isinstance(item, dict):
+                vocals.extend(item.get('userMusicVocals', []) or [])
+
+    ret: set[int] = set()
+    for item in vocals:
+        if not isinstance(item, dict):
+            continue
+        vid = item.get('musicVocalId', item.get('vocalId'))
+        if vid is not None:
+            ret.add(int(vid))
+    return ret
+
+
+async def query_character_anvo_entries(
+    ctx: SekaiHandlerContext,
+    cid: int,
+    owned_music_vocal_ids: set[int],
+) -> List[AnvoEntry]:
+    valid_musics = await get_valid_musics(ctx, leak=False)
+    valid_music_map = {m['id']: m for m in valid_musics}
+
+    vocal_infos = []
+    for vocal in await ctx.md.music_vocals.get():
+        if vocal.get('musicVocalType') != 'another_vocal':
+            continue
+        music_id = int(vocal['musicId'])
+        if music_id not in valid_music_map:
+            continue
+
+        chara_items = []
+        for item in vocal.get('characters', []):
+            if item.get('characterType') == 'game_character' and item.get('characterId') is not None:
+                chara_items.append(item)
+        chara_items.sort(key=lambda x: x.get('seq', 0))
+        chara_ids = [int(item['characterId']) for item in chara_items]
+        if cid not in chara_ids:
+            continue
+
+        music = valid_music_map[music_id]
+        vocal_infos.append({
+            'music_vocal_id': int(vocal['id']),
+            'music_id': music_id,
+            'title': music['title'],
+            'published_at': int(music['publishedAt']),
+            'chara_ids': chara_ids,
+            'owned': int(vocal['id']) in owned_music_vocal_ids,
+        })
+
+    vocal_infos.sort(key=lambda x: (x['published_at'], x['music_id'], x['music_vocal_id']))
+
+    covers = await batch_gather(*[
+        get_music_cover(ctx, item['music_id'], max_res=256 * 256)
+        for item in vocal_infos
+    ])
+
+    return [
+        AnvoEntry(
+            music_vocal_id=item['music_vocal_id'],
+            music_id=item['music_id'],
+            title=item['title'],
+            published_at=item['published_at'],
+            chara_ids=item['chara_ids'],
+            cover_img=cover,
+            owned=item['owned'],
+        )
+        for item, cover in zip(vocal_infos, covers)
+    ]
+
+
+def apply_anvo_unowned_effect(img: Image.Image) -> Image.Image:
+    img = img.convert("RGBA")
+    gray = ImageOps.grayscale(img).convert("RGBA")
+    gray.alpha_composite(Image.new("RGBA", gray.size, (20, 20, 30, 120)))
+    return gray
+
+
+async def compose_anvo_list_image(
+    ctx: SekaiHandlerContext,
+    profile: dict,
+    err_msg: str,
+    cid: int,
+    entries: List[AnvoEntry],
+    total_count: int,
+    owned_count: int,
+) -> Image.Image:
+    chara = await ctx.md.game_characters.find_by_id(cid)
+    chara_name = f"{chara.get('firstName', '')}{chara.get('givenName', '')}" if chara else str(cid)
+
+    lock_icon = None
+    try:
+        lock_icon = ctx.static_imgs.get("lock.png").convert("RGBA")
+    except Exception:
+        lock_icon = None
+
+    with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
+        with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
+            await get_detailed_profile_card(ctx, profile, err_msg)
+
+            with VSplit().set_bg(roundrect_bg()).set_padding(16).set_sep(12):
+                TextBox(
+                    f"{chara_name} Another Vocal 持有情况",
+                    TextStyle(DEFAULT_HEAVY_FONT, 28, BLACK),
+                )
+                TextBox(
+                    f"已持有 {owned_count}/{total_count} 首",
+                    TextStyle(DEFAULT_BOLD_FONT, 20, (80, 80, 80)),
+                )
+
+                with Grid(col_count=5, hsep=12, vsep=12).set_content_align('lt').set_item_align('lt'):
+                    for item in entries:
+                        with VSplit().set_content_align('t').set_item_align('c').set_sep(8).set_padding(10) \
+                            .set_bg(roundrect_bg(fill=(255, 255, 255, 180), radius=8)):
+                            TextBox(
+                                truncate(item.title, 24),
+                                TextStyle(DEFAULT_BOLD_FONT, 20, BLACK),
+                                line_count=1,
+                                overflow="clip",
+                            ).set_w(220).set_content_align('c')
+
+                            with Frame().set_size((220, 220)).set_content_align('lt'):
+                                cover = item.cover_img.resize((220, 220), Image.BICUBIC)
+                                if not item.owned:
+                                    cover = apply_anvo_unowned_effect(cover)
+                                ImageBox(cover, size=(220, 220), image_size_mode='fill', shadow=True)
+
+                                # 左下角叠加 vocal 对应角色头像，方便快速看出这是哪组 Another Vocal。
+                                icon_size = 40
+                                overlap = 10
+                                for idx, icon_cid in enumerate(item.chara_ids):
+                                    icon_unit = get_unit_by_chara_id(icon_cid) if icon_cid == 21 else None
+                                    icon_img = get_chara_icon_by_chara_id(icon_cid, size=icon_size, unit=icon_unit)
+                                    ox = 6 + idx * (icon_size - overlap)
+                                    oy = 220 - icon_size - 6
+                                    ImageBox(icon_img, size=(icon_size, icon_size), use_alphablend=True, shadow=True).set_offset((ox, oy))
+
+                                if not item.owned and lock_icon is not None:
+                                    lock_size = int(220 * 0.33)
+                                    ImageBox(lock_icon, size=(lock_size, lock_size), use_alphablend=True, shadow=True) \
+                                        .set_offset(((220 - lock_size) // 2, (220 - lock_size) // 2))
+
+                            status_text = "已持有" if item.owned else "未持有"
+                            status_color = (15, 128, 70) if item.owned else (120, 120, 120)
+                            TextBox(status_text, TextStyle(DEFAULT_FONT, 16, status_color))
+
+    add_watermark(canvas)
+    return await canvas.get_img()
+
+
 async def get_music_trans_title(mid: int, lang: str, default: str=None) -> str:
     if lang == 'cn':
         return (await music_cn_titles.get()).get(str(mid), default)
@@ -2225,9 +2496,15 @@ async def _(ctx: SekaiHandlerContext):
         ))
 
     # 查询单曲
-    ret = await search_music(ctx, query, MusicSearchOptions())
-    msg = await get_image_cq(await compose_music_detail_image(ctx, ret.music['id']))
+    ret, query_ctx, used_fallback = await search_music_with_jp_fallback(
+        ctx,
+        query,
+        MusicSearchOptions(),
+    )
+    msg = await get_image_cq(await compose_music_detail_image(query_ctx, ret.music['id']))
     msg += ret.candidate_msg
+    if used_fallback:
+        msg = format_jp_fallback_reply(msg)
     return await ctx.asend_reply_msg(msg)
 
 
@@ -2473,16 +2750,20 @@ pjsk_bpm.check_cdrate(cd).check_wblist(gbl)
 @pjsk_bpm.handle()
 async def _(ctx: SekaiHandlerContext):
     query = ctx.get_args().strip()
-    ret = await search_music(ctx, query, MusicSearchOptions())
+    ret, query_ctx, used_fallback = await search_music_with_jp_fallback(
+        ctx,
+        query,
+        MusicSearchOptions(),
+    )
     assert_and_reply(ret.music, f"未找到歌曲\"{query}\"")
 
     cover_cq = await get_image_cq(
-        await get_music_cover_thumb(ctx, ret.music['id']), 
+        await get_music_cover_thumb(query_ctx, ret.music['id']), 
         low_quality=True
     )
     msg = f"{cover_cq}【{ret.music['id']}】{ret.music['title']}\n{ret.candidate_msg}".strip()
     
-    bpm = await get_chart_bpm(ctx, ret.music['id'])
+    bpm = await get_chart_bpm(query_ctx, ret.music['id'])
     msg += "\n---\nBPM: "
     for event in bpm.bpm_events:
         bpm = event.get('bpm')
@@ -2493,6 +2774,8 @@ async def _(ctx: SekaiHandlerContext):
                 bpm = int(bpm)
             msg += f"{bpm} - "
     msg = msg.rstrip(" - ")
+    if used_fallback:
+        msg = format_jp_fallback_reply(msg)
     return await ctx.asend_reply_msg(msg)
 
 
@@ -2505,12 +2788,18 @@ pjsk_music_cover.check_cdrate(cd).check_wblist(gbl)
 @pjsk_music_cover.handle()
 async def _(ctx: SekaiHandlerContext):
     query = ctx.get_args().strip()
-    ret = await search_music(ctx, query, MusicSearchOptions(raise_when_err=True))
+    ret, query_ctx, used_fallback = await search_music_with_jp_fallback(
+        ctx,
+        query,
+        MusicSearchOptions(raise_when_err=True),
+    )
     asset_name = ret.music['assetbundleName']
     title = ret.music['title']
     mid = ret.music['id']
-    cover = await ctx.rip.img(f"music/jacket/{asset_name}_rip/{asset_name}.png")
+    cover = await query_ctx.rip.img(f"music/jacket/{asset_name}_rip/{asset_name}.png")
     msg = await get_image_cq(cover) + (f"【{mid}】{title}\n" + ret.candidate_msg).strip()
+    if used_fallback:
+        msg = format_jp_fallback_reply(msg)
     return await ctx.asend_reply_msg(msg)
 
 
@@ -2693,3 +2982,4 @@ for hour, minute, second in SyncMusicAliasConfig.get().sync_times:
     async def cron_statistic():
         logger.info("触发歌曲别名自动同步")
         await sync_music_alias()
+

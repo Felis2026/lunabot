@@ -1036,6 +1036,38 @@ async def compose_card_detail_image(ctx: SekaiHandlerContext, card_id: int):
 
 # ======================= 指令处理 ======================= #
 
+# ================================ 跨服Fallback辅助 ================================ #
+
+def should_try_single_card_jp_fallback(ctx: SekaiHandlerContext, exc: Exception) -> bool:
+    """
+    仅在单卡查询表现为“国服没有这张卡 / 国服卡数不够”时补查日服。
+    """
+    if not ctx.can_fallback_to_jp():
+        return False
+
+    text = str(exc)
+    return "找不到卡牌" in text or ("只有" in text and "张卡" in text)
+
+
+async def search_single_card_with_jp_fallback(
+    ctx: SekaiHandlerContext,
+    args: str,
+) -> tuple[dict, SekaiHandlerContext, bool]:
+    """
+    先按当前区服查单卡；若满足无前缀 CN miss 条件，则自动补查 JP。
+    """
+    try:
+        return await search_single_card(ctx, args), ctx, False
+    except Exception as exc:
+        if not should_try_single_card_jp_fallback(ctx, exc):
+            raise
+
+        jp_ctx = ctx.copy_for_region("jp")
+        try:
+            return await search_single_card(jp_ctx, args), jp_ctx, True
+        except Exception:
+            raise exc
+
 # 角色别名查询
 pjsk_chara_alias = SekaiCmdHandler([
     "/pjsk chara alias",
@@ -1060,31 +1092,47 @@ pjsk_card = SekaiCmdHandler([
 pjsk_card.check_cdrate(cd).check_wblist(gbl)
 @pjsk_card.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip()
-    card, chara_id = None, None
+    raw_args = ctx.get_args().strip()
+    card, card_ctx, used_fallback = None, ctx, False
     cards = await ctx.md.cards.get()
     
     ## 尝试解析：单独查某张卡
     try: 
-        card = await search_single_card(ctx, args)
+        card, card_ctx, used_fallback = await search_single_card_with_jp_fallback(ctx, raw_args)
     except Exception as e:
-        if '找不到卡牌' in str(e):
+        if '找不到卡牌' in str(e) or ('只有' in str(e) and '张卡' in str(e)):
             raise e
         card = None
     if card:
         logger.info(f"查询卡牌: id={card['id']}")
-        return await ctx.asend_reply_msg(await get_image_cq(
-            await compose_card_detail_image(ctx, card['id']),
+        msg = await get_image_cq(
+            await compose_card_detail_image(card_ctx, card['id']),
             low_quality=True,
-        ))
+        )
+        if used_fallback:
+            msg = format_jp_fallback_reply(msg)
+        return await ctx.asend_reply_msg(msg)
         
     ## 尝试解析：查多张卡
-    res, args = await search_multi_cards(ctx, args, cards, contain_leak=True)
+    res, args = await search_multi_cards(ctx, raw_args, cards, contain_leak=True)
     box = False
     if 'box' in args:
         args = args.replace('box', '').strip()
         box = True
     assert_and_reply(not args, f"无法解析的参数:\"{args}\"")
+
+    if not box and not res and ctx.can_fallback_to_jp():
+        jp_ctx = ctx.copy_for_region("jp")
+        jp_cards = await jp_ctx.md.cards.get()
+        jp_res, jp_args = await search_multi_cards(jp_ctx, raw_args, jp_cards, contain_leak=True)
+        if 'box' in jp_args:
+            jp_args = jp_args.replace('box', '').strip()
+        if not jp_args and jp_res:
+            logger.info(f"国服卡牌筛选无结果，已回退到日服并搜索到{len(jp_res)}个卡牌")
+            return await ctx.asend_reply_msg(format_jp_fallback_reply(await get_image_cq(
+                await compose_card_list_image(jp_ctx, jp_res, None),
+                low_quality=True,
+            )))
 
     logger.info(f"搜索到{len(res)}个卡牌")
 
@@ -1103,12 +1151,14 @@ pjsk_card_img = SekaiCmdHandler([
 pjsk_card_img.check_cdrate(cd).check_wblist(gbl)
 @pjsk_card_img.handle()
 async def _(ctx: SekaiHandlerContext):
-    card = await search_single_card(ctx, ctx.get_args().strip())
+    card, card_ctx, used_fallback = await search_single_card_with_jp_fallback(ctx, ctx.get_args().strip())
     msg = ""
     if not only_has_after_training(card):
-        msg += await get_image_cq(await get_card_image(ctx, card['id'], False, False))
+        msg += await get_image_cq(await get_card_image(card_ctx, card['id'], False, False))
     if has_after_training(card):
-        msg += await get_image_cq(await get_card_image(ctx, card['id'], True, False))
+        msg += await get_image_cq(await get_card_image(card_ctx, card['id'], True, False))
+    if used_fallback:
+        msg = format_jp_fallback_reply(msg)
     return await ctx.asend_reply_msg(msg)
 
 

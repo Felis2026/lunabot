@@ -38,6 +38,7 @@ class SekaiHandlerContext(HandlerContext):
     prefix_arg: str = None
     uid_arg: str = None
     data_mode_arg: str = None
+    explicit_region_prefix: bool = False
 
     @classmethod
     def from_region(cls, region: str) -> 'SekaiHandlerContext':
@@ -50,10 +51,48 @@ class SekaiHandlerContext(HandlerContext):
         ctx.prefix_arg = None
         ctx.data_mode_arg = None
         return ctx
+
+    # ================================ 跨服Fallback辅助 ================================ #
+    # 这里只处理“无前缀命令的国服 miss 自动补查日服”。
+    # 关键约束：
+    # 1. 显式 /cn /jp 前缀绝不自动切服，避免用户误判结果来源。
+    # 2. 只允许 cn -> jp 单向回退，不做反向或多跳回退。
+
+    def can_fallback_to_jp(self) -> bool:
+        """
+        判断当前上下文是否允许在国服 miss 时自动回退到日服。
+        """
+        return not self.explicit_region_prefix and self.region == "cn"
+
+    def copy_for_region(self, region: str) -> 'SekaiHandlerContext':
+        """
+        复制当前上下文并切换区服。
+
+        这样可以保留原消息、回复接口和用户上下文，只替换区服相关的
+        MasterData / 资源访问器，避免在 fallback 查询时丢失会话信息。
+        """
+        params = self.__dict__.copy()
+        params["region"] = region
+        params["md"] = RegionMasterDataCollection(region)
+        params["rip"] = RegionRipAssetManger.get(region)
+        params["static_imgs"] = StaticImageRes()
+        return SekaiHandlerContext(**params)
     
     def block_region(self, key="", timeout=3*60, err_msg: str = None):
         if not self.create_from_region:
             return self.block(f"{self.region}_{key}", timeout=timeout, err_msg=err_msg)
+
+
+JP_FALLBACK_NOTICE = "国服未找到，以下为日服查询结果。"
+
+
+def format_jp_fallback_reply(content: str) -> str:
+    """
+    为回退到日服的结果统一追加提示，明确结果来源。
+    """
+    if not content:
+        return JP_FALLBACK_NOTICE
+    return f"{JP_FALLBACK_NOTICE}\n{content}"
 
 
 class SekaiCmdHandler(CmdHandler):
@@ -88,10 +127,12 @@ class SekaiCmdHandler(CmdHandler):
         # 处理指令区服前缀
         with ProfileTimer("sekaihandler.parse_prefix"):
             cmd_region = None
+            explicit_region_prefix = False
             original_trigger_cmd = context.trigger_cmd
             for region in ALL_SERVER_REGIONS:
                 if context.trigger_cmd.strip().startswith(f"/{region}"):
                     cmd_region = region
+                    explicit_region_prefix = True
                     context.trigger_cmd = context.trigger_cmd.replace(f"/{region}", "/")
                     break
             
@@ -166,6 +207,7 @@ class SekaiCmdHandler(CmdHandler):
             params['prefix_arg'] = prefix_arg
             params['uid_arg'] = uid_arg
             params['data_mode_arg'] = data_mode_arg
+            params['explicit_region_prefix'] = explicit_region_prefix
             return SekaiHandlerContext(**params)
 
 

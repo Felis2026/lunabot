@@ -157,7 +157,11 @@ async def _(ctx: SekaiHandlerContext):
     
     skill = True
     diff, query = extract_diff(query)
-    ret = await search_music(ctx, query, MusicSearchOptions(diff=diff))
+    ret, query_ctx, used_fallback = await search_music_with_jp_fallback(
+        ctx,
+        query,
+        MusicSearchOptions(diff=diff),
+    )
 
     mid, title = ret.music['id'], ret.music['title']
 
@@ -165,7 +169,8 @@ async def _(ctx: SekaiHandlerContext):
     try:
         msg = await get_image_cq(
             await generate_music_chart(
-                ctx, mid, diff, 
+                query_ctx, mid, diff, 
+                need_reply=not used_fallback,
                 refresh=refresh, 
                 use_cache=True,
                 style_sheet=config.get('chart.style_sheet_name'),
@@ -178,5 +183,7 @@ async def _(ctx: SekaiHandlerContext):
         return await ctx.asend_reply_msg(f"获取指定曲目\"{title}\"难度{diff}的谱面失败: {e}")
         
     msg += ret.candidate_msg
+    if used_fallback:
+        msg = format_jp_fallback_reply(msg)
     return await ctx.asend_reply_msg(msg.strip())
 

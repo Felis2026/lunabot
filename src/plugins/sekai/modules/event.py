@@ -465,10 +465,48 @@ async def parse_search_single_event_args(ctx: SekaiHandlerContext, args: str, fa
     else:
         raise ReplyException(f"查单个活动参数错误")
 
+
+def should_try_single_event_jp_fallback(
+    ctx: SekaiHandlerContext,
+    args: str,
+    exc: Exception,
+) -> bool:
+    """
+    仅对明确的活动 ID 查询做国服 miss -> 日服补查。
+    """
+    if not ctx.can_fallback_to_jp():
+        return False
+    if not args.isdigit():
+        return False
+
+    text = str(exc)
+    return f"活动{ctx.region.upper()}-" in text and "不存在" in text
+
+
+async def parse_search_single_event_args_with_jp_fallback(
+    ctx: SekaiHandlerContext,
+    args: str,
+    fallback: str = "next_first",
+) -> tuple[dict, SekaiHandlerContext, bool]:
+    """
+    先按当前区服解析单活动；若满足无前缀 CN miss 条件，则自动补查 JP。
+    """
+    try:
+        return await parse_search_single_event_args(ctx, args, fallback=fallback), ctx, False
+    except Exception as exc:
+        if not should_try_single_event_jp_fallback(ctx, args, exc):
+            raise
+
+        jp_ctx = ctx.copy_for_region("jp")
+        try:
+            return await parse_search_single_event_args(jp_ctx, args, fallback=fallback), jp_ctx, True
+        except Exception:
+            raise exc
+
 # 合成活动剧情总结文本版
 async def compose_event_story_summary_msg_list(
     ctx: SekaiHandlerContext, 
-    event: dict, 
+    event: dict,
     eps: list[dict], 
     no_snippet_eps: list[dict], 
     summary: dict,
@@ -1075,14 +1113,19 @@ async def _(ctx: SekaiHandlerContext):
         ))
     
     async def query_single(args: str):
+        query_ctx = ctx
+        used_fallback = False
         if args:
-            event = await parse_search_single_event_args(ctx, args)
+            event, query_ctx, used_fallback = await parse_search_single_event_args_with_jp_fallback(ctx, args)
         else:
             event = await get_current_event(ctx, fallback='next_first')
-        return await ctx.asend_reply_msg(await get_image_cq(
-            await compose_event_detail_image(ctx, event),
+        msg = await get_image_cq(
+            await compose_event_detail_image(query_ctx, event),
             low_quality=True,
-        ))
+        )
+        if used_fallback:
+            msg = format_jp_fallback_reply(msg)
+        return await ctx.asend_reply_msg(msg)
 
     # 如果参数为空，根据命令区分查询单个还是多个活动
     if not args:
