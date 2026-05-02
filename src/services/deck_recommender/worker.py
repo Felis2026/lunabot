@@ -34,6 +34,7 @@ class Worker:
             return
         self.recommender = SekaiDeckRecommend()
         self.masterdata_version: dict[str, str] = {}
+        self.masterdata_fingerprint: dict[str, str] = {}
         self.musicmetas_update_ts: dict[str, int] = {}
         self.userdata_cache: list[tuple[str, DeckRecommendUserData]] = []
         self.inited = True
@@ -72,11 +73,23 @@ class Worker:
         db = load_json(DB_PATH, default={})
 
         masterdata_version = db.get('masterdata_version', {}).get(region)
-        if self.masterdata_version.get(region) != masterdata_version:
+        masterdata_fingerprint = db.get('masterdata_fingerprint', {}).get(region)
+
+        # ================================ MasterData热更新兜底 ================================ #
+        # 只比较版本号会漏掉“同版本下单文件热修”的场景。
+        # 指纹变化时也要强制重新加载本地 masterdata，避免 worker 保留旧索引。
+        if (
+            self.masterdata_version.get(region) != masterdata_version or
+            self.masterdata_fingerprint.get(region) != masterdata_fingerprint
+        ):
             local_md_dir = pjoin(DATA_DIR, 'masterdata', region)
             self.recommender.update_masterdata(local_md_dir, region)
             self.masterdata_version[region] = masterdata_version
-            self.log(f"加载 {region} MasterData: v{masterdata_version}")
+            self.masterdata_fingerprint[region] = masterdata_fingerprint
+            self.log(
+                f"加载 {region} MasterData: "
+                f"v{masterdata_version} fp={(masterdata_fingerprint or 'None')[:8]}"
+            )
 
         musicmetas_update_ts = db.get('musicmetas_update_ts', {}).get(region)
         if self.musicmetas_update_ts.get(region) != musicmetas_update_ts:

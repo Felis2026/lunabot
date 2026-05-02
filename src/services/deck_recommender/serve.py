@@ -24,6 +24,7 @@ except ImportError:
 def update_data(
     region: str, 
     masterdata_version: str, 
+    masterdata_fingerprint: str | None,
     masterdata: dict[str, bytes] | None,
     musicmetas_update_ts: int,
     musicmetas: bytes | None,
@@ -32,8 +33,16 @@ def update_data(
 
     missing_data = set()
 
+    # ================================ MasterData版本与指纹校验 ================================ #
+    # 组卡依赖的 MasterData 可能会在版本号不变时被单文件热修。
+    # 因此除了版本号，还需要校验客户端上报的同步指纹，避免服务端继续沿用旧文件。
     current_masterdata_version = db.get('masterdata_version', {}).get(region)
-    if current_masterdata_version != masterdata_version:
+    current_masterdata_fingerprint = db.get('masterdata_fingerprint', {}).get(region)
+    masterdata_changed = current_masterdata_version != masterdata_version
+    if masterdata_fingerprint is not None and current_masterdata_fingerprint != masterdata_fingerprint:
+        masterdata_changed = True
+
+    if masterdata_changed:
         if not masterdata:
             missing_data.add('masterdata')
         else:
@@ -41,7 +50,13 @@ def update_data(
             for name, md in masterdata.items():
                 write_file(pjoin(local_md_dir, name), md)
             db.setdefault('masterdata_version', {})[region] = masterdata_version
-            log(f"更新 {region} MasterData {current_masterdata_version} -> {masterdata_version}")
+            if masterdata_fingerprint is not None:
+                db.setdefault('masterdata_fingerprint', {})[region] = masterdata_fingerprint
+            log(
+                f"更新 {region} MasterData "
+                f"version={current_masterdata_version} -> {masterdata_version} "
+                f"fingerprint={current_masterdata_fingerprint or 'None'} -> {masterdata_fingerprint or 'None'}"
+            )
 
     current_musicmetas_update_ts = db.get('musicmetas_update_ts', {}).get(region)
     if current_musicmetas_update_ts != musicmetas_update_ts:
@@ -92,6 +107,7 @@ async def _(request: Request):
         data = loads_json(segments[0])
         region = data['region']
         masterdata_version      = data['masterdata_version']
+        masterdata_fingerprint  = data.get('masterdata_fingerprint')
         musicmetas_update_ts    = data['musicmetas_update_ts']
 
         masterdatas: dict[str, bytes] = {}
@@ -104,7 +120,7 @@ async def _(request: Request):
             else:
                 masterdatas[key] = value
             
-        update_data(region, masterdata_version, masterdatas, musicmetas_update_ts, musicmetas)
+        update_data(region, masterdata_version, masterdata_fingerprint, masterdatas, musicmetas_update_ts, musicmetas)
 
     except HTTPException as he:
         raise he

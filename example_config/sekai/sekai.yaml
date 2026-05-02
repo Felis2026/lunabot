@@ -1,4 +1,4 @@
-﻿debug: false
+debug: false
 
 gameapi_token: xxx
 
@@ -86,7 +86,9 @@ deck:
     - url: http://127.0.0.1:45678
       weight: 8
 
-  music_meta_url: https://storage.sekai.best/sekai-best-assets/music_metas.json
+  music_meta_urls:
+    - https://storage.sekai.best/sekai-best-assets/music_metas.json
+    - https://assets.exmeaning.com/musicmeta/music_metas.json
   data_update_interval_seconds: 30
   default_algs: ['dfs', 'ga']
 
@@ -266,4 +268,3 @@ music:
     override_url: ""
     info_text: |
       该bot的定数表未配置
-

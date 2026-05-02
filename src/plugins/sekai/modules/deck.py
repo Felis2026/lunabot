@@ -6,6 +6,7 @@ from ..draw import *
 from .event import get_event_banner_img, get_current_event
 from .sk import get_wl_events
 from .profile import (
+    format_suite_missing_fields_error,
     get_player_bind_id,
     get_basic_profile,
     get_detailed_profile, 
@@ -34,6 +35,7 @@ from sekai_deck_recommend_cpp import (
     DeckRecommendSaOptions,
     RecommendDeck,
 )
+from hashlib import md5
 
 
 BOOST_BONUS_DICT: Dict[int, int] = {
@@ -1110,12 +1112,22 @@ async def do_deck_recommend_batch(
         async with get_client_session().post(url, data=payload) as resp:
             if resp.status != 200:
                 msg = f"{resp.status}: "
+                raw_detail = ""
+                body_text = ""
                 try:
-                    err_data = await resp.json()
-                    msg += err_data.get('detail', '')
-                except:
-                    try: msg += await resp.text()
-                    except: pass
+                    body_text = await resp.text()
+                    # 组卡服务有时会被 WAF / 反代拦截并返回整页 HTML。
+                    # 这里不能把原文直接拼进 ReplyException，否则：
+                    # 1. 用户会看到整页垃圾 HTML；
+                    # 2. 外层 logger.warning(get_exc_desc(e)) 会把日志直接打爆。
+                    err_data = loads_json(body_text)
+                    if isinstance(err_data, dict) and 'detail' in err_data:
+                        raw_detail = err_data['detail']
+                    else:
+                        raw_detail = err_data
+                except Exception:
+                    raw_detail = body_text
+                msg += summarize_http_error_detail(raw_detail, resp.content_type)
                 raise ReplyException(msg)
             return await resp.json()
 
@@ -1443,6 +1455,15 @@ async def compose_deck_recommend_image(
                 ),
                 strict=False,
                 raise_exc=True, ignore_hide=True)
+
+            # ================================ Suite 核心字段兜底 ================================ #
+            # 组卡后续会大量依赖 `userGamedata.userId`、`userCards`、`userDecks` 等核心字段。
+            # 即使上游 OAuth / Public-API 某次结构波动，至少也要在这里抛出可读错误，
+            # 不能直接落成 KeyError 让用户完全看不懂发生了什么。
+            assert_and_reply(
+                isinstance(profile.get('userGamedata'), dict) and profile['userGamedata'].get('userId'),
+                format_suite_missing_fields_error(ctx, profile, ['userGamedata']),
+            )
             uid = profile['userGamedata']['userId']
 
     original_usercards = profile['userCards']
@@ -1882,19 +1903,15 @@ async def compose_deck_recommend_image(
 
                     if recommend_type not in ["bonus", "wl_bonus", "mysekai"]:
                         skill_text_style = TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(70, 70, 70))
-                        avg_icon_text_offset = (0, 1)
                         with HSplit().set_content_align('l').set_item_align('c').set_sep(16):
                             with HSplit().set_content_align('l').set_item_align('c').set_sep(2):
                                 TextBox("技能顺序:", skill_text_style)
                                 if options.skill_order_choose_strategy == 'average':
-                                    TextBox("⚖️", skill_text_style).set_text_offset(avg_icon_text_offset)
-                                    TextBox("平均情况", skill_text_style)
+                                    TextBox("⚖️平均情况", skill_text_style)
                                 elif options.skill_order_choose_strategy == 'max':
-                                    TextBox("🌟", skill_text_style)
-                                    TextBox("最优顺序", skill_text_style)
+                                    TextBox("🌟最优顺序", skill_text_style)
                                 elif options.skill_order_choose_strategy == 'min':
-                                    TextBox("🥀", skill_text_style)
-                                    TextBox("最差顺序", skill_text_style)
+                                    TextBox("🥀最差顺序", skill_text_style)
                                 elif options.skill_order_choose_strategy == 'specific':
                                     skill_order = options.specific_skill_order
                                     TextBox(f"{''.join([str(s + 1) for s in skill_order])}", skill_text_style)
@@ -1902,14 +1919,11 @@ async def compose_deck_recommend_image(
                             with HSplit().set_content_align('l').set_item_align('c').set_sep(2):
                                 TextBox("BloomFes花前技能吸取:", skill_text_style)
                                 if options.skill_reference_choose_strategy == 'average':
-                                    TextBox("⚖️", skill_text_style).set_text_offset(avg_icon_text_offset)
-                                    TextBox("平均值", skill_text_style)
+                                    TextBox("⚖️平均值", skill_text_style)
                                 elif options.skill_reference_choose_strategy == 'max':
-                                    TextBox("🌟", skill_text_style)
-                                    TextBox("最大值", skill_text_style)
+                                    TextBox("🌟最大值", skill_text_style)
                                 elif options.skill_reference_choose_strategy == 'min':
-                                    TextBox("🥀", skill_text_style)
-                                    TextBox("最小值", skill_text_style)
+                                    TextBox("🥀最小值", skill_text_style)
                     
                     info_text = ""
 
@@ -2235,6 +2249,67 @@ async def _(ctx: SekaiHandlerContext):
 
 DECKREC_DATA_UPDATE_INTERVAL_CFG = config.item('deck.data_update_interval_seconds')
 
+
+# ================================ 组卡服务MasterData同步 ================================ #
+
+async def get_deckrec_masterdata_paths(ctx: SekaiHandlerContext) -> List[str]:
+    """
+    获取组卡服务依赖的 MasterData 文件路径。
+    这里必须和 deck_recommender 服务端实际消费的文件集合保持一致，
+    否则单个文件热更新时会出现版本号一致但内容不一致的情况。
+    """
+    masterdata_tasks = [
+        ctx.md.area_item_levels.get_path(),
+        ctx.md.area_items.get_path(),
+        ctx.md.areas.get_path(),
+        ctx.md.card_episodes.get_path(),
+        ctx.md.cards.get_path(),
+        ctx.md.card_rarities.get_path(),
+        ctx.md.character_ranks.get_path(),
+        ctx.md.event_cards.get_path(),
+        ctx.md.event_deck_bonuses.get_path(),
+        ctx.md.event_exchange_summaries.get_path(),
+        ctx.md.events.get_path(),
+        ctx.md.event_items.get_path(),
+        ctx.md.event_rarity_bonus_rates.get_path(),
+        ctx.md.game_characters.get_path(),
+        ctx.md.game_character_units.get_path(),
+        ctx.md.honors.get_path(),
+        ctx.md.master_lessons.get_path(),
+        ctx.md.music_diffs.get_path(),
+        ctx.md.musics.get_path(),
+        ctx.md.music_vocals.get_path(),
+        ctx.md.shop_items.get_path(),
+        ctx.md.skills.get_path(),
+        ctx.md.world_bloom_different_attribute_bonuses.get_path(),
+        ctx.md.world_blooms.get_path(),
+        ctx.md.world_bloom_support_deck_bonuses.get_path(),
+    ]
+    if ctx.region in MYSEKAI_REGIONS:
+        masterdata_tasks += [
+            ctx.md.card_mysekai_canvas_bonuses.get_path(),
+            ctx.md.mysekai_fixture_game_character_groups.get_path(),
+            ctx.md.mysekai_fixture_game_character_group_performance_bonuses.get_path(),
+            ctx.md.mysekai_gates.get_path(),
+            ctx.md.mysekai_gate_levels.get_path(),
+        ]
+    if await ctx.md.events.find_by_id(180):
+        masterdata_tasks.append(ctx.md.world_bloom_support_deck_unit_event_limited_bonuses.get_path())
+    return await asyncio.gather(*masterdata_tasks)
+
+
+def calc_deckrec_masterdata_fingerprint(masterdata_paths: List[str]) -> str:
+    """
+    基于文件名、大小和修改时间生成同步指纹。
+    MasterData 可能在版本号不变的情况下做单文件热修，因此不能只依赖版本号。
+    """
+    digest = md5()
+    for path in masterdata_paths:
+        stat = os.stat(path)
+        digest.update(f"{os.path.basename(path)}:{stat.st_size}:{stat.st_mtime_ns}\n".encode('utf-8'))
+    return digest.hexdigest()
+
+
 @repeat_with_interval(DECKREC_DATA_UPDATE_INTERVAL_CFG, "组卡数据更新", logger)
 async def deckrec_update_data():
     for region in ALL_SERVER_REGIONS:
@@ -2242,8 +2317,14 @@ async def deckrec_update_data():
             ctx = SekaiHandlerContext.from_region(region)
 
             current_masterdata_version = await ctx.md.get_version()
+            masterdata_paths = await get_deckrec_masterdata_paths(ctx)
+            masterdata_fingerprint = calc_deckrec_masterdata_fingerprint(masterdata_paths)
             current_musicmetas_update_ts = await musicmetas_json.get_update_time()
-            logger.debug(f"组卡 {region} 当前 masterdata 版本: {current_masterdata_version} musicmetas 更新时间: {current_musicmetas_update_ts}")
+            logger.debug(
+                f"组卡 {region} 当前 masterdata 版本: {current_masterdata_version} "
+                f"指纹: {masterdata_fingerprint[:8]} "
+                f"musicmetas 更新时间: {current_musicmetas_update_ts}"
+            )
 
             async def construct_payload(with_masterdata: bool, with_musicmetas: bool) -> bytes:
                 payloads = []
@@ -2251,50 +2332,14 @@ async def deckrec_update_data():
                 data = { 
                     'region': ctx.region,
                     'masterdata_version': str(current_masterdata_version),
+                    'masterdata_fingerprint': masterdata_fingerprint,
                     'musicmetas_update_ts': int(current_musicmetas_update_ts.timestamp()),
                 }
                 add_payload_segment(payloads, dumps_json(data, indent=False).encode('utf-8'))
 
                 if with_masterdata:
                     logger.info(f"为自动组卡加载 {ctx.region} masterdata")
-                    mds = [
-                        ctx.md.area_item_levels.get_path(),
-                        ctx.md.area_items.get_path(),
-                        ctx.md.areas.get_path(),
-                        ctx.md.card_episodes.get_path(),
-                        ctx.md.cards.get_path(),
-                        ctx.md.card_rarities.get_path(),
-                        ctx.md.character_ranks.get_path(),
-                        ctx.md.event_cards.get_path(),
-                        ctx.md.event_deck_bonuses.get_path(),
-                        ctx.md.event_exchange_summaries.get_path(),
-                        ctx.md.events.get_path(),
-                        ctx.md.event_items.get_path(),
-                        ctx.md.event_rarity_bonus_rates.get_path(),
-                        ctx.md.game_characters.get_path(),
-                        ctx.md.game_character_units.get_path(),
-                        ctx.md.honors.get_path(),
-                        ctx.md.master_lessons.get_path(),
-                        ctx.md.music_diffs.get_path(),
-                        ctx.md.musics.get_path(),
-                        ctx.md.music_vocals.get_path(),
-                        ctx.md.shop_items.get_path(),
-                        ctx.md.skills.get_path(),
-                        ctx.md.world_bloom_different_attribute_bonuses.get_path(),
-                        ctx.md.world_blooms.get_path(),
-                        ctx.md.world_bloom_support_deck_bonuses.get_path(),
-                    ]
-                    if ctx.region in MYSEKAI_REGIONS:
-                        mds += [
-                            ctx.md.card_mysekai_canvas_bonuses.get_path(),
-                            ctx.md.mysekai_fixture_game_character_groups.get_path(),
-                            ctx.md.mysekai_fixture_game_character_group_performance_bonuses.get_path(),
-                            ctx.md.mysekai_gates.get_path(),
-                            ctx.md.mysekai_gate_levels.get_path(),
-                        ]
-                    if await ctx.md.events.find_by_id(180):
-                        mds.append(ctx.md.world_bloom_support_deck_unit_event_limited_bonuses.get_path())
-                    for path in await asyncio.gather(*mds):
+                    for path in masterdata_paths:
                         with open(path, 'rb') as f:
                             add_payload_segment(payloads, os.path.basename(path).encode('utf-8'))
                             add_payload_segment(payloads, f.read())

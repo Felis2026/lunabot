@@ -191,37 +191,34 @@ async def get_snowy_forecast_data(region: str, event_id: int, chapter_id: int | 
         region=region,
         event_id=event_id,
     )
-    # 从网页爬取
-    # async with TempBotOrInternetFilePath('html', cfg['url']) as html_path:
-    #     with open(html_path, 'r', encoding='utf-8') as f:
-    #         html = f.read()
 
-    #     if f'event_{event_id}' not in html:
-    #         raise GetForecastException("最新活动预测未更新")
+    # 新接口先校验活动列表，避免上游尚未切到当前活动时误读旧数据。
+    events_resp = await download_json(cfg['events_url'].format(region=region))
+    if not isinstance(events_resp, list) or not any(int(event.get('event_id', 0)) == event_id for event in events_resp):
+        raise GetForecastException("最新活动预测未更新")
 
-    #     rank_preds = {}
+    resp = await download_json(cfg['latest_url'].format(region=region, event_id=event_id))
+    if int(resp.get('event_id', 0)) != data.event_id:
+        raise GetForecastException("最新活动预测未更新")
 
-    #     pattern = re.compile(r'"Rank":(\d+),"CurrentScore":\d+,"PredictedScore":(\d+),')
-    #     for match in pattern.finditer(html):
-    #         rank = int(match.group(1))
-    #         pred_score = int(match.group(2))
-    #         rank_preds[rank] = pred_score
-        
-    #     data.forecast_ts = int(time.time())
-    #     for rank, pred in rank_preds.items():
-    #         data.rank_data[rank] = RankForecastData(final_score=pred)
+    updated_at = resp.get('updated_at')
+    if not updated_at:
+        raise GetForecastException("最新活动预测缺少更新时间")
+    data.forecast_ts = int(datetime.fromisoformat(updated_at.replace('Z', '+00:00')).timestamp())
 
-    # 从公开API获取
-    resp = await download_json(cfg['url'].format(region=region + '/' if region != 'cn' else '', event_id=event_id))
-    for item in resp.get('data', {}).get('charts', []):
-        rank = int(item['Rank'])
+    for item in resp.get('items', []):
+        rank = int(item['rank'])
         if rank not in cfg['ranks']:
             continue
-        pred_score = int(item['PredictedScore'])
-        data.rank_data[rank] = RankForecastData(final_score=pred_score)
+
+        # 新接口在高档位可能只返回实时分数而不给预测值，这里显式跳过空预测。
+        prediction = item.get('prediction')
+        if prediction is None:
+            continue
+        data.rank_data[rank] = RankForecastData(final_score=int(prediction))
+
     if not data.rank_data:
         raise GetForecastException("最新活动预测未更新")
-    data.forecast_ts = int(resp['timestamp'] / 1000)
 
     return data
 
