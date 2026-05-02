@@ -1263,20 +1263,100 @@ class StaticImageRes:
 # ================================ 网页Json资源 ================================ #
 
 class WebJsonRes:
-    def __init__(self, name: str, url: str, update_interval: timedelta = None):
+    def __init__(
+        self,
+        name: str,
+        url: str | None = None,
+        urls: List[str] | None = None,
+        update_interval: timedelta = None,
+        file_cache: bool = True,
+    ):
         self.name = name
         self.url = url
+        self.urls = self._normalize_urls(url, urls)
         self.update_interval = update_interval
         self.data: Any = None
         self.update_time: datetime = None
         self.hash: str = None
+        self.last_success_url: str | None = None
+        self.file_cache_path: str | None = None
+        if file_cache:
+            # 使用资源名作为文件名，方便在本地直接定位某个网页 JSON 的兜底缓存。
+            self.file_cache_path = f"{SEKAI_DATA_DIR}/webjson/{self.name}.json"
+
+    # ================================ 数据源归一化 ================================ #
+    # 这里兼容旧版单地址调用和新版多地址回退调用，避免各业务方自己重复处理去空、去重逻辑。
+    @staticmethod
+    def _normalize_urls(url: str | None, urls: List[str] | None) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+
+        raw_urls: List[str] = []
+        if urls is not None:
+            raw_urls = [urls] if isinstance(urls, str) else list(urls)
+        elif url is not None:
+            raw_urls = [url]
+
+        for item in raw_urls:
+            item = (item or "").strip()
+            if not item or item in seen:
+                continue
+            normalized.append(item)
+            seen.add(item)
+        return normalized
     
     async def _download(self):
-        self.data = await download_json(self.url)
-        self.hash = get_md5(dumps_json(self.data, indent=False).encode('utf-8'))
-        self.update_time = datetime.now()
-        logger.info(f"网页Json资源 [{self.name}] 更新成功")
+        # ================================ 多地址顺序回退 ================================ #
+        # 按配置顺序尝试网页 JSON 数据源；主地址故障时自动切换到后续备用地址。
+        # 这里只负责“本次刷新该用哪个源”，旧数据续用逻辑仍由 _check_before_get 统一处理。
+        if not self.urls:
+            raise Exception(f"网页Json资源 [{self.name}] 未配置可用的数据源URL")
+
+        errors: List[str] = []
+        for idx, current_url in enumerate(self.urls, start=1):
+            try:
+                data = await download_json(current_url)
+                self.data = data
+                self.hash = get_md5(dumps_json(self.data, indent=False).encode('utf-8'))
+                self.update_time = datetime.now()
+                self.last_success_url = current_url
+                if self.file_cache_path:
+                    try:
+                        dump_json(self.data, self.file_cache_path, indent=False)
+                    except Exception as cache_err:
+                        logger.warning(
+                            f"网页Json资源 [{self.name}] 写入本地缓存失败: {get_exc_desc(cache_err)}"
+                        )
+                logger.info(f"网页Json资源 [{self.name}] 更新成功，使用数据源: {current_url}")
+                return
+            except Exception as e:
+                err = get_exc_desc(e)
+                errors.append(f"[{idx}] {current_url} -> {truncate(err, 120)}")
+                if idx < len(self.urls):
+                    logger.warning(f"网页Json资源 [{self.name}] 数据源不可用，尝试下一个: {current_url} err={truncate(err, 120)}")
+
+        raise Exception(f"网页Json资源 [{self.name}] 所有数据源更新失败: {' | '.join(errors)}")
     
+    def _try_load_file_cache(self) -> bool:
+        """
+        当在线源全部失败且当前进程里没有旧数据时，尝试从磁盘缓存恢复。
+        这里只做兜底，不替代正常的数据源选择流程。
+        """
+        if not self.file_cache_path or not os.path.exists(self.file_cache_path):
+            return False
+        try:
+            self.data = load_json(self.file_cache_path)
+            self.hash = get_md5(dumps_json(self.data, indent=False).encode('utf-8'))
+            self.update_time = datetime.fromtimestamp(os.path.getmtime(self.file_cache_path))
+            self.last_success_url = "[file-cache]"
+            logger.warning(f"网页Json资源 [{self.name}] 从本地文件缓存中恢复")
+            return True
+        except Exception as cache_err:
+            logger.warning(
+                f"网页Json资源 [{self.name}] 读取本地缓存失败: {get_exc_desc(cache_err)}"
+            )
+            return False
+
     async def _check_before_get(self, timeout: float, raise_on_no_data: bool):
         if not self.data or not self.update_interval or datetime.now() - self.update_time > self.update_interval:
             try:
@@ -1285,6 +1365,8 @@ class WebJsonRes:
                 if self.data:
                     logger.warning(f"更新网页Json资源 [{self.name}] 失败: {get_exc_desc(e)}，继续使用旧数据")
                 else:
+                    if self._try_load_file_cache():
+                        return
                     if raise_on_no_data:
                         raise Exception(f"更新网页Json资源 [{self.name}] 失败: {get_exc_desc(e)}")
                     else:

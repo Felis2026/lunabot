@@ -2,6 +2,7 @@ from .card_extractor import *
 from .card import *
 from .chart import *
 from .deck import *
+from .education import *
 from .entertainment import *
 from .event import *
 from .gacha import *

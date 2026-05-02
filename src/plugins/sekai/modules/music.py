@@ -1,4 +1,4 @@
-﻿from ...utils import *
+from ...utils import *
 from ...llm import get_text_retriever
 from ..common import *
 from ..handler import *
@@ -22,6 +22,7 @@ import pandas as pd
 import csv
 import io
 import math
+from PIL import ImageOps
 
 
 music_group_sub = SekaiGroupSubHelper("music", "新曲通知", ALL_SERVER_REGIONS)
@@ -406,6 +407,16 @@ class MusicSearchResult:
     search_type: str = None
     err_msg: str = None
 
+
+@dataclass
+class AnvoEntry:
+    music_vocal_id: int
+    music_id: int
+    title: str
+    published_at: int
+    chara_ids: List[int]
+    cover_img: Image.Image
+    owned: bool
 
 
 # ================================ 跨服Fallback辅助 ================================ #
@@ -2803,6 +2814,37 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(msg)
 
 
+# 查角色 Another Vocal 持有情况
+pjsk_anvo = SekaiCmdHandler([
+    "/anvo", "/pjsk anvo",
+])
+pjsk_anvo.check_cdrate(cd).check_wblist(gbl)
+@pjsk_anvo.handle()
+async def _(ctx: SekaiHandlerContext):
+    cid = parse_anvo_args(ctx.get_args())
+    profile, err_msg = await get_detailed_profile(
+        ctx,
+        ctx.user_id,
+        filter=get_detailed_profile_card_filter('userMusicVocals', 'userMusics'),
+        raise_exc=True,
+    )
+
+    owned_music_vocal_ids = get_owned_music_vocal_ids(profile)
+    all_entries = await query_character_anvo_entries(ctx, cid, owned_music_vocal_ids)
+    assert_and_reply(all_entries, "该角色暂无可查询的Another Vocal")
+
+    img = await compose_anvo_list_image(
+        ctx,
+        profile,
+        err_msg,
+        cid,
+        all_entries,
+        total_count=len(all_entries),
+        owned_count=sum(1 for item in all_entries if item.owned),
+    )
+    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True))
+
+
 # best30
 pjsk_best30 = SekaiCmdHandler([
     "/pjsk b30", "/b30", "/pjsk rating",
@@ -2982,4 +3024,3 @@ for hour, minute, second in SyncMusicAliasConfig.get().sync_times:
     async def cron_statistic():
         logger.info("触发歌曲别名自动同步")
         await sync_music_alias()
-

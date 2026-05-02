@@ -349,8 +349,16 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
     # 获取区域道具升级材料列表 m[item_id][level][material_id] = quantity
     area_item_lv_materials: dict[int, dict[int, dict[int, int]]] = {}
     for item_id in item_ids:
-        for lv, resbox_id in area_item_lv_shop_item_resbox_ids[item_id].items():
-            for cost in (await ctx.md.shop_items.find_by('resourceBoxId', resbox_id)).get('costs', []):
+        for lv, resbox_id in area_item_lv_shop_item_resbox_ids.get(item_id, {}).items():
+            # 兼容上游 masterdata 先更新了 areaItemLevels / resourceBoxes，
+            # 但 shopItems 还没补齐的情况；缺失时先跳过该等级，避免 /区域道具 整体崩溃。
+            # 等资源补齐后记得改回去：
+            # 1. 删除下面这个 if not shop_item: continue 的临时兜底
+            # 2. 将下一行恢复成直接遍历
+            #    for cost in (await ctx.md.shop_items.find_by('resourceBoxId', resbox_id)).get('costs', [])
+            if not (shop_item := await ctx.md.shop_items.find_by('resourceBoxId', resbox_id)):
+                continue
+            for cost in shop_item.get('costs', []):
                 cost = cost['cost']
                 res_id = cost['resourceId']
                 if cost['resourceType'] == 'coin':
@@ -365,7 +373,10 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
         sum_materials: dict[int, int] = {}
         # 枚举等级和材料
         for lv in range(user_lv + 1, area_item_max_levels[item_id] + 1):
-            for mid, quantity in lv_materials[lv].items():
+            # 上面的 shopItems 兜底会让缺失等级不生成材料表，这里同步跳过，避免缺键再次报错。
+            if not (materials := lv_materials.get(lv)):
+                continue
+            for mid, quantity in materials.items():
                 sum_materials[mid] = sum_materials.get(mid, 0) + quantity
                 area_item_lv_sum_materials.setdefault(item_id, {}).setdefault(lv, {})[mid] = sum_materials[mid]
 
@@ -412,8 +423,11 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
                         for lv in range(user_area_item_lower_lv + 1, area_item_max_levels[item_id] + 1):
                             # 统计道具是否足够
                             if lv > current_lv:
+                                # 与上面的缺等级兜底保持一致：没有累计材料就不渲染该等级，避免查询直接失败。
+                                if not (lv_sum := lv_sum_materials.get(lv)):
+                                    continue
                                 material_is_enough: dict[int, bool] = {}
-                                for mid, quantity in lv_sum_materials[lv].items():
+                                for mid, quantity in lv_sum.items():
                                     material_is_enough[mid] = user_materials.get(mid, 0) >= quantity
                                 lv_can_upgrade = lv_can_upgrade and all(material_is_enough.values())
 
