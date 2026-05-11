@@ -791,11 +791,11 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
             index = int(ctx.uid_arg[1:]) - 1
             uid = get_uid_by_index(str(ctx.user_id), index)
         elif ctx.uid_arg.startswith('@'):
-            assert_and_reply(is_super, "仅bot管理可直接@指定QQ号")
+            assert_and_reply(is_super, "不支持直接通过@QQ指定查询对象")
             at_qid = int(ctx.uid_arg[1:])
             uid = get_player_bind_id(ctx, at_qid, check_bind)
         else:
-            assert_and_reply(is_super, "仅bot管理可直接指定游戏ID")
+            assert_and_reply(is_super, "不支持直接指定游戏ID查询，请先绑定后再使用")
             uid = ctx.uid_arg
             if not validate_uid(ctx, uid):
                 raise ReplyException(f"指定的游戏ID {uid} 不是有效的{region_name}游戏ID")
@@ -803,7 +803,9 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
     if check_bind and uid is None:
         region = "" if ctx.region == "jp" else ctx.region
         raise ReplyException(f"请使用\"/{region}绑定 你的游戏ID\"绑定账号")
-    if not is_super:
+    # 未绑定且当前调用方允许返回 None 时，不应继续做黑名单查询，
+    # 否则会把“尚未解析出 UID”的正常分支打成 uid=None 的误导告警。
+    if not is_super and uid is not None:
         assert_and_reply(not check_uid_in_blacklist(uid, ctx.region), f"该游戏ID({uid})已被拉入黑名单")
     return uid
 

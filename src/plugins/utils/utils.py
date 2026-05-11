@@ -755,6 +755,18 @@ async def download_file(url, file_path):
             detail = summarize_http_error_detail(detail, resp.content_type)
             utils_logger.error(f"下载 {url} 失败: {resp.status} {detail}")
             raise HttpError(resp.status, detail)
+        with open(file_path, 'wb') as f:
+            f.write(await resp.read())
+
+# ================================ 临时下载文件路径 ================================ #
+# 这里给“先下载到本地，再把路径交给后续逻辑”的场景提供统一入口。
+# 扩展名默认从 URL 末尾推断；若 URL 不规整，可由调用方显式传 ext，避免生成没有后缀的临时文件。
+class TempDownloadFilePath(TempFilePath):
+    """
+    异步下载远程文件到临时路径，并在退出上下文后按 TempFilePath 规则清理。
+    """
+    def __init__(self, url, ext: str = None, remove_after: timedelta = None):
+        self.url = url
         if ext is None:
             ext = url.split('.')[-1]
         super().__init__(ext, remove_after)
@@ -1500,4 +1512,3 @@ if _memray_at_startup:
         _memray_tracker.__exit__(None, None, None)
         print(f"启动时内存分析已保存到 {_memray_save_path}")
         _memray_tracker = None
-

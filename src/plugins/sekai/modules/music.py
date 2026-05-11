@@ -898,15 +898,40 @@ def get_music_constants() -> dict[tuple[int, str], float]:
 
 # 获取定数说明卡片
 def get_music_constants_info_widget(font_size: int = 20, padding: int = 16, additional_text = None) -> Widget | None:
-    info_text = config.get('music.constant.info_text', "")
+    # ================================ 定数说明文本组装 ================================ #
+    # 定数表来自外部维护，额外提示需要单独着色；因此这里先拆分普通说明和警告文案。
+    info_text = (config.get('music.constant.info_text', "") or "").rstrip()
     if _music_constants_mtime is not None:
-        info_text = f"定数更新时间: {datetime.fromtimestamp(_music_constants_mtime).strftime('%Y-%m-%d %H:%M')}\n" + info_text
+        update_text = f"定数更新时间: {datetime.fromtimestamp(_music_constants_mtime).strftime('%Y-%m-%d %H:%M')}"
+        info_text = f"{update_text}\n{info_text}" if info_text else update_text
     if additional_text:
-        info_text += "\n" + additional_text
-    if not info_text:
+        additional_text = str(additional_text).strip()
+        if additional_text and additional_text not in info_text.splitlines():
+            info_text = f"{info_text}\n{additional_text}" if info_text else additional_text
+
+    warning_text = (config.get('music.constant.warning_text', "", raise_exc=False) or "").strip()
+    if not info_text and not warning_text:
         return None
-    w = TextBox(info_text, TextStyle(font=DEFAULT_FONT, size=font_size, color=BLACK), use_real_line_count=True)
-    w.set_padding(padding).set_bg(roundrect_bg())
+
+    # ================================ 多色说明卡片绘制 ================================ #
+    # TextBox 只能使用单一颜色；警告语需要插在“定数来源”后方并单独绘制成红色。
+    style = TextStyle(font=DEFAULT_FONT, size=font_size, color=BLACK)
+    warning_style = TextStyle(font=DEFAULT_BOLD_FONT, size=font_size, color=RED)
+    info_lines = info_text.splitlines()
+    warning_insert_index = next(
+        (i + 1 for i, line in enumerate(info_lines) if line.strip().startswith("定数来源")),
+        len(info_lines),
+    )
+    info_before_warning = "\n".join(info_lines[:warning_insert_index]).strip()
+    info_after_warning = "\n".join(info_lines[warning_insert_index:]).strip()
+
+    with VSplit().set_content_align('l').set_item_align('l').set_sep(4).set_padding(padding).set_bg(roundrect_bg()) as w:
+        if info_before_warning:
+            TextBox(info_before_warning, style, use_real_line_count=True)
+        if warning_text:
+            TextBox(warning_text, warning_style, use_real_line_count=True)
+        if info_after_warning:
+            TextBox(info_after_warning, style, use_real_line_count=True)
     return w
 
 
@@ -2324,7 +2349,7 @@ async def compose_best30_image(ctx: SekaiHandlerContext, qid: int) -> Image.Imag
                     style = TextStyle(DEFAULT_BOLD_FONT, 24, BLACK, use_shadow=True, shadow_color=shadow_color, shadow_offset=3)
                     TextBox(f"Rating", style)
                     TextBox(f"{user_rating:.2f}", style.replace(size=48))
-                get_music_constants_info_widget(additional_text="计算方式: 33及以上FC-1，以下-1.5，AP±0").set_bg(None)
+                get_music_constants_info_widget().set_bg(None)
 
             with Grid(col_count=3, hsep=16, vsep=16).set_item_bg(roundrect_bg()).set_content_align('lt').set_content_align('lt'):
                 for cr in constant_results:

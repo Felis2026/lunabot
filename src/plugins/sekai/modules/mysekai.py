@@ -2143,7 +2143,7 @@ async def _(ctx: SekaiHandlerContext):
 
         # 临时关闭手动 MSR 查询入口。
         # 这里只拦截 /msr、/msmap、/msa 等手动别名，不影响自动推送和其他 MySekai 指令。
-        raise ReplyException("暂不支持 /MSR 查询")
+        raise ReplyException("MSR 手动查询暂不可用，请使用 msdraw 绘制")
 
 
 # 查询mysekai蓝图
