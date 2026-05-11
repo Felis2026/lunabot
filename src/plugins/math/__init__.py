@@ -6,7 +6,7 @@ config = Config('math')
 logger = get_logger("Math")
 file_db = get_file_db("data/math/db.json", logger)
 cd = ColdDown(file_db, logger)
-gbl = get_group_black_list(file_db, logger, 'math')
+gbl = get_group_black_list(file_db, logger, 'math', allow_group_admin_current_group=True)
 
 
 _aeval = None

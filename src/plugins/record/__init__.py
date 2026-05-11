@@ -7,7 +7,7 @@ from .sql import *
 config = Config('record')
 logger = get_logger("Record")
 file_db = get_file_db("data/record/db.json", logger)
-gbl = get_group_black_list(file_db, logger, "record")
+gbl = get_group_black_list(file_db, logger, "record", allow_group_admin_current_group=True)
 cd = ColdDown(file_db, logger)
 
 record_msg_gbl = get_group_black_list(file_db, logger, "record_msg", is_service=False)

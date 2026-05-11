@@ -10,7 +10,7 @@ config = Config('imgtool')
 logger = get_logger("ImgTool")
 file_db = get_file_db("data/imgtool/db.json", logger)
 cd = ColdDown(file_db, logger)
-gbl = get_group_black_list(file_db, logger, 'imgtool')
+gbl = get_group_black_list(file_db, logger, 'imgtool', allow_group_admin_current_group=True)
 
 
 # ============================= cpp程序调用 ============================= # 

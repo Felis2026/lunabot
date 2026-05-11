@@ -6,7 +6,7 @@ config = Config('cron.cron')
 logger = get_logger('Cron')
 file_db = get_file_db('data/cron/cron.json', logger)
 cd = ColdDown(file_db, logger)
-gbl = get_group_black_list(file_db, logger, 'cron')
+gbl = get_group_black_list(file_db, logger, 'cron', allow_group_admin_current_group=True)
 
 # 获取下次提醒时间描述
 def get_task_next_run_time_str(group_id, task_id):

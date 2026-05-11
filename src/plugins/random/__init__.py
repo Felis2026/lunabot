@@ -4,7 +4,7 @@ config = Config('random')
 logger = get_logger("Random")
 file_db = get_file_db("data/random/db.json", logger)
 cd = ColdDown(file_db, logger)
-gbl = get_group_black_list(file_db, logger, 'random')
+gbl = get_group_black_list(file_db, logger, 'random', allow_group_admin_current_group=True)
 
 
 try:

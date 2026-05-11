@@ -1,4 +1,5 @@
 from ..utils import *
+from .status_registry import build_help_status_context, get_help_status_prefix
 import glob
 
 config = Config('helper')
@@ -10,6 +11,46 @@ cd = ColdDown(file_db, logger)
 
 HELP_DOCS_PATH = "helps/{name}.md"
 
+HELP_BASIC_SERVICES = [
+    "general",
+    "alive",
+]
+
+HELP_GROUP_SERVICES = [
+    "sekai",
+    "gallery-tag",
+    "nekochat",
+    "rollpig",
+    "msxray",
+    "cron",
+    "imgtool",
+    "imgexp",
+    "random",
+    "math",
+    "record",
+    "sta",
+    "water",
+]
+
+HELP_ADMIN_TOGGLE_SERVICES = {
+    "cron",
+    "gallery-tag",
+    "imgexp",
+    "imgtool",
+    "math",
+    "random",
+    "record",
+    "rollpig",
+}
+
+HELP_SUPERUSER_TOGGLE_SERVICES = {
+    "sekai",
+    "nekochat",
+    "msxray",
+    "sta",
+    "water",
+}
+
 HELP_IMG_SCALE = 0.8
 HELP_IMG_WIDTH = 600
 HELP_IMG_INTERSECT = 20
@@ -19,6 +60,7 @@ help.check_wblist(gbl).check_cdrate(cd)
 @help.handle()
 async def _(ctx: HandlerContext):
     args = ctx.get_args().strip()
+    status_ctx = build_help_status_context(getattr(ctx, 'group_id', None))
 
     help_doc_paths = glob.glob(HELP_DOCS_PATH.format(name='*'))
     help_names = []
@@ -34,13 +76,39 @@ async def _(ctx: HandlerContext):
             pass
 
     if not args or args not in help_names:
-        service_list_text = ""
-        for name, desc in sorted(zip(help_names, help_decs)):
-            service_list_text += f"{name} - {desc}\n"
+        help_desc_map = {
+            name: desc
+            for name, desc in zip(help_names, help_decs)
+        }
+
+        def render_group_service(name: str) -> str:
+            desc = help_desc_map[name]
+            status_prefix = get_help_status_prefix(name, status_ctx) if status_ctx is not None else ""
+            permission_suffix = ""
+            if name in HELP_ADMIN_TOGGLE_SERVICES:
+                permission_suffix = " 🛠️"
+            elif name in HELP_SUPERUSER_TOGGLE_SERVICES:
+                permission_suffix = " 🔒"
+            prefix = f"{status_prefix} " if status_prefix else ""
+            return f"{prefix}{name} - {desc}{permission_suffix}"
+
+        basic_lines = [
+            f"{name} - {help_desc_map[name]}"
+            for name in HELP_BASIC_SERVICES
+            if name in help_desc_map
+        ]
+
+        group_lines = [
+            render_group_service(name)
+            for name in HELP_GROUP_SERVICES
+            if name in help_desc_map
+        ]
 
         template: str = config.get('template')
-        if r"{service_list}" in template:
-            template = template.format(service_list=service_list_text.strip())
+        template = template.format(
+            basic_service_list="\n".join(basic_lines).strip(),
+            group_service_list="\n".join(group_lines).strip(),
+        )
         return await ctx.asend_fold_msg_adaptive(template.strip(), need_reply=False)
 
     else:

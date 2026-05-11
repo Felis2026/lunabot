@@ -839,6 +839,40 @@ def check_superuser(event: MessageEvent, superuser: Union[List[int], ConfigItem]
         return False
     return event.user_id in get_cfg_or_value(superuser)
 
+async def check_group_admin_or_superuser(
+    bot: Bot,
+    event: MessageEvent,
+    group_id: int | None = None,
+    superuser: Union[List[int], ConfigItem] = SUPERUSER_CFG,
+) -> bool:
+    """
+    检查事件发送者是否为群主 / 群管理员 / 超级管理员。
+    优先复用事件里的 sender.role，缺失时再回退查群成员信息。
+    """
+    if check_superuser(event, superuser):
+        return True
+    if not isinstance(event, GroupMessageEvent):
+        return False
+
+    target_group_id = int(group_id or event.group_id)
+    sender = getattr(event, "sender", None)
+    role = str(getattr(sender, "role", "") or "").strip().lower()
+    if role in {"owner", "admin"}:
+        return True
+
+    try:
+        info = await bot.call_api(
+            "get_group_member_info",
+            group_id=target_group_id,
+            user_id=int(event.user_id),
+            no_cache=True,
+        )
+    except Exception:
+        return False
+
+    role = str((info or {}).get("role", "") or "").strip().lower()
+    return role in {"owner", "admin"}
+
 def check_self_reply(event: MessageEvent):
     """
     检查事件是否是自身对指令的回复消息
@@ -1485,7 +1519,8 @@ class GroupWhiteList:
         name: str, 
         superuser: Union[List[int], ConfigItem]=SUPERUSER_CFG,
         on_func=None, 
-        off_func=None
+        off_func=None,
+        allow_group_admin_current_group: bool = False,
     ):
         self.superuser = superuser
         self.name = name
@@ -1494,6 +1529,37 @@ class GroupWhiteList:
         self.white_list_name = f'group_white_list_{name}'
         self.on_func = on_func
         self.off_func = off_func
+        self.allow_group_admin_current_group = allow_group_admin_current_group
+
+        async def assert_toggle_permission(ctx: HandlerContext, target_group_id: int):
+            if check_superuser(ctx.event, self.superuser):
+                return
+            assert_and_reply(
+                self.allow_group_admin_current_group,
+                f"仅超级管理员可控制{self.name}开关"
+            )
+            assert_and_reply(
+                isinstance(ctx.event, GroupMessageEvent) and ctx.group_id,
+                f"仅群主、群管理员或超级管理员可在群内控制本群{self.name}开关"
+            )
+            assert_and_reply(
+                int(target_group_id) == int(ctx.group_id),
+                "仅超级管理员可指定其他群号"
+            )
+            ok = await check_group_admin_or_superuser(ctx.bot, ctx.event, int(ctx.group_id), self.superuser)
+            assert_and_reply(ok, f"仅群主、群管理员或超级管理员可在群内控制本群{self.name}开关")
+
+        def get_operator_desc(ctx: HandlerContext) -> str:
+            sender = getattr(ctx.event, "sender", None)
+            role = str(getattr(sender, "role", "") or "").strip().lower() or "unknown"
+            return f"user_id={ctx.user_id} role={role}"
+
+        def log_toggle_action(ctx: HandlerContext, action: str, group_id: int, changed: bool):
+            result = "changed" if changed else "noop"
+            self.logger.info(
+                f"[group-toggle] service={self.name} action={action} group_id={group_id} "
+                f"operator={get_operator_desc(ctx)} result={result}"
+            )
 
         async def get_group_id_desc(ctx: HandlerContext) -> tuple[int, str]:
             if args := ctx.get_args().strip():
@@ -1507,20 +1573,28 @@ class GroupWhiteList:
             return int(group_id), group_desc
 
         switch_on = CmdHandler([f'/{name} on'], utils_logger, help_command='/{服务名} on')
-        switch_on.check_superuser(superuser)
+        if not allow_group_admin_current_group:
+            switch_on.check_superuser(superuser)
         @switch_on.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            if not await self.aadd(group_id):
+            await assert_toggle_permission(ctx, group_id)
+            changed = await self.aadd(group_id)
+            log_toggle_action(ctx, "on", group_id, changed)
+            if not changed:
                 return await ctx.asend_reply_msg(f'{group_desc}的{name}已经是开启状态')
             return await ctx.asend_reply_msg(f'成功开启{group_desc}的{name}')
         
         switch_off = CmdHandler([f'/{name} off'], utils_logger, help_command='/{服务名} off')
-        switch_off.check_superuser(superuser)
+        if not allow_group_admin_current_group:
+            switch_off.check_superuser(superuser)
         @switch_off.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            if not await self.aremove(group_id):
+            await assert_toggle_permission(ctx, group_id)
+            changed = await self.aremove(group_id)
+            log_toggle_action(ctx, "off", group_id, changed)
+            if not changed:
                 return await ctx.asend_reply_msg(f'{group_desc}的{name}已经是关闭状态')
             return await ctx.asend_reply_msg(f'成功关闭{group_desc}的{name}')
             
@@ -1642,7 +1716,8 @@ class GroupBlackList:
         name: str, 
         superuser: Union[List[int], ConfigItem]=SUPERUSER_CFG,
         on_func=None, 
-        off_func=None
+        off_func=None,
+        allow_group_admin_current_group: bool = False,
     ):
         self.superuser = superuser
         self.name = name
@@ -1651,6 +1726,37 @@ class GroupBlackList:
         self.black_list_name = f'group_black_list_{name}'
         self.on_func = on_func
         self.off_func = off_func
+        self.allow_group_admin_current_group = allow_group_admin_current_group
+
+        async def assert_toggle_permission(ctx: HandlerContext, target_group_id: int):
+            if check_superuser(ctx.event, self.superuser):
+                return
+            assert_and_reply(
+                self.allow_group_admin_current_group,
+                f"仅超级管理员可控制{self.name}开关"
+            )
+            assert_and_reply(
+                isinstance(ctx.event, GroupMessageEvent) and ctx.group_id,
+                f"仅群主、群管理员或超级管理员可在群内控制本群{self.name}开关"
+            )
+            assert_and_reply(
+                int(target_group_id) == int(ctx.group_id),
+                "仅超级管理员可指定其他群号"
+            )
+            ok = await check_group_admin_or_superuser(ctx.bot, ctx.event, int(ctx.group_id), self.superuser)
+            assert_and_reply(ok, f"仅群主、群管理员或超级管理员可在群内控制本群{self.name}开关")
+
+        def get_operator_desc(ctx: HandlerContext) -> str:
+            sender = getattr(ctx.event, "sender", None)
+            role = str(getattr(sender, "role", "") or "").strip().lower() or "unknown"
+            return f"user_id={ctx.user_id} role={role}"
+
+        def log_toggle_action(ctx: HandlerContext, action: str, group_id: int, changed: bool):
+            result = "changed" if changed else "noop"
+            self.logger.info(
+                f"[group-toggle] service={self.name} action={action} group_id={group_id} "
+                f"operator={get_operator_desc(ctx)} result={result}"
+            )
 
         async def get_group_id_desc(ctx: HandlerContext) -> tuple[int, str]:
             if args := ctx.get_args().strip():
@@ -1664,20 +1770,28 @@ class GroupBlackList:
             return int(group_id), group_desc
 
         switch_off = CmdHandler([f'/{name} off'], utils_logger, help_command='/{服务名} off')
-        switch_off.check_superuser(superuser)
+        if not allow_group_admin_current_group:
+            switch_off.check_superuser(superuser)
         @switch_off.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            if not await self.aadd(group_id):
+            await assert_toggle_permission(ctx, group_id)
+            changed = await self.aadd(group_id)
+            log_toggle_action(ctx, "off", group_id, changed)
+            if not changed:
                 return await ctx.asend_reply_msg(f'成功关闭{group_desc}的{name}')
             return await ctx.asend_reply_msg(f'{group_desc}的{name}已关闭')
         
         switch_on = CmdHandler([f'/{name} on'], utils_logger, help_command='/{服务名} on')
-        switch_on.check_superuser(superuser)
+        if not allow_group_admin_current_group:
+            switch_on.check_superuser(superuser)
         @switch_on.handle()
         async def _(ctx: HandlerContext):
             group_id, group_desc = await get_group_id_desc(ctx)
-            if not await self.aremove(group_id):
+            await assert_toggle_permission(ctx, group_id)
+            changed = await self.aremove(group_id)
+            log_toggle_action(ctx, "on", group_id, changed)
+            if not changed:
                 return await ctx.asend_reply_msg(f'成功开启{group_desc}的{name}')
             return await ctx.asend_reply_msg(f'{group_desc}的{name}已开启')
             
@@ -1798,15 +1912,17 @@ def get_group_white_list(
     superuser: Union[List[int], ConfigItem]=SUPERUSER_CFG,
     on_func=None, 
     off_func=None, 
-    is_service=True
+    is_service=True,
+    allow_group_admin_current_group: bool = False,
 ) -> GroupWhiteList:
     if is_service:
         global _gwls
         if name not in _gwls:
-            _gwls[name] = GroupWhiteList(db, logger, name, superuser, on_func, off_func)
+            _gwls[name] = GroupWhiteList(db, logger, name, superuser, on_func, off_func, allow_group_admin_current_group)
         toggle = _gwls[name]
     else:
-        toggle = GroupWhiteList(db, logger, name, superuser, on_func, off_func)
+        toggle = GroupWhiteList(db, logger, name, superuser, on_func, off_func, allow_group_admin_current_group)
+    toggle.allow_group_admin_current_group = allow_group_admin_current_group
     register_group_toggle(toggle, name=name, mode='whitelist', is_service=is_service, db_key=toggle.white_list_name)
     return toggle
 
@@ -1818,15 +1934,17 @@ def get_group_black_list(
     superuser: Union[List[int], ConfigItem]=SUPERUSER_CFG,
     on_func=None, 
     off_func=None, 
-    is_service=True
+    is_service=True,
+    allow_group_admin_current_group: bool = False,
 ) -> GroupBlackList:
     if is_service:
         global _gbls
         if name not in _gbls:
-            _gbls[name] = GroupBlackList(db, logger, name, superuser, on_func, off_func)
+            _gbls[name] = GroupBlackList(db, logger, name, superuser, on_func, off_func, allow_group_admin_current_group)
         toggle = _gbls[name]
     else:
-        toggle = GroupBlackList(db, logger, name, superuser, on_func, off_func)
+        toggle = GroupBlackList(db, logger, name, superuser, on_func, off_func, allow_group_admin_current_group)
+    toggle.allow_group_admin_current_group = allow_group_admin_current_group
     register_group_toggle(toggle, name=name, mode='blacklist', is_service=is_service, db_key=toggle.black_list_name)
     return toggle
 

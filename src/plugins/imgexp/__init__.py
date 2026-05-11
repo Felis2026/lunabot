@@ -9,7 +9,7 @@ config = Config('imgexp')
 logger = get_logger('ImgExp')
 file_db = get_file_db('data/imgexp/imgexp.json', logger)
 cd = ColdDown(file_db, logger)
-gbl = get_group_black_list(file_db, logger, 'imgexp')
+gbl = get_group_black_list(file_db, logger, 'imgexp', allow_group_admin_current_group=True)
 
 
 # ==================== 图像反查 ==================== #
