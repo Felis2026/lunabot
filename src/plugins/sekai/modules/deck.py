@@ -301,6 +301,128 @@ async def extract_target_event_or_simulate_event(
     args: str,
     options: DeckRecommendOptions,
 ) -> str:
+    force_simulated_wl = False
+    force_simulated_wl_turn = None
+    force_simulated_wl_match = re.search(r"(?:模拟|sim)\s*wl([12])", args)
+    if force_simulated_wl_match:
+        force_simulated_wl = True
+        force_simulated_wl_turn = int(force_simulated_wl_match.group(1))
+        args = (
+            args[:force_simulated_wl_match.start()]
+            + f" wl{force_simulated_wl_turn} "
+            + args[force_simulated_wl_match.end():]
+        ).strip()
+
+    # ================================ 优先命中真实WL活动 ================================ #
+    # 历史逻辑里，只要参数同时出现「wl1/wl2」和角色昵称，就会直接走模拟WL。
+    # 这会让当前正在进行的真实WL章节也被错误分流到 fake event，
+    # 从而漏掉真实活动的当期卡加成。
+    #
+    # 这里先尝试按“真实活动 + 章节/角色”解释；只有当前/指定活动无法命中WL章节时，
+    # 才回退到旧的模拟语义。这样能一次修正所有角色、所有团的同类问题。
+    wl_turn_hint = None
+    wl_nickname_hint = None
+    for turn in (1, 2):
+        if f"wl{turn}" in args:
+            wl_turn_hint = turn
+            break
+    if wl_turn_hint is not None:
+        for nickname, _ in get_character_nickname_data().nickname_ids:
+            if nickname in args:
+                wl_nickname_hint = nickname
+                break
+
+    if not force_simulated_wl and wl_turn_hint is not None and wl_nickname_hint is not None:
+        explicit_event_match = (
+            re.search(r"(?:活动|event)(\d+)", args) or
+            re.search(r"(?:^|\s)(\d{1,3})(?=$|\s)", args)
+        )
+
+        async def resolve_real_wl_event() -> Optional[Tuple[dict, int, str]]:
+            if explicit_event_match:
+                # 这里的 wl1/wl2 是“第几轮WL”的口语缩写，不是章节号。
+                # 当用户已经显式给出活动ID且同时给了角色昵称时，优先按角色章节解析，
+                # 避免把 wl2 错当成 chapterNo=2。
+                explicit_args = args.replace(f"wl{wl_turn_hint}", "", 1).strip()
+                return await extract_target_event(
+                    ctx,
+                    explicit_args,
+                    match_type="all",
+                    default_return_current=True,
+                    raise_if_not_found=True,
+                )
+
+            cid = get_cid_by_nickname(wl_nickname_hint)
+            if not cid:
+                return None
+            unit = get_unit_by_chara_id(cid)
+            now = datetime.now()
+
+            # ================================ VS真实WL特殊映射 ================================ #
+            # CN 的 VS 第二轮WL（event179）在 MasterData 里 unit=none，
+            # 不能沿用“按团(unit)筛活动”的真人团逻辑。
+            # 当前先只把用户明确提到的 wl2 + VS角色 映射到真实179；
+            # wl1 仍保持旧的模拟WL语义，避免在缺失真实首轮映射时误导用户。
+            if unit == "piapro":
+                if wl_turn_hint != 2:
+                    return None
+                event_179 = await ctx.md.events.find_by_id(179)
+                if not (event_179 and event_179.get('eventType') == 'world_bloom'):
+                    return None
+                target_event = event_179
+            else:
+                unit_events = [
+                    event for event in await ctx.md.events.get()
+                    if event.get('eventType') == 'world_bloom' and event.get('unit') == unit
+                ]
+                unit_events.sort(key=lambda x: x['startAt'])
+                if wl_turn_hint > len(unit_events):
+                    return None
+                target_event = unit_events[wl_turn_hint - 1]
+
+            chapter_candidates: list[tuple[tuple[int, int], int]] = []
+            for chapter in await get_wl_events(ctx, target_event['id']):
+                if chapter.get('wl_cid') != cid:
+                    continue
+                start_at = chapter['startAt']
+                aggregate_at = chapter['aggregateAt']
+                start_time = datetime.fromtimestamp(start_at / 1000)
+                end_time = datetime.fromtimestamp(aggregate_at / 1000 + 1)
+                if start_time <= now <= end_time:
+                    rank = (0, -start_at)
+                elif start_time > now:
+                    rank = (1, start_at)
+                else:
+                    rank = (2, -aggregate_at)
+                chapter_candidates.append((rank, target_event['id']))
+
+            if not chapter_candidates:
+                return None
+
+            chapter_candidates.sort(key=lambda x: x[0])
+            event_id = chapter_candidates[0][1]
+            implicit_args = args.replace(f"wl{wl_turn_hint}", "", 1).strip()
+            return await extract_target_event(
+                ctx,
+                f"event{event_id} {implicit_args}",
+                match_type="all",
+                default_return_current=True,
+                raise_if_not_found=True,
+            )
+
+        try:
+            resolved = await resolve_real_wl_event()
+            if resolved:
+                event, wl_cid, new_args = resolved
+                options.event_id = event['id']
+                options.world_bloom_character_id = wl_cid
+                return new_args
+        except ReplyException:
+            # 用户显式指定了活动时，说明意图已经非常明确，真实活动解析失败就应该报错，
+            # 不能再悄悄退回到模拟WL，否则结果会完全变成另一套语义。
+            if explicit_event_match:
+                raise
+
     # 匹配模拟WL活动（角色名+wl1 / wl2）
     for turn in (1, 2):
         if f"wl{turn}" in args:
