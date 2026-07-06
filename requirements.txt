@@ -28,7 +28,7 @@ orjson
 pandas
 pdf2image
 PicImageSearch
-pilmoji[requests]
+pilmoji[requests]>=2.0.5
 psutil<7.0.0
 pydub
 rapidfuzz

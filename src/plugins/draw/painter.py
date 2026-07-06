@@ -20,6 +20,7 @@ import io
 import colour
 import struct
 from functools import lru_cache
+from urllib.parse import quote_plus
 
 
 _original_get_emoji_unicode_dict = getattr(emoji.unicode_codes, 'get_emoji_unicode_dict', None)
@@ -50,12 +51,116 @@ from ..common.config import *
 from ..common.process_pool import *
 from .img_utils import adjust_image_alpha_inplace
 
-try:
-    from ...private.felis_local_emoji_source import LocalThenRemoteEmojiSource
-except Exception:
-    LocalThenRemoteEmojiSource = None
 
-EMOJI_SOURCE_CLS = LocalThenRemoteEmojiSource or GoogleEmojiSource
+# ================================ Emoji本地缓存源 ================================ #
+# pilmoji 默认的 GoogleEmojiSource 会在缺少本地资源时访问 emojicdn.elk.sh。
+# 该服务偶发慢响应会直接阻塞整张图绘制，所以这里统一使用公开代码里的
+# “本地缓存优先、远程兜底限时、成功后写回缓存”逻辑，避免 src/private 覆盖导致行为漂移。
+class LocalCachedEmojiSource(GoogleEmojiSource):
+    """Prefer local emoji PNG cache and persist successful remote fallbacks."""
+
+    TWEMOJI_CDN_URL = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{codepoint}.png"
+    REQUEST_KWARGS = {
+        **GoogleEmojiSource.REQUEST_KWARGS,
+        "timeout": 5,
+    }
+
+    def __init__(self, local_dir: Optional[str] = None, allow_remote_fallback: bool = True) -> None:
+        super().__init__()
+        self.allow_remote_fallback = allow_remote_fallback
+        if local_dir is None:
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+            local_dir = os.path.join(project_root, "data", "utils", "emoji", "google")
+        self.local_dir = local_dir
+
+    @staticmethod
+    def _iter_emoji_variants(emoji_text: str):
+        yield emoji_text
+        no_vs16 = emoji_text.replace("\ufe0f", "")
+        if no_vs16 != emoji_text:
+            yield no_vs16
+
+    @staticmethod
+    def _iter_twemoji_codepoints(emoji_text: str):
+        # Twemoji 的静态文件名通常是小写 codepoint 串；部分符号带 VS16，部分不带。
+        # 两种都尝试，可以兼容 ♻️ / ⏰ 这类序列差异。
+        seen = set()
+        for candidate in LocalCachedEmojiSource._iter_emoji_variants(emoji_text):
+            codepoint = "-".join(f"{ord(c):x}" for c in candidate)
+            if codepoint and codepoint not in seen:
+                seen.add(codepoint)
+                yield codepoint
+
+    def _get_local_emoji_path(self, emoji_text: str) -> str:
+        return os.path.join(self.local_dir, f"{quote_plus(emoji_text)}.png")
+
+    def _load_local_emoji(self, emoji_text: str) -> Optional[io.BytesIO]:
+        for candidate in self._iter_emoji_variants(emoji_text):
+            file_path = self._get_local_emoji_path(candidate)
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    return io.BytesIO(f.read())
+        return None
+
+    def _save_local_emoji(self, emoji_text: str, data: bytes) -> None:
+        if not data:
+            return
+        os.makedirs(self.local_dir, exist_ok=True)
+        file_path = self._get_local_emoji_path(emoji_text)
+        tmp_path = f"{file_path}.tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, file_path)
+
+    def _fetch_static_emoji(self, emoji_text: str) -> Optional[bytes]:
+        for codepoint in self._iter_twemoji_codepoints(emoji_text):
+            try:
+                data = self.request(self.TWEMOJI_CDN_URL.format(codepoint=codepoint))
+            except Exception:
+                continue
+            if data:
+                return data
+        return None
+
+    def _fetch_remote_emoji(self, emoji_text: str) -> Optional[bytes]:
+        # 先走稳定的静态 PNG CDN，最后才落到 pilmoji 原始的 GoogleEmojiSource。
+        # 后者依赖 emojicdn，必须只作为兜底，避免一个缺失 emoji 卡住整张图。
+        data = self._fetch_static_emoji(emoji_text)
+        if data:
+            return data
+        try:
+            remote_stream = super().get_emoji(emoji_text)
+        except Exception:
+            return None
+        if remote_stream is None:
+            return None
+        return remote_stream.getvalue()
+
+    def get_emoji(self, emoji: str, /):
+        local_stream = self._load_local_emoji(emoji)
+        if local_stream is not None:
+            return local_stream
+        if not self.allow_remote_fallback:
+            return None
+        data = self._fetch_remote_emoji(emoji)
+        if not data:
+            return None
+        try:
+            self._save_local_emoji(emoji, data)
+        except Exception as e:
+            debug_print(f"emoji cache save failed: {e}")
+        return io.BytesIO(data)
+
+    def get_discord_emoji(self, id: int, /):
+        if not self.allow_remote_fallback:
+            return None
+        try:
+            return super().get_discord_emoji(id)
+        except Exception:
+            return None
+
+
+EMOJI_SOURCE_CLS = LocalCachedEmojiSource
 _painter_pool: Optional[ProcessPool] = None
 _painter_pool_disabled = False
 
