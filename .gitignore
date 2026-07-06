@@ -144,6 +144,7 @@ data/
 logs/
 sandbox/
 config/
+helps/.bak/
 
 src/private/
 
@@ -184,6 +185,13 @@ napcat/
 # keep per-instance startup helpers local; preserve tracked start.sh
 start_v*.sh
 
+# local runtime caches
+cache/
+
 # local integration configs
+haruki.Dockerfile
 haruki/
 onebotfilter/
+
+# Local-only Microsoft YaHei fonts for RollPig Plus Docker rendering.
+fonts/msyh*.ttc
