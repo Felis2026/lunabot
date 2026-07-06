@@ -139,7 +139,7 @@ def get_suite_public_warning_text(ctx: SekaiHandlerContext, profile: dict | None
         or _get_requested_suite_uid_for_warning(ctx, requested_qid)
     )
     if uid and can_use_oauth_suite(ctx, requested_qid, str(uid)):
-        return '公开API即将关闭，请尽快使用 /授权 使本Bot能够访问您的数据'
+        return '公开API即将关闭，请尽快私聊bot /授权 使本Bot能够访问您的数据'
     return ""
 
 
@@ -756,14 +756,24 @@ def get_player_bind_count(ctx: SekaiHandlerContext, qid: int) -> int:
     return len(uids)
 
 # 获取qq用户绑定的游戏id，如果qid=None则使用ctx.uid_arg获取用户id，index=None获取主绑定账号
-def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=True, index: int | None=None) -> str:
+def get_player_bind_id(
+    ctx: SekaiHandlerContext,
+    qid: int = None,
+    check_bind=True,
+    index: int | None=None,
+    check_blacklist: bool = True,
+) -> str:
     is_super = check_superuser(ctx.event) if ctx.event else False
     region_name = get_region_name(ctx.region)
     
     bind_list: Dict[str, str | list[str]] = profile_db.get("bind_list", {}).get(ctx.region, {})
     main_bind_list: Dict[str, str] = profile_db.get("main_bind_list", {}).get(ctx.region, {})
     state_qid = str(qid) if qid is not None else str(ctx.user_id)
-    cloud_state = _get_cloud_state(ctx, state_qid) if (qid or not ctx.uid_arg) else None
+    uid_arg = (ctx.uid_arg or "").strip()
+    # 云端绑定是当前主链路：不但“默认账号”要读云端，`u2/u3` 这种序号查询也必须读云端。
+    # 直接指定 UID 和 @代查仍沿用原有分支，避免把管理员代查误判为当前用户自己的绑定。
+    should_load_cloud_state = qid is not None or not uid_arg or uid_arg.startswith("u")
+    cloud_state = _get_cloud_state(ctx, state_qid) if should_load_cloud_state else None
 
     def get_uid_by_index(qid: str, index: int) -> str | None:
         if cloud_state and qid == state_qid:
@@ -777,7 +787,7 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
         return uids[index]
 
     # 指定qid/没有ctx.uid_arg的情况则直接获取qid绑定的账号
-    if qid or not ctx.uid_arg:
+    if qid is not None or not uid_arg:
         qid = str(qid) if qid is not None else str(ctx.user_id)
         if not is_super:
             assert_and_reply(not check_qid_in_blacklist(qid), f"该QQ号({qid})已被拉入黑名单")
@@ -787,16 +797,16 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
             uid = get_uid_by_index(qid, index)
     # 从ctx.uid_arg中获取
     else:
-        if ctx.uid_arg.startswith('u'):
-            index = int(ctx.uid_arg[1:]) - 1
+        if uid_arg.startswith('u'):
+            index = int(uid_arg[1:]) - 1
             uid = get_uid_by_index(str(ctx.user_id), index)
-        elif ctx.uid_arg.startswith('@'):
+        elif uid_arg.startswith('@'):
             assert_and_reply(is_super, "不支持直接通过@QQ指定查询对象")
-            at_qid = int(ctx.uid_arg[1:])
+            at_qid = int(uid_arg[1:])
             uid = get_player_bind_id(ctx, at_qid, check_bind)
         else:
             assert_and_reply(is_super, "不支持直接指定游戏ID查询，请先绑定后再使用")
-            uid = ctx.uid_arg
+            uid = uid_arg
             if not validate_uid(ctx, uid):
                 raise ReplyException(f"指定的游戏ID {uid} 不是有效的{region_name}游戏ID")
 
@@ -805,7 +815,7 @@ def get_player_bind_id(ctx: SekaiHandlerContext, qid: int = None, check_bind=Tru
         raise ReplyException(f"请使用\"/{region}绑定 你的游戏ID\"绑定账号")
     # 未绑定且当前调用方允许返回 None 时，不应继续做黑名单查询，
     # 否则会把“尚未解析出 UID”的正常分支打成 uid=None 的误导告警。
-    if not is_super and uid is not None:
+    if check_blacklist and not is_super and uid is not None:
         assert_and_reply(not check_uid_in_blacklist(uid, ctx.region), f"该游戏ID({uid})已被拉入黑名单")
     return uid
 
@@ -2549,11 +2559,13 @@ async def _(ctx: SekaiHandlerContext):
         msg = ""
         for region in ALL_SERVER_REGIONS:
             region_ctx = SekaiHandlerContext.from_region(region)
-            main_uid = get_player_bind_id(region_ctx, ctx.user_id, check_bind=False)
+            # 绑定列表是“查看自己绑定了什么”，不应被某个历史 UID 黑名单中断；
+            # 真正查询数据时仍会按默认逻辑检查 UID 黑名单。
+            main_uid = get_player_bind_id(region_ctx, ctx.user_id, check_bind=False, check_blacklist=False)
 
             lines = []
             for i in range(get_player_bind_count(region_ctx, ctx.user_id)):
-                uid = get_player_bind_id(region_ctx, ctx.user_id, index=i)
+                uid = get_player_bind_id(region_ctx, ctx.user_id, index=i, check_blacklist=False)
                 is_main = (uid == main_uid)
                 uid = process_hide_uid(ctx, uid, keep=6)
                 line = f"[{i+1}] {uid}"
@@ -3094,7 +3106,7 @@ async def reply_oauth_authorize_link(ctx: SekaiHandlerContext, url: str):
     - 能私聊：群里只提示“已私发”
     - 不能私聊：群里先明确建议走临时会话，再带风险提示后回落群内发链接
     """
-    private_msg = f"请在浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
+    private_msg = f"请复制到浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
 
     if not ctx.group_id:
         return await ctx.asend_reply_msg(private_msg)
@@ -3696,10 +3708,11 @@ async def _(ctx: HandlerContext):
         msg = f"用户{qid}当前绑定:\n"
         for region in ALL_SERVER_REGIONS:
             region_ctx = SekaiHandlerContext.from_region(region)
-            main_uid = get_player_bind_id(region_ctx, qid, check_bind=False)
+            # 管理员查绑定关系时也只展示关系本身，避免单个黑名单 UID 让整页不可读。
+            main_uid = get_player_bind_id(region_ctx, qid, check_bind=False, check_blacklist=False)
             lines = []
             for i in range(get_player_bind_count(region_ctx, qid)):
-                uid = get_player_bind_id(region_ctx, qid, index=i)
+                uid = get_player_bind_id(region_ctx, qid, index=i, check_blacklist=False)
                 is_main = (uid == main_uid)
                 line = f"[{i+1}] {uid}"
                 if is_main:
