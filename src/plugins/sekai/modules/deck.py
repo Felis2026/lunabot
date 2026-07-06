@@ -110,6 +110,7 @@ SKILL_REF_KEYWORDS = ('技能抽取', '技能吸取')
 
 BOOST_KEYWORDS = ('boost', '火', '体力', '体',)
 AREA_ITEM_KEYWORDS = ('区域道具', '道具', 'areaitem', )
+FINAL_CHAPTER_BADGE_KEYWORDS = ('tk牌', '终章牌', '带牌')
 
 DEFAULT_CARD_CONFIG_12 = DeckRecommendCardConfig()
 DEFAULT_CARD_CONFIG_12.disable = False
@@ -225,6 +226,167 @@ def format_hhmm_short(total_hours: float) -> str:
     return f"{hours}h{minutes:02d}min"
 
 
+# ================================ 终章目标角色与牌子模拟 ================================ #
+
+FINAL_CHAPTER_HONOR_UNIT_NAME_MAP = {
+    "light_sound": "lightsound",
+    "idol": "idol",
+    "street": "street",
+    "theme_park": "themepark",
+    "school_refusal": "schoolrefusal",
+    "piapro": "piapro",
+}
+
+
+async def get_final_chapter_target_cid(
+    ctx: SekaiHandlerContext,
+    options: DeckRecommendOptions,
+    use_current_deck: bool,
+) -> Optional[int]:
+    """
+    获取终章当前上下文下的目标角色。
+
+    终章的特殊加成和支援队在 cpp 里都与“队长角色”绑定，
+    因此 Python 侧需要尽量把用户的“想冲某个角色”转换成确定目标。
+    """
+    if options.event_id != 180:
+        return None
+
+    if options.world_bloom_character_id:
+        return options.world_bloom_character_id
+
+    if options.fixed_characters:
+        return options.fixed_characters[0]
+
+    if options.fixed_cards:
+        first_fixed_card = await ctx.md.cards.find_by_id(options.fixed_cards[0])
+        if first_fixed_card:
+            return first_fixed_card['characterId']
+
+    if use_current_deck:
+        return None
+
+    return None
+
+
+async def apply_final_chapter_target_character(
+    ctx: SekaiHandlerContext,
+    options: DeckRecommendOptions,
+    use_current_deck: bool,
+) -> Optional[int]:
+    """
+    把终章目标角色固化为固定队长角色，以贴合 cpp 的终章规则。
+    """
+    target_cid = await get_final_chapter_target_cid(ctx, options, use_current_deck)
+    if options.event_id != 180 or target_cid is None:
+        return target_cid
+
+    if options.fixed_characters:
+        assert_and_reply(
+            options.fixed_characters[0] == target_cid,
+            "终章指定角色与固定队长角色冲突，请保持一致",
+        )
+        return target_cid
+
+    if options.fixed_cards:
+        leader_card = await ctx.md.cards.find_by_id(options.fixed_cards[0])
+        assert_and_reply(leader_card, f"找不到固定卡牌 {options.fixed_cards[0]}")
+        assert_and_reply(
+            leader_card['characterId'] == target_cid,
+            "终章指定角色与固定卡牌队长不一致，请把目标角色的卡放在固定卡牌列表第一位",
+        )
+        options.best_skill_as_leader = False
+        return target_cid
+
+    if use_current_deck:
+        assert_and_reply(
+            False,
+            "终章指定角色时暂不支持同时使用“当前”，请改为固定卡牌并把目标角色卡放在第一位",
+        )
+
+    options.fixed_characters = [target_cid]
+    options.best_skill_as_leader = False
+    return target_cid
+
+
+async def get_final_chapter_wl2_chapter_no(
+    ctx: SekaiHandlerContext,
+    cid: int,
+) -> Optional[int]:
+    """
+    获取目标角色在第二轮 WL 中对应的章节号，用于模拟终章牌子。
+    """
+    unit = get_unit_by_chara_id(cid)
+    if not unit:
+        return None
+
+    if unit == "piapro":
+        event = await ctx.md.events.find_by_id(179)
+        if not event:
+            return None
+        chapters = await get_wl_events(ctx, event['id'])
+    else:
+        unit_events = [
+            event for event in await ctx.md.events.get()
+            if event.get('eventType') == 'world_bloom' and event.get('unit') == unit
+        ]
+        unit_events.sort(key=lambda x: x['startAt'])
+        if len(unit_events) < 2:
+            return None
+        chapters = await get_wl_events(ctx, unit_events[1]['id'])
+
+    for chapter in chapters:
+        if chapter.get('wl_cid') == cid:
+            return chapter.get('id', 0) // 1000
+    return None
+
+
+async def apply_final_chapter_badge_simulation(
+    ctx: SekaiHandlerContext,
+    profile: dict,
+    target_cid: Optional[int],
+    enabled: bool,
+) -> None:
+    """
+    通过临时注入一枚 WL2 高阶 honor，模拟终章牌子加成。
+    """
+    if not enabled or target_cid is None:
+        return
+
+    chapter_no = await get_final_chapter_wl2_chapter_no(ctx, target_cid)
+    assert_and_reply(chapter_no is not None, "找不到该角色在 WL2 中对应的章节，无法模拟终章牌子")
+
+    unit = get_unit_by_chara_id(target_cid)
+    unit_name = FINAL_CHAPTER_HONOR_UNIT_NAME_MAP.get(unit)
+    assert_and_reply(unit_name is not None, "无法识别该角色对应的终章牌子类型")
+
+    honors = await ctx.md.honors.get()
+    asset_name = f"honor_top_001000_event_wl_2nd_{unit_name}_cp{chapter_no}"
+    honor = find_by_predicate(
+        honors,
+        lambda x: x.get('assetbundleName') == asset_name and x.get('honorRarity') in ('high', 'highest'),
+    )
+    if honor is None:
+        honor = find_by_predicate(
+            honors,
+            lambda x: (
+                isinstance(x.get('assetbundleName'), str)
+                and x['assetbundleName'].endswith(f"event_wl_2nd_{unit_name}_cp{chapter_no}")
+                and x.get('honorRarity') in ('high', 'highest')
+            ),
+        )
+    assert_and_reply(honor is not None, "找不到可用于模拟的终章牌子 honor")
+
+    user_honors = profile.setdefault('userHonors', [])
+    if find_by(user_honors, 'honorId', honor['id']):
+        return
+
+    user_honors.append({
+        "honorId": honor['id'],
+        "level": 1,
+    })
+
+
 def add_payload_segment(payloads: list[bytes], data: bytes):
     payloads.append(len(data).to_bytes(4, 'big'))
     payloads.append(data)
@@ -270,9 +432,12 @@ async def extract_target_event(
     match_simple = match_type in ('simple', 'all')
     match_full = match_type in ('full', 'all')
     
+    forced_event_id = None
+
     # 总是替换终章
     for keyword in ('终章', ):
         if keyword in args:
+            forced_event_id = 180
             args = args.replace(keyword, " event180 " if match_full else " 180 ").strip()
 
     # 解析成功后需要移除的文本
@@ -305,6 +470,8 @@ async def extract_target_event(
         if full_match:
             event_id = int(full_match.group(1) or full_match.group(2))
             event_matched_texts.append(full_match.group(0))
+    if event_id is None and forced_event_id is not None:
+        event_id = forced_event_id
 
     if event_id == 0:
         event_id = None
@@ -370,10 +537,15 @@ async def extract_target_event(
         wl_cid = chapter['wl_cid']
 
     else:
-        # 指定 wlx 的情况报错
-        assert_and_reply_or_return(not chapter_id, f"活动 {ctx.region}-{event['id']} 不是WL活动，无法指定章节")
-        # 指定角色昵称的情况不报错，直接忽略
-        wl_matched_texts = []
+        if event_id == 180 and chapter_nickname:
+            # 终章不把昵称解释成“WL章节”，而是作为想冲的目标角色继续向下传递。
+            wl_cid = get_cid_by_nickname(chapter_nickname)
+            assert_and_reply_or_return(wl_cid, f"无法识别终章目标角色 {chapter_nickname}")
+        else:
+            # 指定 wlx 的情况报错
+            assert_and_reply_or_return(not chapter_id, f"活动 {ctx.region}-{event['id']} 不是WL活动，无法指定章节")
+            # 指定角色昵称的情况不报错，直接忽略
+            wl_matched_texts = []
 
     # 确认匹配到活动
     for text in event_matched_texts:
@@ -400,6 +572,22 @@ async def extract_target_event_or_simulate_event(
             + f" wl{force_simulated_wl_turn} "
             + args[force_simulated_wl_match.end():]
         ).strip()
+
+    # ================================ 终章目标角色直通 ================================ #
+    # 终章和普通 WL 不同，角色名表示“想冲的目标角色”，不是章节昵称。
+    # 这里直接在上层消化掉这层语义，避免落到普通 WL 章节解析里。
+    final_keyword_text = None
+    for keyword in ("终章", "活动180", "event180"):
+        if keyword in args:
+            final_keyword_text = keyword
+            break
+    if final_keyword_text:
+        for nickname, cid in get_character_nickname_data().nickname_ids:
+            if nickname in args:
+                args = args.replace(final_keyword_text, "", 1).replace(nickname, "", 1).strip()
+                options.event_id = 180
+                options.world_bloom_character_id = cid
+                return args
 
     # ================================ 优先命中真实WL活动 ================================ #
     # 历史逻辑里，只要参数同时出现「wl1/wl2」和角色昵称，就会直接走模拟WL。
@@ -900,6 +1088,12 @@ def extract_addtional_options(args: str) -> Tuple[dict, str]:
 
     war_prepare, args = extract_war_prepare_options(args)
     ret.update(war_prepare)
+
+    for keyword in FINAL_CHAPTER_BADGE_KEYWORDS:
+        if keyword in args:
+            ret['final_chapter_badge_sim'] = True
+            args = args.replace(keyword, "", 1).strip()
+            break
 
     for boost in reversed(BOOST_BONUS_DICT.keys()):
         for keyword in BOOST_KEYWORDS:
@@ -1749,14 +1943,52 @@ async def compose_deck_recommend_image(
                     # suite中没有该卡，提示需要抓包更新
                     raise ReplyException(f"当前卡组中的卡牌 {bp_card['cardId']} 不在Suite数据中，请更新抓包数据")
 
-    # 如果卡组完全固定则只需要跑一种算法，并删除profile中除固定以外的其他卡牌以减少开销
+    # ================================ 终章目标与牌子模拟 ================================ #
+    # 终章的支援和额外加成都跟队长角色绑定，因此要先把目标角色固化，再决定后续裁卡池策略。
+    final_chapter_target_cid = await apply_final_chapter_target_character(ctx, options, use_current_deck)
+
+    assert_and_reply(
+        not additional.get('final_chapter_badge_sim', False) or options.event_id == 180,
+        "“tk牌”仅支持终章活动组卡使用",
+    )
+    assert_and_reply(
+        not additional.get('final_chapter_badge_sim', False) or final_chapter_target_cid is not None,
+        "使用“tk牌”时需要先指定终章目标角色，例如“终章 miku tk牌”",
+    )
+
+    await apply_final_chapter_badge_simulation(
+        ctx,
+        profile,
+        final_chapter_target_cid,
+        bool(additional.get('final_chapter_badge_sim', False)),
+    )
+
+    # ================================ 终章下发参数纠偏 ================================ #
+    # event180 在 MasterData 里只有 finale 章节，没有“按角色拆开的 worldBloom chapter”。
+    # 因此这里不能再把目标角色继续塞进 world_bloom_character_id 下发给后端，
+    # 否则服务端会误走“按章节找角色”的分支并直接报 chapter not found。
+    #
+    # 终章真正的冲榜目标应由队长角色决定：
+    # 1. 固定卡牌时，第一张固定卡就是队长；
+    # 2. 只指定角色时，前面已经转成 fixed_characters 约束；
+    # 3. tk牌则通过临时注入 honor 来模拟，不需要额外 chapter 参数。
+    if options.event_id == 180:
+        options.world_bloom_character_id = None
+
+    # 终章指定固定卡牌时，需要保证“第一张固定卡就是队长角色”，因此直接走 DFS。
+    if options.event_id == 180 and options.fixed_cards:
+        options.algorithm = "dfs"
+
+    # 如果卡组完全固定则只需要跑一种算法；但 WL / 终章仍然需要整份卡池来计算支援加成，
+    # 否则固定 5 张前排后，支援候选只剩前排本身，去重后会直接变成 0。
     is_deck_fixed = options.fixed_cards and len(options.fixed_cards) == 5 or use_current_deck
     if is_deck_fixed:
         options.algorithm = "dfs"
-        profile['userCards'] = [
-            uc for uc in profile['userCards']
-            if uc['cardId'] in options.fixed_cards
-        ]
+        if not is_wl:
+            profile['userCards'] = [
+                uc for uc in profile['userCards']
+                if uc['cardId'] in options.fixed_cards
+            ]
 
     # 检查是否在未使用固定队伍情况下指定技能顺序
     if not is_deck_fixed:
@@ -2011,8 +2243,9 @@ async def compose_deck_recommend_image(
 
     # 获取WL角色名字和头像
     wl_chara_name = None
-    if options.world_bloom_character_id:
-        wl_chara = await ctx.md.game_characters.find_by_id(options.world_bloom_character_id)
+    wl_display_cid = final_chapter_target_cid if event_id == 180 else options.world_bloom_character_id
+    if wl_display_cid:
+        wl_chara = await ctx.md.game_characters.find_by_id(wl_display_cid)
         if wl_chara:
             wl_chara_name = wl_chara.get('firstName', '') + wl_chara.get('givenName', '')
             wl_chara_icon = get_chara_icon_by_chara_id(wl_chara['id'])
@@ -2135,8 +2368,9 @@ async def compose_deck_recommend_image(
                             ImageBox(chara_icon, size=(None, 50))
                             TextBox(f"{chara_name}", TextStyle(font=DEFAULT_BOLD_FONT, size=30, color=(70, 70, 70)))
                         if wl_chara_name:
+                            wl_desc = "目标" if event_id == 180 else "章节"
                             ImageBox(wl_chara_icon, size=(None, 50))
-                            TextBox(f"{wl_chara_name} 章节", TextStyle(font=DEFAULT_BOLD_FONT, size=30, color=(70, 70, 70)))
+                            TextBox(f"{wl_chara_name} {wl_desc}", TextStyle(font=DEFAULT_BOLD_FONT, size=30, color=(70, 70, 70)))
                         if unit_logo and attr_icon:
                             ImageBox(unit_logo, size=(None, 60))
                             ImageBox(attr_icon, size=(None, 50))

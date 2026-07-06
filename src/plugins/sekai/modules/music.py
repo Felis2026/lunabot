@@ -347,13 +347,36 @@ async def sync_music_alias():
     logger.info(f"开始从haruki同步 {cfg.regions} 的 {len(mids)} 首歌曲的别名")
     alias_db = MusicAliasDB.get_instance()
     alias_db.backup()
+
+    # ================================ 新旧别名接口兼容 ================================ #
+    # 旧 public-api 直接返回 {"music_id", "aliases"}；
+    # 新 neo public bot v2 返回 {"status","message","data":{"aliases":[...]}}。
+    # 这里统一抽成一个解析函数，迁移期间两边都能读，避免切接口时整批同步直接失败。
+    def extract_aliases_from_sync_payload(payload: dict, mid: int) -> list[str]:
+        if not isinstance(payload, dict):
+            raise Exception("别名接口返回格式错误")
+
+        data_block = payload.get('data')
+        if isinstance(data_block, dict):
+            aliases = data_block.get('aliases')
+            if isinstance(aliases, list):
+                return aliases
+
+        aliases = payload.get('aliases')
+        if isinstance(aliases, list):
+            music_id = payload.get('music_id')
+            if music_id is not None:
+                assert int(music_id) == int(mid)
+            return aliases
+
+        raise Exception("别名接口缺少 aliases 字段")
+
     async def sync(mid: int) -> bool:
         try:
             url = cfg.url.format(mid=mid)
             data = await download_json(url)
             await asyncio.sleep(cfg.sync_batch_interval)  
-            assert data['music_id'] == mid
-            aliases = data['aliases']
+            aliases = extract_aliases_from_sync_payload(data, mid)
             # 排除韩语别名
             aliases = [a for a in aliases if not any('\uac00' <= c <= '\ud7af' for c in a)]
             added, removed = alias_db.update(mid, aliases, verbose=False)
