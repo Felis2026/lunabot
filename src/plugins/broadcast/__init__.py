@@ -1,6 +1,7 @@
 from ..utils import *
 
 
+BC_SEND_DELAY_RANGE_SECONDS = (3, 10)
 config = Config('broadcast')
 logger = get_logger("Broadcast")
 file_db = get_file_db("data/broadcast/db.json", logger)
@@ -31,6 +32,18 @@ async def send_msg_to(ctx: HandlerContext, guid: str, msg: str):
     else:
         user_id = int(guid.split('_')[1])
         return await send_private_msg_by_bot(user_id, msg)
+
+
+async def wait_before_next_broadcast_send(index: int):
+    """
+    广播连续发送时给后续目标加随机间隔，降低短时间多群消息触发风控的概率。
+    第一条消息不等待，避免单目标广播也被无意义拖慢。
+    """
+    if index <= 0:
+        return
+    delay = random.uniform(*BC_SEND_DELAY_RANGE_SECONDS)
+    logger.info(f"广播发送等待 {delay:.1f}s 后继续")
+    await asyncio.sleep(delay)
 
 
 bc_list = CmdHandler(['/broadcast list', '/bc list'], logger)
@@ -163,8 +176,9 @@ async def _(ctx: HandlerContext):
         smsg.insert(0, {'type': 'text', 'data': {'text': f'【广播组{name}的消息】\n'}})
     else:
         smsg = f"【广播组{name}的消息】\n{smsg.strip()}"
-    for guid in bc[name]:
+    for index, guid in enumerate(bc[name]):
         try:
+            await wait_before_next_broadcast_send(index)
             await send_msg_to(ctx, guid, smsg)
             sended_list.append(guid)
         except Exception as e:

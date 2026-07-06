@@ -287,7 +287,7 @@ async def _(ctx: HandlerContext):
                 break
 
         # 如果当前群组正在自动聊天或者关闭@触发，只有通过/chat触发的消息才回复
-        if is_group_msg(event) and (autochat_gwl.check_id(event.group_id) or not at_trigger_chat_gbl.check(event)):
+        if is_group_msg(event) and (autochat_gwl.check_id(event.group_id) or not at_trigger_chat_gbl.check(event, allow_super=False)):
             if not triggered_by_chat_cmd:
                 return
             
@@ -729,7 +729,7 @@ async def _(ctx: HandlerContext):
 
 # 查询autochat用户记忆
 autochat_usermemory = CmdHandler([
-    "/autochat um", "/um", "/autochat usermemory", "/usermemory"
+    "/autochat um", "/autochat usermemory", "/usermemory"
 ], logger)
 autochat_usermemory.check_cdrate(chat_cd).check_wblist(autochat_gwl)
 @autochat_usermemory.handle()
