@@ -85,7 +85,7 @@ numpy
 onnxruntime
 pjsekai.scores
 pydantic>=2.12,<3
-Pillow
+Pillow>=12.2.0
 playwright
 pycryptodome
 pyyaml

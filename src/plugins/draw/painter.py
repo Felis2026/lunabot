@@ -17,10 +17,14 @@ import hashlib
 import pickle
 import glob
 import io
+import threading
 import colour
 import struct
 from functools import lru_cache
 from urllib.parse import quote_plus
+import unicodedata
+
+from fontTools.ttLib import TTFont
 
 
 _original_get_emoji_unicode_dict = getattr(emoji.unicode_codes, 'get_emoji_unicode_dict', None)
@@ -52,14 +56,17 @@ from ..common.process_pool import *
 from .img_utils import adjust_image_alpha_inplace
 
 
-# ================================ Emoji本地缓存源 ================================ #
-# pilmoji 默认的 GoogleEmojiSource 会在缺少本地资源时访问 emojicdn.elk.sh。
-# 该服务偶发慢响应会直接阻塞整张图绘制，所以这里统一使用公开代码里的
-# “本地缓存优先、远程兜底限时、成功后写回缓存”逻辑，避免 src/private 覆盖导致行为漂移。
+# ================================ Emoji 本地缓存与远程兜底 ================================ #
+# 顺序固定为：本地 Google → 远程 Google → 远程 Twemoji → 失败。
+# 只有 Google 结果写入本地；Twemoji 只负责当次兜底，避免两套画风污染同一缓存。
 class LocalCachedEmojiSource(GoogleEmojiSource):
-    """Prefer local emoji PNG cache and persist successful remote fallbacks."""
+    """为全局 Pilmoji 提供本地优先的 Google Emoji 和 Twemoji 最终兜底。"""
 
-    TWEMOJI_CDN_URL = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{codepoint}.png"
+    PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+    TWEMOJI_CDN_URL = (
+        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/"
+        "assets/72x72/{codepoint}.png"
+    )
     REQUEST_KWARGS = {
         **GoogleEmojiSource.REQUEST_KWARGS,
         "timeout": 5,
@@ -70,7 +77,8 @@ class LocalCachedEmojiSource(GoogleEmojiSource):
         self.allow_remote_fallback = allow_remote_fallback
         if local_dir is None:
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-            local_dir = os.path.join(project_root, "data", "utils", "emoji", "google")
+            # 旧 google 目录曾写入 Twemoji，改用新目录保证缓存内容全部来自 Google。
+            local_dir = os.path.join(project_root, "data", "utils", "emoji", "google-pilmoji")
         self.local_dir = local_dir
 
     @staticmethod
@@ -80,26 +88,19 @@ class LocalCachedEmojiSource(GoogleEmojiSource):
         if no_vs16 != emoji_text:
             yield no_vs16
 
-    @staticmethod
-    def _iter_twemoji_codepoints(emoji_text: str):
-        # Twemoji 的静态文件名通常是小写 codepoint 串；部分符号带 VS16，部分不带。
-        # 两种都尝试，可以兼容 ♻️ / ⏰ 这类序列差异。
-        seen = set()
-        for candidate in LocalCachedEmojiSource._iter_emoji_variants(emoji_text):
-            codepoint = "-".join(f"{ord(c):x}" for c in candidate)
-            if codepoint and codepoint not in seen:
-                seen.add(codepoint)
-                yield codepoint
-
     def _get_local_emoji_path(self, emoji_text: str) -> str:
         return os.path.join(self.local_dir, f"{quote_plus(emoji_text)}.png")
 
     def _load_local_emoji(self, emoji_text: str) -> Optional[io.BytesIO]:
         for candidate in self._iter_emoji_variants(emoji_text):
             file_path = self._get_local_emoji_path(candidate)
-            if os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    return io.BytesIO(f.read())
+            try:
+                with open(file_path, "rb") as file:
+                    data = file.read()
+            except OSError:
+                continue
+            if data.startswith(self.PNG_SIGNATURE):
+                return io.BytesIO(data)
         return None
 
     def _save_local_emoji(self, emoji_text: str, data: bytes) -> None:
@@ -107,51 +108,58 @@ class LocalCachedEmojiSource(GoogleEmojiSource):
             return
         os.makedirs(self.local_dir, exist_ok=True)
         file_path = self._get_local_emoji_path(emoji_text)
-        tmp_path = f"{file_path}.tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(data)
-        os.replace(tmp_path, file_path)
+        # Painter 可能在线程回退模式并发绘图，临时文件名必须同时区分进程和线程。
+        tmp_path = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp_path, "wb") as file:
+                file.write(data)
+            os.replace(tmp_path, file_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
-    def _fetch_static_emoji(self, emoji_text: str) -> Optional[bytes]:
-        for codepoint in self._iter_twemoji_codepoints(emoji_text):
+    def _fetch_google_emoji(self, emoji_text: str) -> Optional[bytes]:
+        for candidate in self._iter_emoji_variants(emoji_text):
+            try:
+                stream = super().get_emoji(candidate)
+            except Exception:
+                continue
+            if stream is not None and stream.getvalue().startswith(self.PNG_SIGNATURE):
+                return stream.getvalue()
+        return None
+
+    def _fetch_twemoji_fallback(self, emoji_text: str) -> Optional[bytes]:
+        for candidate in self._iter_emoji_variants(emoji_text):
+            codepoint = "-".join(f"{ord(char):x}" for char in candidate)
             try:
                 data = self.request(self.TWEMOJI_CDN_URL.format(codepoint=codepoint))
             except Exception:
                 continue
-            if data:
+            if data and data.startswith(self.PNG_SIGNATURE):
                 return data
         return None
 
-    def _fetch_remote_emoji(self, emoji_text: str) -> Optional[bytes]:
-        # 先走稳定的静态 PNG CDN，最后才落到 pilmoji 原始的 GoogleEmojiSource。
-        # 后者依赖 emojicdn，必须只作为兜底，避免一个缺失 emoji 卡住整张图。
-        data = self._fetch_static_emoji(emoji_text)
-        if data:
-            return data
-        try:
-            remote_stream = super().get_emoji(emoji_text)
-        except Exception:
-            return None
-        if remote_stream is None:
-            return None
-        return remote_stream.getvalue()
-
-    def get_emoji(self, emoji: str, /):
-        local_stream = self._load_local_emoji(emoji)
+    def get_emoji(self, emoji_text: str, /) -> Optional[io.BytesIO]:
+        local_stream = self._load_local_emoji(emoji_text)
         if local_stream is not None:
             return local_stream
         if not self.allow_remote_fallback:
             return None
-        data = self._fetch_remote_emoji(emoji)
-        if not data:
-            return None
-        try:
-            self._save_local_emoji(emoji, data)
-        except Exception as e:
-            debug_print(f"emoji cache save failed: {e}")
-        return io.BytesIO(data)
 
-    def get_discord_emoji(self, id: int, /):
+        google_data = self._fetch_google_emoji(emoji_text)
+        if google_data:
+            try:
+                self._save_local_emoji(emoji_text, google_data)
+            except OSError:
+                pass
+            return io.BytesIO(google_data)
+
+        twemoji_data = self._fetch_twemoji_fallback(emoji_text)
+        return io.BytesIO(twemoji_data) if twemoji_data else None
+
+    def get_discord_emoji(self, id: int, /) -> Optional[io.BytesIO]:
         if not self.allow_remote_fallback:
             return None
         try:
@@ -429,6 +437,24 @@ DEFAULT_BOLD_FONT = "SourceHanSansCN-Bold"
 DEFAULT_HEAVY_FONT = "SourceHanSansCN-Heavy"
 DEFAULT_EMOJI_FONT = "EmojiOneColor-SVGinOT"
 
+# SourceHan 仍是唯一主字体；下列字体只在确认主字体缺字后按顺序使用。
+# 使用本地文件可以保证 Windows/Linux 的字形选择一致，并避免生图时访问网络。
+FONT_FALLBACK_NAMES = (
+    "NotoSans-Variable",
+    "NotoSansCanadianAboriginal-Variable",
+    "NotoSansSymbols2-Regular",
+)
+SOURCE_HAN_FONT_PREFIX = "sourcehansanscn-"
+SOURCE_HAN_WEIGHT_VARIATIONS = {
+    "extralight": "ExtraLight",
+    "light": "Light",
+    "normal": "Regular",
+    "regular": "Regular",
+    "medium": "Medium",
+    "bold": "Bold",
+    "heavy": "Black",
+}
+
 
 ALIGN_MAP = {
     'c': ('c', 'c'), 'l': ('l', 'c'), 'r': ('r', 'c'), 't': ('c', 't'), 'b': ('c', 'b'),
@@ -452,6 +478,7 @@ class FontCacheEntry:
 FONT_CACHE_MAX_NUM_CFG = global_config.item('painter.font_cache_num')
 font_cache: dict[str, FontCacheEntry] = {}
 font_std_size_cache: dict[Font, Size] = {}
+font_cache_lock = threading.Lock()
 
 def crop_by_align(original_size, crop_size, align):
     w, h = original_size
@@ -516,31 +543,46 @@ def adjust_color(c, r=None, g=None, b=None, a=None):
 def get_font_desc(path: str, size: int) -> FontDesc:
     return FontDesc(path=path, size=size)
 
-def get_font(path: str, size: int) -> Font:
+def _get_existing_font_path(path: str) -> str:
+    """解析 Painter 字体名或路径，返回实际存在的字体文件。"""
+
+    paths = [
+        path,
+        os.path.join(FONT_DIR, path),
+        os.path.join(FONT_DIR, path + ".ttf"),
+        os.path.join(FONT_DIR, path + ".otf"),
+    ]
+    for candidate in paths:
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Font file not found: {path}")
+
+
+def get_font(path: str, size: int, variation_name: Optional[str] = None) -> Font:
+    """加载并缓存指定字号字体，可选设置可变字体字重实例。"""
+
     global font_cache
-    key = f"{path}_{size}"
-    paths = [path]
-    paths.append(os.path.join(FONT_DIR, path))
-    paths.append(os.path.join(FONT_DIR, path + ".ttf"))
-    paths.append(os.path.join(FONT_DIR, path + ".otf"))
-    if key not in font_cache:
-        font = None
-        for path in paths:
-            if os.path.exists(path):
-                font = ImageFont.truetype(path, size)
-                break
-        if font is None:
-            raise FileNotFoundError(f"Font file not found: {path}")
-        font_cache[key] = FontCacheEntry(
-            font=font, 
-            last_used=datetime.now(),
-        )
-        # 清理过期的字体缓存
-        while len(font_cache) > FONT_CACHE_MAX_NUM_CFG.get():
-            oldest_key = min(font_cache, key=lambda k: font_cache[k].last_used)
-            removed = font_cache.pop(oldest_key)
-            font_std_size_cache.pop(removed.font, None)
-    return font_cache[key].font
+    key = f"{path}_{size}_{variation_name or ''}"
+    # /语录 在线程池中生成，同一字号首次命中时必须避免重复加载和并发淘汰。
+    with font_cache_lock:
+        if key not in font_cache:
+            resolved_path = _get_existing_font_path(path)
+            font = ImageFont.truetype(resolved_path, size)
+            if variation_name is not None:
+                # fallback 使用可变字体匹配 SourceHan 字重，避免粗体缺字退化为常规字重。
+                font.set_variation_by_name(variation_name)
+            font_cache[key] = FontCacheEntry(
+                font=font,
+                last_used=datetime.now(),
+            )
+            # 清理过期的字体缓存
+            while len(font_cache) > FONT_CACHE_MAX_NUM_CFG.get():
+                oldest_key = min(font_cache, key=lambda k: font_cache[k].last_used)
+                removed = font_cache.pop(oldest_key)
+                font_std_size_cache.pop(removed.font, None)
+        else:
+            font_cache[key].last_used = datetime.now()
+        return font_cache[key].font
 
 def get_font_std_size(font: Font) -> Size:
     global font_std_size_cache
@@ -550,14 +592,29 @@ def get_font_std_size(font: Font) -> Size:
         return std_size
     return font_std_size_cache[font]
 
-# ================================ Emoji混排测量与绘制 ================================ #
+# ================================ Emoji 与缺字字体混排 ================================ #
 
-# 旧实现会把整串混合文本直接交给 pilmoji。
-# 这会让“文字基线”和“emoji 图像”的排版逻辑耦合在一起，业务层只能靠手工拆分 TextBox 来修偏移。
-# 这里改为底层按 run 分段：普通文字继续走 PIL，emoji 单独走 pilmoji，
-# 这样可以统一复用同一条文本基线，并避免换行/裁剪时把 emoji 序列切坏。
+# Emoji 仍交给 Pilmoji；普通文字只有在 SourceHan 缺字时才选择本地 fallback。
+# 测量、换行和绘制必须复用同一份 run 计划，否则不同字体的字宽会让布局与成图不一致。
 
 EMOJI_SEQUENCE_MARKERS = ("\ufe0f", "\u200d", "\u20e3")
+ZERO_WIDTH_DRAWLESS_CHARS = frozenset(("\u200b", "\u2060", "\ufeff"))
+TEXT_JOIN_CONTROLS = frozenset(("\u200c", "\u200d"))
+UNICODE_COVERAGE_BYTE_COUNT = (0x110000 + 7) // 8
+
+
+@dataclass(frozen=True)
+class InlineTextLayoutRun:
+    """描述一次 Pillow/Pilmoji 绘制调用及其字体选择。"""
+
+    text: str
+    is_emoji: bool = False
+    fallback_index: int = -1
+
+
+font_coverage_cache: dict[str, bytes] = {}
+font_coverage_cache_lock = threading.Lock()
+
 
 def _contains_possible_emoji(text: str) -> bool:
     for c in text:
@@ -569,6 +626,7 @@ def _contains_possible_emoji(text: str) -> bool:
         if 0x1F1E6 <= code <= 0x1F1FF:
             return True
     return False
+
 
 @lru_cache(maxsize=4096)
 def _get_inline_text_units(text: str) -> Tuple[Tuple[str, bool], ...]:
@@ -586,8 +644,10 @@ def _get_inline_text_units(text: str) -> Tuple[Tuple[str, bool], ...]:
             units.append((token.chars, True))
     return tuple(units)
 
+
 def get_inline_text_units(text: str) -> Tuple[Tuple[str, bool], ...]:
     return _get_inline_text_units(text)
+
 
 @lru_cache(maxsize=4096)
 def _get_inline_text_segments(text: str) -> Tuple[Tuple[str, bool], ...]:
@@ -608,6 +668,244 @@ def _get_inline_text_segments(text: str) -> Tuple[Tuple[str, bool], ...]:
         segments.append(("".join(text_buffer), False))
     return tuple(segments)
 
+
+def _is_variation_selector(char: str) -> bool:
+    codepoint = ord(char)
+    return 0xFE00 <= codepoint <= 0xFE0F or 0xE0100 <= codepoint <= 0xE01EF
+
+
+def _iter_plain_text_clusters(text: str):
+    """保守合并组合符和连接序列，避免 fallback 在字符簇中间换字体。"""
+
+    cluster = ""
+    for char in text:
+        if char in ZERO_WIDTH_DRAWLESS_CHARS:
+            if cluster:
+                yield cluster
+                cluster = ""
+            yield char
+            continue
+
+        category = unicodedata.category(char)
+        joins_cluster = (
+            bool(cluster)
+            and (
+                category.startswith("M")
+                or _is_variation_selector(char)
+                or char in TEXT_JOIN_CONTROLS
+                or cluster[-1] in TEXT_JOIN_CONTROLS
+            )
+        )
+        if joins_cluster:
+            cluster += char
+        else:
+            if cluster:
+                yield cluster
+            cluster = char
+    if cluster:
+        yield cluster
+
+
+@lru_cache(maxsize=4096)
+def _get_inline_text_layout_units(text: str) -> Tuple[Tuple[str, bool], ...]:
+    """返回换行安全的普通字符簇和完整 Emoji 单元。"""
+
+    units: list[tuple[str, bool]] = []
+    for segment_text, is_emoji in _get_inline_text_segments(text):
+        if is_emoji:
+            units.append((segment_text, True))
+        else:
+            units.extend((cluster, False) for cluster in _iter_plain_text_clusters(segment_text))
+    return tuple(units)
+
+
+def get_inline_text_layout_units(text: str) -> Tuple[Tuple[str, bool], ...]:
+    return _get_inline_text_layout_units(text)
+
+
+def _font_path(font: Font) -> Optional[str]:
+    path = getattr(font, "path", None)
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    return os.path.normpath(path) if isinstance(path, str) else None
+
+
+def _is_source_han_font(font: Font) -> bool:
+    path = _font_path(font)
+    return bool(path and os.path.basename(path).lower().startswith(SOURCE_HAN_FONT_PREFIX))
+
+
+def _get_source_han_variation(font: Font) -> str:
+    path = _font_path(font) or DEFAULT_FONT
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    weight_name = stem.rsplit("-", 1)[-1]
+    return SOURCE_HAN_WEIGHT_VARIATIONS.get(weight_name, "Regular")
+
+
+def _get_font_coverage(font_path: str) -> bytes:
+    """读取字体 cmap 并缓存为定长 bitset，避免常驻大型 Python 集合。"""
+
+    resolved_path = os.path.abspath(_get_existing_font_path(font_path))
+    with font_coverage_cache_lock:
+        cached = font_coverage_cache.get(resolved_path)
+        if cached is not None:
+            return cached
+
+        ttfont = TTFont(resolved_path, lazy=True)
+        try:
+            cmap = ttfont.getBestCmap() or {}
+        finally:
+            ttfont.close()
+        coverage = bytearray(UNICODE_COVERAGE_BYTE_COUNT)
+        for codepoint in cmap:
+            coverage[codepoint >> 3] |= 1 << (codepoint & 7)
+        cached = bytes(coverage)
+        font_coverage_cache[resolved_path] = cached
+        return cached
+
+
+def _coverage_has_char(coverage: bytes, char: str) -> bool:
+    if char in ("\n", "\r", "\t") or _is_variation_selector(char):
+        return True
+    codepoint = ord(char)
+    return bool(coverage[codepoint >> 3] & (1 << (codepoint & 7)))
+
+
+def _font_name_supports_cluster(font_name: str, cluster: str) -> bool:
+    try:
+        coverage = _get_font_coverage(font_name)
+    except (FileNotFoundError, OSError):
+        # data/ 字体资源由部署包提供；资源未同步时保持旧的方框行为，不能让整张图失败。
+        return False
+    return all(_coverage_has_char(coverage, char) for char in cluster)
+
+
+@lru_cache(maxsize=16384)
+def _select_source_han_fallback(cluster: str) -> int:
+    """为 SourceHan 缺失字符簇选择第一个能完整覆盖的本地字体。"""
+
+    source_han_coverage = _get_font_coverage(DEFAULT_FONT)
+    if all(_coverage_has_char(source_han_coverage, char) for char in cluster):
+        return -1
+    for index, font_name in enumerate(FONT_FALLBACK_NAMES):
+        if _font_name_supports_cluster(font_name, cluster):
+            return index
+    return -1
+
+
+def _is_neutral_layout_cluster(cluster: str) -> bool:
+    """空白和标点可跟随相邻 fallback，从而减少不必要的字体切换。"""
+
+    return bool(cluster) and all(
+        char.isspace() or unicodedata.category(char)[0] in ("P", "Z")
+        for char in cluster
+    )
+
+
+def _append_layout_run(
+    runs: list[InlineTextLayoutRun],
+    text: str,
+    is_emoji: bool,
+    fallback_index: int = -1,
+) -> None:
+    if not text:
+        return
+    if (
+        runs
+        and runs[-1].is_emoji == is_emoji
+        and runs[-1].fallback_index == fallback_index
+    ):
+        previous = runs[-1]
+        runs[-1] = InlineTextLayoutRun(
+            previous.text + text,
+            is_emoji=is_emoji,
+            fallback_index=fallback_index,
+        )
+    else:
+        runs.append(InlineTextLayoutRun(text, is_emoji, fallback_index))
+
+
+@lru_cache(maxsize=4096)
+def _get_source_han_layout_runs(text: str) -> Tuple[InlineTextLayoutRun, ...]:
+    assignments: list[list[Any]] = []
+    for unit_text, is_emoji in _get_inline_text_layout_units(text):
+        if not is_emoji and unit_text in ZERO_WIDTH_DRAWLESS_CHARS:
+            continue
+        fallback_index = -1 if is_emoji else _select_source_han_fallback(unit_text)
+        assignments.append([unit_text, is_emoji, fallback_index])
+
+    # 标点和空格改用相邻 fallback 可把“主字体→标点→fallback”压缩成一次绘制，
+    # 但字母、数字和中日韩文字仍坚持使用 SourceHan，避免正常视觉发生漂移。
+    for index, (unit_text, is_emoji, fallback_index) in enumerate(assignments):
+        if is_emoji or fallback_index >= 0 or not _is_neutral_layout_cluster(unit_text):
+            continue
+        candidate_indexes: list[int] = []
+        for neighbor_index in (index - 1, index + 1):
+            if 0 <= neighbor_index < len(assignments):
+                _, neighbor_is_emoji, neighbor_fallback = assignments[neighbor_index]
+                if not neighbor_is_emoji and neighbor_fallback >= 0:
+                    candidate_indexes.append(neighbor_fallback)
+        for candidate_index in dict.fromkeys(candidate_indexes):
+            if _font_name_supports_cluster(FONT_FALLBACK_NAMES[candidate_index], unit_text):
+                assignments[index][2] = candidate_index
+                break
+
+    runs: list[InlineTextLayoutRun] = []
+    for unit_text, is_emoji, fallback_index in assignments:
+        _append_layout_run(runs, unit_text, is_emoji, fallback_index)
+    return tuple(runs)
+
+
+@lru_cache(maxsize=4096)
+def _get_default_layout_runs(text: str) -> Tuple[InlineTextLayoutRun, ...]:
+    runs: list[InlineTextLayoutRun] = []
+    for unit_text, is_emoji in _get_inline_text_layout_units(text):
+        if not is_emoji and unit_text in ZERO_WIDTH_DRAWLESS_CHARS:
+            continue
+        _append_layout_run(runs, unit_text, is_emoji)
+    return tuple(runs)
+
+
+@lru_cache(maxsize=4096)
+def _source_han_text_requires_layout(text: str) -> bool:
+    coverage = _get_font_coverage(DEFAULT_FONT)
+    for char in text:
+        codepoint = ord(char)
+        if char in ZERO_WIDTH_DRAWLESS_CHARS:
+            return True
+        if (
+            char in emoji.EMOJI_DATA
+            or char in EMOJI_SEQUENCE_MARKERS
+            or 0x1F1E6 <= codepoint <= 0x1F1FF
+        ):
+            return True
+        if not _coverage_has_char(coverage, char):
+            return True
+    return False
+
+
+def _text_requires_inline_layout(font: Font, text: str) -> bool:
+    if _is_source_han_font(font):
+        return _source_han_text_requires_layout(text)
+    return any(char in ZERO_WIDTH_DRAWLESS_CHARS for char in text) or has_emoji(text)
+
+
+def _get_inline_layout_runs(font: Font, text: str) -> Tuple[InlineTextLayoutRun, ...]:
+    if _is_source_han_font(font):
+        return _get_source_han_layout_runs(text)
+    return _get_default_layout_runs(text)
+
+
+def _get_layout_run_font(font: Font, run: InlineTextLayoutRun) -> Font:
+    if run.fallback_index < 0:
+        return font
+    font_name = FONT_FALLBACK_NAMES[run.fallback_index]
+    variation_name = None
+    if font_name != "NotoSansSymbols2-Regular":
+        variation_name = _get_source_han_variation(font)
+    return get_font(font_name, font.size, variation_name)
+
+
 def _get_text_bbox_ls(font: Font, text: str) -> Tuple[float, float, float, float]:
     try:
         bbox = font.getbbox(text, anchor='ls')
@@ -617,6 +915,7 @@ def _get_text_bbox_ls(font: Font, text: str) -> Tuple[float, float, float, float
         std_size = get_font_std_size(font)
         return bbox[0], bbox[1] - std_size[1], bbox[2], bbox[3] - std_size[1]
 
+
 def _get_emoji_position_offset(font: Font) -> Position:
     std_size = get_font_std_size(font)
     offset = global_config.get('painter.emoji.offset')
@@ -625,6 +924,7 @@ def _get_emoji_position_offset(font: Font) -> Position:
         int(offset[1] * std_size[1] / 32) - std_size[1],
     )
 
+
 def _get_inline_text_metrics(font: Font, text: str) -> Tuple[float, Tuple[float, float, float, float]]:
     advance_total = 0.0
     min_x = min_y = max_x = max_y = 0.0
@@ -632,22 +932,20 @@ def _get_inline_text_metrics(font: Font, text: str) -> Tuple[float, Tuple[float,
     emoji_scale = EMOJI_SCALE_CFG.get()
     emoji_offset = _get_emoji_position_offset(font)
 
-    for segment_text, is_emoji in _get_inline_text_segments(text):
-        if not segment_text:
-            continue
-
-        if is_emoji:
-            seg_w, seg_h = getsize_emoji(segment_text, font=font, emoji_scale_factor=emoji_scale)
+    for run in _get_inline_layout_runs(font, text):
+        if run.is_emoji:
+            seg_w, seg_h = getsize_emoji(run.text, font=font, emoji_scale_factor=emoji_scale)
             left = advance_total + emoji_offset[0]
             top = emoji_offset[1]
             right = left + seg_w
             bottom = top + seg_h
             advance = seg_w
         else:
-            left, top, right, bottom = _get_text_bbox_ls(font, segment_text)
+            run_font = _get_layout_run_font(font, run)
+            left, top, right, bottom = _get_text_bbox_ls(run_font, run.text)
             left += advance_total
             right += advance_total
-            advance = font.getlength(segment_text)
+            advance = run_font.getlength(run.text)
 
         if not has_bbox:
             min_x, min_y, max_x, max_y = left, top, right, bottom
@@ -657,7 +955,6 @@ def _get_inline_text_metrics(font: Font, text: str) -> Tuple[float, Tuple[float,
             min_y = min(min_y, top)
             max_x = max(max_x, right)
             max_y = max(max_y, bottom)
-
         advance_total += advance
 
     if not has_bbox:
@@ -667,30 +964,34 @@ def _get_inline_text_metrics(font: Font, text: str) -> Tuple[float, Tuple[float,
     min_x = min(min_x, 0.0)
     return advance_total, (min_x, min_y, max_x, max_y)
 
+
 def has_emoji(text: str) -> bool:
     if not text or not _contains_possible_emoji(text):
         return False
     return any(is_emoji for _, is_emoji in _get_inline_text_units(text))
 
+
 def get_text_size(font: Font, text: str) -> Size:
-    if not text: 
+    if not text:
         return (0, 0)
-    if has_emoji(text):
+    if _text_requires_inline_layout(font, text):
         _, (min_x, min_y, max_x, max_y) = _get_inline_text_metrics(font, text)
         return math.ceil(max_x - min_x), math.ceil(max_y - min_y)
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
-    
+
+
 def get_text_width(font: Font, text: str) -> int:
     if not text:
         return 0
-    if has_emoji(text):
+    if _text_requires_inline_layout(font, text):
         advance, _ = _get_inline_text_metrics(font, text)
         return advance
     return font.getlength(text)
 
+
 def get_text_offset(font: Font, text: str) -> Position:
-    if has_emoji(text):
+    if _text_requires_inline_layout(font, text):
         _, (min_x, min_y, _, _) = _get_inline_text_metrics(font, text)
         return math.floor(min_x), math.floor(min_y)
     bbox = font.getbbox(text)
@@ -937,42 +1238,54 @@ class Painter:
         text_offset = (0, -std_size[1])
         pos = (pos[0] - text_offset[0] + self.offset[0], pos[1] - text_offset[1] + self.offset[1])
 
-        if not has_emoji(text):
+        if not _text_requires_inline_layout(font, text):
             draw = ImageDraw.Draw(self.img)
             draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
         else:
-            # 按 run 分别绘制普通文字和 emoji，统一复用同一条 baseline，
-            # 避免整串交给 pilmoji 时出现的混排高度漂移问题。
+            # 普通主字体、缺字 fallback 和 Emoji 共用同一条 baseline。
             draw = ImageDraw.Draw(self.img)
-            cursor_x = pos[0]
-            cursor_y = pos[1]
             scale = global_config.get('painter.emoji.scale')
             emoji_offset = _get_emoji_position_offset(font)
-            try:
-                with Pilmoji(self.img, source=EMOJI_SOURCE_CLS) as pilmoji:
-                    for segment_text, is_emoji in _get_inline_text_segments(text):
-                        if not segment_text:
-                            continue
-                        draw_pos = (int(round(cursor_x)), int(round(cursor_y)))
-                        if is_emoji:
+            runs = _get_inline_layout_runs(font, text)
+
+            def draw_runs(pilmoji: Optional[Pilmoji] = None):
+                cursor_x = pos[0]
+                cursor_y = pos[1]
+                for run in runs:
+                    draw_pos = (int(round(cursor_x)), int(round(cursor_y)))
+                    if run.is_emoji:
+                        if pilmoji is not None:
                             try:
                                 pilmoji.text(
-                                    draw_pos, segment_text, font=font, fill=fill, align=align,
+                                    draw_pos, run.text, font=font, fill=fill, align=align,
                                     emoji_position_offset=emoji_offset, emoji_scale_factor=scale,
                                     anchor='ls'
                                 )
                             except Exception as e:
                                 debug_print(f"pilmoji segment failed, fallback to plain text: {e}")
-                                draw.text(draw_pos, segment_text, font=font, fill=fill, align=align, anchor='ls')
-                            seg_w, _ = getsize_emoji(segment_text, font=font, emoji_scale_factor=scale)
-                            cursor_x += seg_w
+                                draw.text(
+                                    draw_pos, run.text, font=font, fill=fill,
+                                    align=align, anchor='ls'
+                                )
                         else:
-                            draw.text(draw_pos, segment_text, font=font, fill=fill, align=align, anchor='ls')
-                            cursor_x += font.getlength(segment_text)
-            except Exception as e:
-                # Keep drawing path available even if emoji source fails.
-                debug_print(f"pilmoji failed, fallback to plain text: {e}")
-                draw.text(pos, text, font=font, fill=fill, align=align, anchor='ls')
+                            draw.text(draw_pos, run.text, font=font, fill=fill, align=align, anchor='ls')
+                        seg_w, _ = getsize_emoji(run.text, font=font, emoji_scale_factor=scale)
+                        cursor_x += seg_w
+                    else:
+                        run_font = _get_layout_run_font(font, run)
+                        draw.text(draw_pos, run.text, font=run_font, fill=fill, align=align, anchor='ls')
+                        cursor_x += run_font.getlength(run.text)
+
+            if any(run.is_emoji for run in runs):
+                try:
+                    with Pilmoji(self.img, source=EMOJI_SOURCE_CLS) as pilmoji:
+                        draw_runs(pilmoji)
+                except Exception as e:
+                    # Emoji 源异常时仍保留普通文字 fallback，不退回整段 SourceHan 方框。
+                    debug_print(f"pilmoji failed, fallback to plain text: {e}")
+                    draw_runs()
+            else:
+                draw_runs()
         return self
     
     def _get_aa_roundrect(

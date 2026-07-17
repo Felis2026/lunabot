@@ -1,6 +1,7 @@
 from ..utils import *
 from .mirage import generate_mirage
 from PIL import Image, ImageOps, ImageEnhance
+from functools import lru_cache
 from enum import Enum
 import sys
 import numpy as np
@@ -1425,7 +1426,215 @@ async def _(ctx: HandlerContext):
         remove_file(tmp_path)
 
 
-# 生成语录
+# ================================ 即时语录图布局 ================================ #
+# 固定横幅只负责业务布局；文字和 Emoji 仍统一交给全局 Painter 绘制。
+# 所有固定图层均缓存在进程内，最终图片只即时返回，不写入语录库或图片文件。
+
+SAYING_CANVAS_SIZE = (1200, 400)
+SAYING_AVATAR_WIDTH = 400
+SAYING_GRADIENT_START = 220
+SAYING_GRADIENT_END = 400
+SAYING_TEXT_LEFT = 440
+SAYING_TEXT_RIGHT = 1150
+SAYING_QUOTE_TOP = 52
+SAYING_QUOTE_BOTTOM = 302
+SAYING_AUTHOR_BOTTOM = 362
+SAYING_MAX_FONT_SIZE = 68
+SAYING_MIN_FONT_SIZE = 34
+SAYING_AUTHOR_FONT_SIZE = 36
+SAYING_LINE_SPACING_RATIO = 1.32
+SAYING_MAX_INPUT_CHARS = 1024
+
+
+@lru_cache(maxsize=1)
+def _build_saying_gradient_overlay() -> Image.Image:
+    """生成并缓存头像到正文之间的固定渐变层。"""
+
+    canvas_width, canvas_height = SAYING_CANVAS_SIZE
+    overlay = Image.new("RGBA", SAYING_CANVAS_SIZE, (0, 0, 0, 0))
+    pixels = overlay.load()
+    span = SAYING_GRADIENT_END - SAYING_GRADIENT_START
+    for x in range(canvas_width):
+        if x < SAYING_GRADIENT_START:
+            alpha = 18
+        elif x >= SAYING_GRADIENT_END:
+            alpha = 255
+        else:
+            progress = (x - SAYING_GRADIENT_START) / span
+            alpha = round(18 + (255 - 18) * (progress ** 1.7))
+        for y in range(canvas_height):
+            edge = abs((y / (canvas_height - 1)) - 0.5) * 2
+            vignette = round(20 * (edge ** 2))
+            pixels[x, y] = (0, 0, 0, min(255, alpha + vignette))
+    return overlay
+
+
+def _crop_saying_avatar(avatar: Image.Image) -> Image.Image:
+    """等比裁剪头像填满左侧区域，避免直接缩放导致变形。"""
+
+    target_size = (SAYING_AVATAR_WIDTH, SAYING_CANVAS_SIZE[1])
+    source = avatar.convert("RGB")
+    scale = max(target_size[0] / source.width, target_size[1] / source.height)
+    resized = source.resize(
+        (round(source.width * scale), round(source.height * scale)),
+        Image.Resampling.LANCZOS,
+    )
+    left = (resized.width - target_size[0]) // 2
+    top = (resized.height - target_size[1]) // 2
+    cropped = resized.crop((left, top, left + target_size[0], top + target_size[1]))
+    return ImageEnhance.Contrast(cropped).enhance(1.04)
+
+
+def _get_saying_line_width(units: list[tuple[str, bool]], font) -> float:
+    """使用全局 Painter 的 Emoji 测量规则计算一行宽度。"""
+
+    return sum(get_text_width(font, unit_text) for unit_text, _ in units)
+
+
+def _wrap_saying_units(
+    units: list[tuple[str, bool]],
+    font,
+    max_width: int,
+    max_lines: int | None = None,
+) -> tuple[list[list[tuple[str, bool]]], bool]:
+    """按真实宽度换行，超过可见行数后立即停止并报告溢出。"""
+
+    lines: list[list[tuple[str, bool]]] = [[]]
+    current_width = 0.0
+    for unit_text, is_emoji in units:
+        if not is_emoji and unit_text == "\n":
+            if max_lines is not None and len(lines) >= max_lines:
+                return lines, True
+            lines.append([])
+            current_width = 0.0
+            continue
+        unit_width = get_text_width(font, unit_text)
+        if lines[-1] and current_width + unit_width > max_width:
+            if max_lines is not None and len(lines) >= max_lines:
+                return lines, True
+            lines.append([])
+            current_width = 0.0
+        lines[-1].append((unit_text, is_emoji))
+        current_width += unit_width
+
+    for line in lines:
+        while line and not line[0][1] and line[0][0] in (" ", "　", "\t"):
+            line.pop(0)
+    return lines, False
+
+
+def _layout_saying_quote_at_size(
+    units: list[tuple[str, bool]],
+    font_size: int,
+    max_width: int,
+    max_height: int,
+) -> tuple[Any, list[list[tuple[str, bool]]], int, bool]:
+    """在单一字号下布局正文；只计算最终画布可能显示的行。"""
+
+    font = get_font(DEFAULT_FONT, font_size)
+    line_height = round(font_size * SAYING_LINE_SPACING_RATIO)
+    max_lines = max(1, max_height // line_height)
+    lines, overflow = _wrap_saying_units(
+        units,
+        font,
+        max_width,
+        max_lines=max_lines,
+    )
+    return font, lines, line_height, overflow
+
+
+def _fit_saying_quote(text: str):
+    """选择可读字号；最低字号仍放不下时用省略号截断。"""
+
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    input_limited = len(normalized_text) > SAYING_MAX_INPUT_CHARS
+    if input_limited:
+        # 输出区域只有数行，先限制解析量可阻止零宽字符或交替字体制造超大 run 列表。
+        normalized_text = normalized_text[:SAYING_MAX_INPUT_CHARS]
+    units = list(get_inline_text_layout_units(f"「{normalized_text}」"))
+    max_width = SAYING_TEXT_RIGHT - SAYING_TEXT_LEFT
+    max_height = SAYING_QUOTE_BOTTOM - SAYING_QUOTE_TOP
+
+    sizes = list(range(SAYING_MIN_FONT_SIZE, SAYING_MAX_FONT_SIZE + 1, 2))
+    largest_layout = _layout_saying_quote_at_size(
+        units, sizes[-1], max_width, max_height
+    )
+    if not largest_layout[3] and not input_limited:
+        return largest_layout[:3]
+
+    smallest_layout = _layout_saying_quote_at_size(
+        units, sizes[0], max_width, max_height
+    )
+    if not smallest_layout[3] and not input_limited:
+        best_layout = smallest_layout
+        low, high = 1, len(sizes) - 2
+        # 可容纳性随字号单调变化，二分可避免为每个字号重复加载 fallback 字体。
+        while low <= high:
+            middle = (low + high) // 2
+            layout = _layout_saying_quote_at_size(
+                units, sizes[middle], max_width, max_height
+            )
+            if layout[3]:
+                high = middle - 1
+            else:
+                best_layout = layout
+                low = middle + 1
+        return best_layout[:3]
+
+    font, lines, line_height, _ = smallest_layout
+    suffix = list(get_inline_text_units("……」"))
+    while lines[-1] and _get_saying_line_width(lines[-1] + suffix, font) > max_width:
+        lines[-1].pop()
+    lines[-1].extend(suffix)
+    return font, lines, line_height
+
+
+def _fit_saying_author(author: str):
+    """在不侵入头像区域的前提下缩小过长署名。"""
+
+    author_text = f"— {author.strip()}"
+    max_width = SAYING_TEXT_RIGHT - SAYING_TEXT_LEFT
+    low, high = 24, SAYING_AUTHOR_FONT_SIZE
+    best_font = get_font(DEFAULT_FONT, low)
+    while low <= high:
+        middle = (low + high) // 2
+        font = get_font(DEFAULT_FONT, middle)
+        if get_text_width(font, author_text) <= max_width:
+            best_font = font
+            low = middle + 1
+        else:
+            high = middle - 1
+    return author_text, best_font
+
+
+def _render_saying_image(avatar: Image.Image, text: str, author: str) -> Image.Image:
+    """在工作线程中生成一张固定尺寸语录图，不产生任何持久化副作用。"""
+
+    canvas = Image.new("RGBA", SAYING_CANVAS_SIZE, BLACK)
+    canvas.paste(_crop_saying_avatar(avatar), (0, 0))
+    canvas.alpha_composite(_build_saying_gradient_overlay())
+    painter = Painter(img=canvas)
+
+    font, lines, line_height = _fit_saying_quote(text)
+    quote_area_height = SAYING_QUOTE_BOTTOM - SAYING_QUOTE_TOP
+    start_y = SAYING_QUOTE_TOP + max(0, (quote_area_height - len(lines) * line_height) // 2)
+    for index, line in enumerate(lines):
+        painter._text(
+            "".join(unit_text for unit_text, _ in line),
+            (SAYING_TEXT_LEFT, start_y + index * line_height),
+            font,
+            WHITE,
+        )
+
+    author_text, author_font = _fit_saying_author(author)
+    author_x = max(SAYING_TEXT_LEFT, round(SAYING_TEXT_RIGHT - get_text_width(author_font, author_text)))
+    author_y = SAYING_AUTHOR_BOTTOM - round(author_font.size * SAYING_LINE_SPACING_RATIO)
+    painter._text(author_text, (author_x, author_y), author_font, (225, 225, 225, 255))
+    return painter.img.convert("RGB")
+
+
+# ================================ 生成语录命令 ================================ #
+
 gen_saying = CmdHandler(['/saying', '/quote', '/语录'], logger)
 gen_saying.check_cdrate(cd).check_wblist(gbl).check_group()
 @gen_saying.handle()
@@ -1452,24 +1661,16 @@ async def _(ctx: HandlerContext):
     if not text:
         raise ReplyException("回复的消息没有文本!")
     
-    text = "「 " + text + " 」"
-    line_len = 20
-    name_text = "——" + reply_user_name
-
-    with Canvas(bg=FillBg(BLACK)) as canvas:
-        with HSplit().set_item_align('c').set_content_align('c').set_padding(16).set_sep(16):
-            with VSplit().set_item_align('c').set_content_align('c'):
-                Spacer(10, 32)
-                ImageBox(await download_image(await get_avatar_url_large(ctx.bot, reply_user_id)), size=(256, 256)).set_margin(16)
-                Spacer(10, 32)
-            
-            with VSplit().set_item_align('c').set_content_align('c').set_sep(8):
-                font_sz = 48
-                TextBox(text, TextStyle(DEFAULT_FONT, font_sz, WHITE), line_count=get_str_line_count(text, line_len) + 1).set_w(font_sz * line_len // 2).set_content_align('l')
-                TextBox(name_text, TextStyle(DEFAULT_FONT, font_sz, WHITE)).set_w(font_sz * line_len // 2).set_content_align('r')
-            Spacer(16, 16)
-
-    return await ctx.asend_reply_msg(await get_image_cq(await canvas.get_img()))
+    avatar = await download_image(await get_avatar_url_large(ctx.bot, reply_user_id))
+    try:
+        image = await run_in_pool(_render_saying_image, avatar, text, reply_user_name)
+    finally:
+        avatar.close()
+    try:
+        image_cq = await get_image_cq(image)
+    finally:
+        image.close()
+    return await ctx.asend_reply_msg(image_cq)
 
 
 # 渲染markdown
