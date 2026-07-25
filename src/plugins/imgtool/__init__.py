@@ -1,9 +1,16 @@
 from ..utils import *
 from .mirage import generate_mirage
 from PIL import Image, ImageOps, ImageEnhance
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from enum import Enum
-import sys
+from pathlib import Path
+import asyncio
+import math
+import os
+import struct
+import subprocess
 import numpy as np
 
 
@@ -14,6 +21,10 @@ cd = ColdDown(file_db, logger)
 gbl = get_group_black_list(file_db, logger, 'imgtool', allow_group_admin_current_group=True)
 
 
+class ImageOperationUnavailableError(RuntimeError):
+    """表示图片操作依赖的可选能力未启用，应直接向用户返回提示。"""
+
+
 # ============================= cpp程序调用 ============================= # 
 
 @dataclass
@@ -21,49 +32,99 @@ class CppImageOutput:
     image: Image.Image | List[Image.Image]
     extra_info: dict
 
+
+CPP_OUTPUT_MAX_BYTES = 1_000_000_000
+CPP_EXTRA_INFO_MAX_BYTES = 1024 * 1024
+
+
+def _read_exact(file_obj, size: int, field_name: str) -> bytes:
+    """读取固定长度的二进制字段，拒绝被截断的 C++ 输出。"""
+    data = file_obj.read(size)
+    if len(data) != size:
+        raise RuntimeError(f"imgtool-cpp返回的{field_name}数据不完整")
+    return data
+
+
 def execute_imgtool_cpp(image: Image.Image | List[Image.Image], command: str, *args) -> CppImageOutput:
-    """
-    调用imgtool-cpp程序处理图片
-    """
+    """通过无 Shell 的二进制协议调用 imgtool-cpp，并严格校验返回数据。"""
     is_single_frame = isinstance(image, Image.Image)
     if is_single_frame:
         image = [image]
-    ret = []
-    w, h = image[0].size
-    n = len(image)
+    if not image:
+        raise ValueError("imgtool-cpp输入图片不能为空")
+
+    input_width, input_height = image[0].size
+    input_frame_count = len(image)
+    if input_width <= 0 or input_height <= 0:
+        raise ValueError("imgtool-cpp输入图片尺寸无效")
+    if any(frame.size != (input_width, input_height) for frame in image):
+        raise ValueError("imgtool-cpp要求所有输入帧尺寸一致")
+
+    ret: List[Image.Image] = []
     with TempFilePath('input') as input_path:
         with TempFilePath('output') as output_path:
             # 保存输入文件
             with open(input_path, 'wb') as f:
-                f.write(int(n).to_bytes(4, sys.byteorder))
-                f.write(int(h).to_bytes(4, sys.byteorder))
-                f.write(int(w).to_bytes(4, sys.byteorder))
-                for i in range(n):
-                    frame = image[i].convert('RGBA')
+                f.write(struct.pack('<iii', input_frame_count, input_height, input_width))
+                for frame in image:
+                    frame = frame.convert('RGBA')
                     f.write(frame.tobytes('raw', 'RGBA'))
 
-            cli_path = "data/imgtool/imgtool-cpp"
-            logger.info(f"调用imgtool-cpp程序: {command} " + " ".join(map(str, args)) + f" 输入尺寸: {n}x{w}x{h}")
-            assert_and_reply(os.path.exists(cli_path), "imgtool-cpp程序不存在，请使用src/scripts/compile_imgtool_cpp.sh编译")
-            cmd = f"{cli_path} {input_path} {output_path} {command} " + " ".join(map(str, args))
-            assert_and_reply(os.system(cmd) == 0, "调用imgtool-cpp程序失败")
+            cli_path = Path(config.get('cpp_binary_path', 'data/imgtool/imgtool-cpp'))
+            timeout_seconds = int(config.get('cpp_timeout_seconds', 30))
+            logger.info(
+                f"调用imgtool-cpp程序: {command} {' '.join(map(str, args))} "
+                f"输入尺寸: {input_frame_count}x{input_width}x{input_height}"
+            )
+            if not cli_path.is_file():
+                raise RuntimeError("imgtool-cpp程序不存在，请使用src/scripts/compile_imgtool_cpp.sh编译")
+
+            try:
+                result = subprocess.run(
+                    [str(cli_path), input_path, output_path, command, *map(str, args)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"imgtool-cpp执行超过{timeout_seconds}秒，已终止") from exc
+
+            if result.returncode != 0:
+                error_text = (result.stderr or result.stdout or "未知错误").strip()
+                raise RuntimeError(f"imgtool-cpp执行失败({result.returncode}): {error_text[:500]}")
+            if not os.path.isfile(output_path):
+                raise RuntimeError("imgtool-cpp未生成输出文件")
 
             # 读取输出文件
             with open(output_path, 'rb') as f:
-                n = int.from_bytes(f.read(4), sys.byteorder)
-                h = int.from_bytes(f.read(4), sys.byteorder)
-                w = int.from_bytes(f.read(4), sys.byteorder)
-                for i in range(n):
-                    frame = Image.new('RGBA', (w, h))
-                    frame.frombytes(f.read(w * h * 4), 'raw', 'RGBA')
+                frame_count, height, width = struct.unpack('<iii', _read_exact(f, 12, "头部"))
+                if frame_count <= 0 or height <= 0 or width <= 0:
+                    raise RuntimeError("imgtool-cpp返回了无效的图片尺寸")
+                if frame_count != input_frame_count:
+                    raise RuntimeError("imgtool-cpp返回的帧数与输入不一致")
+                pixel_bytes = frame_count * height * width * 4
+                if pixel_bytes > CPP_OUTPUT_MAX_BYTES:
+                    raise RuntimeError("imgtool-cpp返回的图片数据过大")
+
+                for _ in range(frame_count):
+                    frame_data = _read_exact(f, width * height * 4, "像素")
+                    frame = Image.frombytes('RGBA', (width, height), frame_data, 'raw', 'RGBA')
                     ret.append(frame)
-                try:
-                    n = int.from_bytes(f.read(4), sys.byteorder)
-                    extra_info = loads_json(f.read(n)) if n > 0 else {}
-                except Exception as e:
-                    logger.warning(f"imgtool-cpp程序返回的extra_info数据解析失败: {get_exc_desc(e)}")
-                    extra_info = {}
-            logger.info(f"imgtool-cpp程序执行完毕，输出尺寸: {n}x{w}x{h}，额外返回: {extra_info}")
+
+                extra_info_length = struct.unpack('<i', _read_exact(f, 4, "附加信息长度"))[0]
+                if not 0 <= extra_info_length <= CPP_EXTRA_INFO_MAX_BYTES:
+                    raise RuntimeError("imgtool-cpp返回的附加信息长度无效")
+                extra_info = loads_json(_read_exact(f, extra_info_length, "附加信息")) if extra_info_length else {}
+                if not isinstance(extra_info, dict):
+                    raise RuntimeError("imgtool-cpp返回的附加信息格式无效")
+                if f.read(1):
+                    raise RuntimeError("imgtool-cpp输出包含未识别的尾部数据")
+
+            logger.info(
+                f"imgtool-cpp程序执行完毕，输出尺寸: {frame_count}x{width}x{height}，"
+                f"额外返回: {extra_info}"
+            )
 
     return CppImageOutput(
         image=ret[0] if is_single_frame else ret, 
@@ -87,34 +148,231 @@ def shrink_image(image: Image.Image | List[Image.Image], alpha_threshold: int, e
     try:
         return execute_imgtool_cpp(image, "shrink", alpha_threshold, edge)
     except Exception as e:
-        # 备用实现
+        # C++ 能力是性能优化，不应成为裁剪透明功能的单点故障。
         logger.warning(f"imgtool-cpp程序shrink命令执行失败，使用备用实现: {get_exc_desc(e)}")
-        image_array = np.array(image)
-        alpha = image_array[:, :, 3]
-        non_blank_rows = np.where(np.any(alpha >= alpha_threshold, axis=1))[0]
-        non_blank_columns = np.where(np.any(alpha >= alpha_threshold, axis=0))[0]
-        if non_blank_rows.size > 0 and non_blank_columns.size > 0:
-            left = non_blank_columns[0]
-            right = non_blank_columns[-1]
-            top = non_blank_rows[0]
-            bottom = non_blank_rows[-1]
-            image = Image.fromarray(image_array[top : bottom + 1, left : right + 1])
+        is_single_frame = isinstance(image, Image.Image)
+        frames = [image] if is_single_frame else list(image)
+        if not frames:
+            raise ValueError("裁剪透明输入不能为空")
+
+        width, height = frames[0].size
+        if any(frame.size != (width, height) for frame in frames):
+            raise ValueError("裁剪透明要求所有输入帧尺寸一致")
+
+        opaque_mask = np.zeros((height, width), dtype=bool)
+        rgba_frames = []
+        for frame in frames:
+            rgba_frame = frame.convert('RGBA')
+            rgba_frames.append(rgba_frame)
+            opaque_mask |= np.asarray(rgba_frame.getchannel('A')) > alpha_threshold
+
+        positions = np.argwhere(opaque_mask)
+        if positions.size == 0:
+            output_frames = [frame.copy() for frame in rgba_frames]
+            bbox = [0, 0, width, height]
         else:
-            image = Image.fromarray(image_array)
-        w, h = image.size
-        new_w = w + 2 * edge
-        new_h = h + 2 * edge
-        new_image = Image.new('RGBA', (new_w, new_h), (0, 0, 0, 0))
-        new_image.paste(image, (edge, edge))
-        image = new_image
-        extra_ret = { 'bbox': (left, top, w, h) }
-        return CppImageOutput(image=image, extra_info=extra_ret)
+            top, left = positions.min(axis=0)
+            bottom, right = positions.max(axis=0) + 1
+            output_left = int(left) - edge
+            output_top = int(top) - edge
+            output_width = int(right - left) + 2 * edge
+            output_height = int(bottom - top) + 2 * edge
+            source_box = (
+                max(0, output_left),
+                max(0, output_top),
+                min(width, output_left + output_width),
+                min(height, output_top + output_height),
+            )
+            paste_position = (max(0, -output_left), max(0, -output_top))
+            output_frames = []
+            for frame in rgba_frames:
+                output = Image.new('RGBA', (output_width, output_height), (0, 0, 0, 0))
+                output.paste(frame.crop(source_box), paste_position)
+                output_frames.append(output)
+            bbox = [output_left, output_top, output_width, output_height]
+
+        return CppImageOutput(
+            image=output_frames[0] if is_single_frame else output_frames,
+            extra_info={'bbox': bbox},
+        )
 
 
 # ============================= 基础设施 ============================= # 
 
 IMAGE_LIST_CLEAN_INTERVAL_CFG = config.item('image_list_clean_interval')  # 图片列表清理间隔(s)
 MULTI_IMAGE_MAX_NUM_CFG = config.item('multi_image_max_num')  # 多张图片操作的最大数量
+IMGTOOL_MAX_CONCURRENT_JOBS = max(1, int(config.get('max_concurrent_jobs', 2)))
+IMGTOOL_MAX_QUEUED_JOBS = max(0, int(config.get('max_queued_jobs', 4)))
+STATIC_OUTPUT_PIXEL_LIMIT = parse_cfg_num(config.get('output_limits.static_pixels', '1024*1024*16'))
+ANIMATED_OUTPUT_PIXEL_LIMIT = parse_cfg_num(config.get('output_limits.animated_pixels', '1024*1024*32'))
+ANIMATED_OUTPUT_MAX_FRAMES = max(1, int(config.get('output_limits.max_frames', 100)))
+
+
+# ================================ 并发与资源预算 ================================ #
+# ImgTool 的 Pillow、NumPy 和外部程序任务都可能瞬时占用较多内存。独立线程池避免
+# 挤占 Bot 公共线程池；显式排队上限则避免 ThreadPoolExecutor 的无界队列持续堆积。
+IMGTOOL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=IMGTOOL_MAX_CONCURRENT_JOBS,
+    thread_name_prefix="imgtool",
+)
+
+
+class ImgToolJobGate:
+    """限制同时执行和等待的 ImgTool 重型任务数量。"""
+
+    def __init__(self, max_concurrent: int, max_queued: int):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._state_lock = asyncio.Lock()
+        self._accepted_jobs = 0
+        self._capacity = max_concurrent + max_queued
+
+    async def acquire(self) -> None:
+        async with self._state_lock:
+            if self._accepted_jobs >= self._capacity:
+                raise ReplyException(
+                    f"当前图片处理任务较多（最多同时处理{IMGTOOL_MAX_CONCURRENT_JOBS}个、"
+                    f"排队{IMGTOOL_MAX_QUEUED_JOBS}个），请稍后再试"
+                )
+            self._accepted_jobs += 1
+
+        try:
+            await self._semaphore.acquire()
+        except BaseException:
+            async with self._state_lock:
+                self._accepted_jobs -= 1
+            raise
+
+    async def release(self) -> None:
+        self._semaphore.release()
+        async with self._state_lock:
+            self._accepted_jobs -= 1
+
+
+IMGTOOL_JOB_GATE = ImgToolJobGate(
+    IMGTOOL_MAX_CONCURRENT_JOBS,
+    IMGTOOL_MAX_QUEUED_JOBS,
+)
+
+
+@asynccontextmanager
+async def imgtool_job_slot():
+    """为一次完整图片任务申请槽位，取消或异常时也会正确释放。"""
+    await IMGTOOL_JOB_GATE.acquire()
+    try:
+        yield
+    finally:
+        await IMGTOOL_JOB_GATE.release()
+
+
+@on_shutdown()
+def _shutdown_imgtool_executor():
+    IMGTOOL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
+
+def _resize_images_to_total_limit(
+    images: List[Image.Image],
+    pixel_limit: int,
+) -> List[Image.Image]:
+    """保留全部独立图片；必要时缩放尺寸并在各自动图内部抽帧。"""
+    total_pixels = get_image_pixels(images)
+    if total_pixels <= pixel_limit:
+        return images
+    if not images or pixel_limit < len(images):
+        raise ReplyException("图片数量或尺寸过大，无法在安全范围内处理")
+
+    try:
+        resized = limit_image_by_pixels(images, pixel_limit, allow_frame_drop=False)
+    except ValueError as exc:
+        raise ReplyException("图片尺寸过大，无法在安全范围内缩放") from exc
+    if get_image_pixels(resized) > pixel_limit:
+        raise ReplyException("图片尺寸过大，无法在安全范围内缩放")
+    return resized
+
+
+def _fit_uniform_size(width: int, height: int, units: int, pixel_limit: int) -> tuple[int, int]:
+    """计算多帧或多图共同使用的安全尺寸，不分配目标画布。"""
+    required_pixels = width * height * units
+    if required_pixels <= pixel_limit:
+        return width, height
+    if units <= 0 or pixel_limit < units:
+        raise ReplyException("预计输出图片过大，无法安全处理")
+
+    scale = math.sqrt(pixel_limit / required_pixels)
+    safe_width = max(1, int(width * scale))
+    safe_height = max(1, int(height * scale))
+    while safe_width * safe_height * units > pixel_limit:
+        if safe_width >= safe_height and safe_width > 1:
+            safe_width -= 1
+        elif safe_height > 1:
+            safe_height -= 1
+        else:
+            raise ReplyException("预计输出图片过大，无法安全处理")
+    return safe_width, safe_height
+
+
+def _limit_animated_image_by_budget(
+    image: Image.Image,
+    pixel_limit: int,
+    frame_limit: int,
+) -> tuple[Image.Image, bool, tuple[int, int], tuple[int, int]]:
+    """按时间轴限制动图；返回结果、是否调整及调整前后的“帧数/总像素”。"""
+    original_stats = (
+        image.n_frames,
+        image.width * image.height * image.n_frames,
+    )
+    if original_stats[0] <= frame_limit and original_stats[1] <= pixel_limit:
+        return image, False, original_stats, original_stats
+
+    frames, durations = get_gif_timeline(image)
+    try:
+        frames, durations = limit_gif_timeline_by_pixels(
+            frames,
+            durations,
+            pixel_limit,
+            max_frames=frame_limit,
+            allow_frame_drop=True,
+        )
+    except ValueError as exc:
+        raise ReplyException("动图尺寸过大，无法在安全范围内缩放") from exc
+    output_stats = (len(frames), get_image_pixels(frames))
+    result = frames_to_gif(
+        frames,
+        quantize_gif_durations(durations),
+    )
+    return result, True, original_stats, output_stats
+
+
+def _enforce_output_budget(image: Image.Image | List[Image.Image], operation_name: str):
+    """在每步操作后统一校验结果，避免后续操作继承超限对象。"""
+    if isinstance(image, list):
+        original_pixels = get_image_pixels(image)
+        limited = _resize_images_to_total_limit(image, STATIC_OUTPUT_PIXEL_LIMIT)
+        if get_image_pixels(limited) != original_pixels:
+            logger.info(
+                f"图片操作 {operation_name} 输出多图超限，已缩放 "
+                f"{original_pixels} -> {get_image_pixels(limited)} 像素"
+            )
+        return limited
+
+    if is_animated(image):
+        limited, adjusted, original_stats, output_stats = _limit_animated_image_by_budget(
+            image,
+            ANIMATED_OUTPUT_PIXEL_LIMIT,
+            ANIMATED_OUTPUT_MAX_FRAMES,
+        )
+        if adjusted:
+            logger.info(
+                f"图片操作 {operation_name} 动图输出超限，已调整 "
+                f"{original_stats[0]}帧/{original_stats[1]}像素 -> "
+                f"{output_stats[0]}帧/{output_stats[1]}像素"
+            )
+        return limited
+
+    original_size = image.size
+    limited = limit_image_by_pixels(image, STATIC_OUTPUT_PIXEL_LIMIT)
+    if limited.size != original_size:
+        logger.info(f"图片操作 {operation_name} 静态输出超限，已缩放 {original_size} -> {limited.size}")
+    return limited
 
 
 # 图片类型
@@ -136,27 +394,22 @@ class ImageType(Enum):
 
     def check_img(self, img) -> bool:
         if self == ImageType.Multiple:
-            if not isinstance(img, list):
+            if not isinstance(img, list) or not img:
                 return False
-            for i in img:
-                if not isinstance(i, Image.Image):
-                    return False
-                if is_animated(i):
-                    return False
-                return True
+            return all(isinstance(item, Image.Image) and not is_animated(item) for item in img)
         elif self == ImageType.Any:
-            return True
+            return isinstance(img, Image.Image)
         elif self == ImageType.Animated:
-            return is_animated(img)
+            return isinstance(img, Image.Image) and is_animated(img)
         elif self == ImageType.Static:
-            return not is_animated(img)
+            return isinstance(img, Image.Image) and not is_animated(img)
+        return False
 
     def check_type(self, tar) -> bool:
-        if self == ImageType.Multiple:
+        if self == ImageType.Multiple or tar == ImageType.Multiple:
             return self == tar
-        if self == ImageType.Any or tar == ImageType.Any:
-            return True
-        return self == tar
+        # Any 仅代表单张图片；静态/动图的最终匹配在每一步运行时再次确认。
+        return self == tar or self == ImageType.Any or tar == ImageType.Any
 
     @classmethod
     def get_type(cls, img) -> 'ImageType':
@@ -197,51 +450,104 @@ class ImageOperation:
             else:
                 msg = f"参数错误\n{self.help}"
             raise ReplyException(msg.strip())
+        operation_input_limit = (
+            args.get('_input_limit', self.input_limit)
+            if isinstance(args, dict)
+            else self.input_limit
+        )
         
+        input_type = ImageType.get_type(img)
+        is_batched_multiple = input_type == ImageType.Multiple and self.input_type != ImageType.Multiple
+        if is_batched_multiple:
+            assert_and_reply(
+                all(self.input_type.check_img(item) for item in img),
+                f"操作 {self.name} 需要 {self.input_type} 输入",
+            )
+        else:
+            assert_and_reply(
+                self.input_type.check_img(img),
+                f"操作 {self.name} 需要 {self.input_type} 输入，实际为 {input_type}",
+            )
+
         def apply_limit(img: Union[Image.Image, List[Image.Image]]):
             if isinstance(img, Image.Image) and not is_animated(img):
                 w, h = img.size
-                img = limit_image_by_pixels(img, self.input_limit)
+                img = limit_image_by_pixels(img, operation_input_limit)
                 new_w, new_h = img.size
                 if (w, h) != (new_w, new_h):
                     logger.info(f"图片操作 {self.name} 对超限输入进行缩放 {w}x{h} -> {new_w}x{new_h}")
+            elif isinstance(img, Image.Image):
+                img, adjusted, original_stats, output_stats = _limit_animated_image_by_budget(
+                    img,
+                    operation_input_limit,
+                    ANIMATED_OUTPUT_MAX_FRAMES,
+                )
+                if adjusted:
+                    logger.info(
+                        f"图片操作 {self.name} 对超限动图输入进行缩放/抽帧 "
+                        f"{original_stats[0]}帧/{original_stats[1]}像素 -> "
+                        f"{output_stats[0]}帧/{output_stats[1]}像素"
+                    )
             else:
-                is_single_gif = False
-                if isinstance(img, Image.Image):
-                    is_single_gif = True
-                    duration = get_gif_duration(img)
-                    img = gif_to_frames(img)
-                
-                w, h, n = img[0].size[0], img[0].size[1], len(img)
-                img = limit_image_by_pixels(img, self.input_limit)
-                new_w, new_h, new_n = img[0].size[0], img[0].size[1], len(img)
-
-                if (n, w, h) != (new_n, new_w, new_h):
-                    logger.info(f"图片操作 {self.name} 对超限输入进行缩放 {n}x{w}x{h} -> {new_n}x{new_w}x{new_h}")
-                if is_single_gif:
-                    img = frames_to_gif(img, int(duration * new_n / n))
+                original_pixels = get_image_pixels(img)
+                img = limit_image_by_pixels(img, operation_input_limit, allow_frame_drop=False)
+                if get_image_pixels(img) != original_pixels:
+                    logger.info(
+                        f"图片操作 {self.name} 对超限多图输入进行缩放 "
+                        f"{original_pixels} -> {get_image_pixels(img)} 像素"
+                    )
             return img
 
         def process_image(img):
             img_type = ImageType.get_type(img)
             if self.process_type == 'single':
-                return self.operate(apply_limit(img), args)
+                return self.operate(apply_limit(img), args, img_type)
             elif self.process_type == 'batch':
                 if img_type == ImageType.Animated:
-                    frames = gif_to_frames(img)
-                    frames = apply_limit(frames)
-                    frames = [self.operate(f, args, img_type, i, img.n_frames) for i, f in enumerate(frames)]
-                    return frames_to_gif(frames, get_gif_duration(img))
+                    limited_img = apply_limit(img)
+                    frames, durations = get_gif_timeline(limited_img)
+                    frames = [self.operate(frame, args, img_type, i, len(frames)) for i, frame in enumerate(frames)]
+                    return frames_to_gif(
+                        frames,
+                        quantize_gif_durations(durations),
+                    )
                 else:
                     return self.operate(apply_limit(img), args, img_type)
+
+        def output_matches(item) -> bool:
+            if self.output_type.check_img(item):
+                return True
+            # Pillow 会把视觉上完全相同的 GIF 帧合并成单帧；这种退化结果仍是有效输出，
+            # 但后续若接倒放等动图专用操作，下一步的运行时输入校验仍会拒绝它。
+            return (
+                self.output_type == ImageType.Animated
+                and isinstance(item, Image.Image)
+                and item.format == 'GIF'
+            )
         
-        img_type = ImageType.get_type(img)
-        logger.info(f"执行图片操作:{self.name} 输入类型:{img_type} 参数:{args}")
-        if self.input_type != ImageType.Multiple and img_type == ImageType.Multiple:
+        log_args = (
+            {key: value for key, value in args.items() if not key.startswith('_')}
+            if isinstance(args, dict)
+            else args
+        )
+        logger.info(f"执行图片操作:{self.name} 输入类型:{input_type} 参数:{log_args}")
+        if is_batched_multiple:
             logger.info(f"为 {self.name} 操作批量处理 {len(img)} 张图片")
-            return [process_image(i) for i in img]
+            processed = [process_image(item) for item in img]
+            if self.output_type == ImageType.Multiple:
+                result = [nested_item for item in processed for nested_item in item]
+                assert_and_reply(self.output_type.check_img(result), f"操作 {self.name} 返回了错误的图片类型")
+            else:
+                result = processed
+                assert_and_reply(
+                    all(output_matches(item) for item in result),
+                    f"操作 {self.name} 返回了错误的图片类型",
+                )
         else:
-            return process_image(img)
+            result = process_image(img)
+            assert_and_reply(output_matches(result), f"操作 {self.name} 返回了错误的图片类型")
+
+        return _enforce_output_budget(result, self.name)
             
                 
 # 从回复消息获取第一张图片
@@ -256,95 +562,173 @@ async def get_reply_fst_image(ctx: HandlerContext, return_url=False):
         raise NoReplyException()
     return img
 
-# 获取图片列表，并检测用户user_id的失效
-def get_image_list(user_id):
-    user_id = str(user_id)
-    image_list = file_db.get('image_list', {})
-    image_list_edit_time = file_db.get('image_list_edit_time', {})
-    
-    # 第一次获取
-    if user_id not in image_list_edit_time:
-        image_list[user_id] = []
-        image_list_edit_time[user_id] = datetime.now().timestamp()
-        file_db.set('image_list', image_list)
-        file_db.set('image_list_edit_time', image_list_edit_time)
-        return image_list
-    
-    # 判断过期
-    last_edit_time = datetime.fromtimestamp(image_list_edit_time[user_id])
-    if (datetime.now() - last_edit_time).total_seconds() > IMAGE_LIST_CLEAN_INTERVAL_CFG.get():
-        logger.info(f"用户 {user_id} 的图片列表已过期")
-        image_list[user_id] = []
-        file_db.set('image_list', image_list)
+# ================================ 图片列表隔离 ================================ #
+# 图片列表按“群 + 用户”隔离；私聊使用独立作用域。锁覆盖整个读改写过程，避免同一
+# 用户快速连续 push/pop 时互相覆盖。旧版按用户存储的数据会在首次访问时就地迁移。
+IMAGE_LIST_LOCK = asyncio.Lock()
 
-    # 更新时间
-    image_list_edit_time[user_id] = datetime.now().timestamp()
-    file_db.set('image_list_edit_time', image_list_edit_time)
-    logger.info(f"获取用户 {user_id} 的图片列表, 共有 {len(image_list[user_id])} 张图片")
-    return image_list
+
+def _get_image_list_scope(ctx: HandlerContext) -> tuple[str, str]:
+    user_id = str(ctx.user_id)
+    group_id = getattr(ctx, 'group_id', None)
+    if group_id:
+        return f"group:{group_id}:user:{user_id}", user_id
+    return f"private:user:{user_id}", user_id
+
+
+def _load_image_list_state(scope_key: str, legacy_user_key: str):
+    """加载、清理并迁移图片列表状态；调用方必须持有 IMAGE_LIST_LOCK。"""
+    image_lists = file_db.get('image_list', {})
+    edit_times = file_db.get('image_list_edit_time', {})
+    if not isinstance(image_lists, dict):
+        image_lists = {}
+    if not isinstance(edit_times, dict):
+        edit_times = {}
+
+    now = datetime.now().timestamp()
+    expire_seconds = IMAGE_LIST_CLEAN_INTERVAL_CFG.get()
+
+    if scope_key not in image_lists and legacy_user_key in image_lists:
+        image_lists[scope_key] = image_lists.pop(legacy_user_key)
+        edit_times[scope_key] = edit_times.pop(legacy_user_key, now)
+        logger.info(f"已将用户 {legacy_user_key} 的旧版图片列表迁移到 {scope_key}")
+
+    expired_keys = []
+    for key, timestamp in list(edit_times.items()):
+        try:
+            expired = now - float(timestamp) > expire_seconds
+        except (TypeError, ValueError):
+            expired = True
+        if expired:
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        image_lists.pop(key, None)
+        edit_times.pop(key, None)
+        logger.info(f"图片列表 {key} 已过期并清理")
+
+    # 清理单边写入遗留的孤儿键，保证两份状态始终一一对应。
+    for key in list(image_lists):
+        if key not in edit_times and key != scope_key:
+            image_lists.pop(key, None)
+    for key in list(edit_times):
+        if key not in image_lists and key != scope_key:
+            edit_times.pop(key, None)
+
+    image_lists.setdefault(scope_key, [])
+    if not isinstance(image_lists[scope_key], list):
+        image_lists[scope_key] = []
+    edit_times[scope_key] = now
+    return image_lists, edit_times
+
+
+async def get_image_list(ctx: HandlerContext) -> List[str]:
+    """返回当前会话作用域的图片 URL 快照。"""
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+        snapshot = list(image_lists[scope_key])
+    logger.info(f"获取图片列表 {scope_key}，共有 {len(snapshot)} 张图片")
+    return snapshot
 
 # 往图片列表push图片
 async def add_image_to_list(ctx: HandlerContext, reply=True):
-    args = ctx.get_args()
-    user_id = str(ctx.user_id)
-    image_list = get_image_list(user_id)
-
-    max_num = MULTI_IMAGE_MAX_NUM_CFG.get()
+    args = ctx.get_args().strip().split()
+    assert_and_reply(not args or args == ['r'], "仅支持参数 r（倒序添加）")
     img_urls = await ctx.aget_image_urls(min_count=1, max_count=None)
-    assert_and_reply(len(image_list[user_id]) + len(img_urls) <= max_num, 
-                     f"图片列表已满，当前有{len(image_list[user_id])}张图片，最多只能处理{max_num}张图片")
-
-    if 'r' in args:
+    if args == ['r']:
         img_urls = img_urls[::-1]
 
-    image_list[user_id].extend(img_urls)
-    file_db.set('image_list', image_list)
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        current_list = image_lists[scope_key]
+        max_num = MULTI_IMAGE_MAX_NUM_CFG.get()
+        assert_and_reply(
+            len(current_list) + len(img_urls) <= max_num,
+            f"图片列表已满，当前有{len(current_list)}张图片，最多只能处理{max_num}张图片",
+        )
+        current_list.extend(img_urls)
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+        current_count = len(current_list)
 
-    logger.info(f"用户 {user_id} 向图片列表添加了 {len(img_urls)} 张图片，共有 {len(image_list[user_id])} 张")
+    logger.info(f"图片列表 {scope_key} 添加了 {len(img_urls)} 张图片，共有 {current_count} 张")
     if reply:
-        return await ctx.asend_reply_msg(f"成功添加{len(img_urls)}张图片，当前有{len(image_list[user_id])}张图片")
+        return await ctx.asend_reply_msg(f"成功添加{len(img_urls)}张图片，当前有{current_count}张图片")
 
 # 从图片列表pop图片
 async def pop_image_from_list(ctx: HandlerContext, reply=True):
-    user_id = str(ctx.user_id)
-    image_list = get_image_list(user_id)
-    assert_and_reply(image_list[user_id], "图片列表为空")
-    img = image_list[user_id].pop()
-    file_db.set('image_list', image_list)
-    logger.info(f"用户 {user_id} 从图片列表中弹出图片, 剩余 {len(image_list[user_id])} 张")
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        assert_and_reply(image_lists[scope_key], "图片列表为空")
+        img = image_lists[scope_key].pop()
+        remaining_count = len(image_lists[scope_key])
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+    logger.info(f"图片列表 {scope_key} 移除一张图片，剩余 {remaining_count} 张")
     img = await get_image_cq(img)
     if reply:
-        return await ctx.asend_reply_msg(f"{img}移除该图片，剩余{len(image_list[user_id])}张图片")
+        return await ctx.asend_reply_msg(f"{img}移除该图片，剩余{remaining_count}张图片")
 
 # 清空图片列表
 async def clear_image_list(ctx: HandlerContext, reply=True):
-    user_id = str(ctx.user_id)
-    image_list = get_image_list(user_id)
-    pre_len = len(image_list[user_id])
-    image_list[user_id].clear()
-    file_db.set('image_list', image_list)
-    logger.info(f"用户 {user_id} 清空了图片列表, 之前有 {pre_len} 张图片")
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        previous_count = len(image_lists[scope_key])
+        image_lists[scope_key].clear()
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+    logger.info(f"图片列表 {scope_key} 已清空，之前有 {previous_count} 张图片")
     if reply:
-        return await ctx.asend_reply_msg(f"清空列表中 {pre_len} 张图片")
+        return await ctx.asend_reply_msg(f"清空列表中 {previous_count} 张图片")
+
+
+async def consume_image_list_snapshot(ctx: HandlerContext, consumed_urls: List[str]) -> None:
+    """仅移除本次操作读取的列表前缀，保留处理期间新追加的图片。"""
+    if not consumed_urls:
+        return
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        current_list = image_lists[scope_key]
+        if current_list[:len(consumed_urls)] != consumed_urls:
+            logger.warning(f"图片列表 {scope_key} 在处理期间发生变更，本次不自动消费列表")
+            file_db.set('image_list', image_lists)
+            file_db.set('image_list_edit_time', edit_times)
+            return
+        del current_list[:len(consumed_urls)]
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+    logger.info(f"图片列表 {scope_key} 已消费本次使用的 {len(consumed_urls)} 张图片")
+
 
 # 翻转图片列表
 async def reverse_image_list(ctx: HandlerContext, reply=True):
-    user_id = str(ctx.user_id)
-    image_list = get_image_list(user_id)
-    image_list[user_id].reverse()
-    file_db.set('image_list', image_list)
-    logger.info(f"用户 {user_id} 翻转了图片列表")
+    scope_key, legacy_user_key = _get_image_list_scope(ctx)
+    async with IMAGE_LIST_LOCK:
+        image_lists, edit_times = _load_image_list_state(scope_key, legacy_user_key)
+        image_lists[scope_key].reverse()
+        current_count = len(image_lists[scope_key])
+        file_db.set('image_list', image_lists)
+        file_db.set('image_list_edit_time', edit_times)
+    logger.info(f"图片列表 {scope_key} 已翻转")
     if reply:
-        return await ctx.asend_reply_msg(f"翻转成功，当前列表有{len(image_list[user_id])}张图片")
+        return await ctx.asend_reply_msg(f"翻转成功，当前列表有{current_count}张图片")
 
 # 获取多张图片
-async def get_multi_images(ctx: HandlerContext) -> List[Image.Image]:
+async def get_multi_images(ctx: HandlerContext) -> tuple[Image.Image | List[Image.Image], bool, List[str]]:
     max_num = MULTI_IMAGE_MAX_NUM_CFG.get()
     img_urls = await ctx.aget_image_urls(min_count=None, max_count=max_num)
     # 使用消息本身带有的图片，如果本身不带图片则使用图片列表
+    used_saved_list = False
     if not img_urls:
-        user_id = str(ctx.user_id)
-        img_urls = get_image_list(user_id).get(user_id, [])
+        img_urls = await get_image_list(ctx)
+        used_saved_list = True
         assert_and_reply(img_urls, """
 请指定要操作的图片！
 方法1. 回复包含单张、多张图片的消息、折叠转发消息
@@ -363,13 +747,23 @@ async def get_multi_images(ctx: HandlerContext) -> List[Image.Image]:
         imgs.append(img)
 
     if len(imgs) == 1:
-        return imgs[0]
-    return imgs
+        return imgs[0], used_saved_list, list(img_urls) if used_saved_list else []
+    return imgs, used_saved_list, list(img_urls) if used_saved_list else []
 
 # 进行图片操作
-async def operate_image(ctx: HandlerContext) -> Image.Image:
+async def operate_image(
+    ctx: HandlerContext,
+    initial_operation: str | None = None,
+) -> Image.Image:
+    """解析并执行图片操作链；裸快捷指令通过 initial_operation 补回首个操作名。"""
     args = ctx.get_args().strip().split()
     all_op_names = ImageOperation.all_ops.keys()
+    if initial_operation is not None:
+        assert_and_reply(
+            initial_operation in all_op_names,
+            f"未知图片操作 {initial_operation}, 可用的操作: {', '.join(all_op_names)}",
+        )
+        args.insert(0, initial_operation)
     assert_and_reply(args, f"""
 操作序列不能为空！
 使用方式: (回复一张图片) /img 操作1 参数1 操作2 参数2 ...
@@ -390,16 +784,12 @@ async def operate_image(ctx: HandlerContext) -> Image.Image:
     assert_and_reply(ops, f"未指定操作, 可用的操作: {', '.join(all_op_names)}")
     assert_and_reply(len(ops) <= 10, f"操作过多, 最多支持10个操作")
 
-    # 检查操作输入输出类型是否对应
-    for i in range(1, len(ops)):
-        pre_name = ops[i-1][0].name
-        cur_name = ops[i][0].name
-        pre_type = ops[i-1][0].output_type
-        cur_type = ops[i][0].input_type
-        assert_and_reply(pre_type.check_type(cur_type), f"第{i}个操作 {pre_name} 的输出类型 {pre_type} 与 第{i+1}个操作 {cur_name} 的输入类型 {cur_type} 不匹配")
+    # 操作可对多图逐张批处理，声明类型无法完整表达这条动态链路。
+    # 因此每一步都以实际返回对象重新校验，避免 Any 被误当成 Multiple，同时保留
+    # “多图 resize 后 concat”这类合法组合。
 
     # 获取图片，并检查初始输入类型是否匹配
-    img = await get_multi_images(ctx)
+    img, used_saved_list, consumed_urls = await get_multi_images(ctx)
     img_num = 1 if isinstance(img, Image.Image) else len(img)
     img_type = ImageType.get_type(img)
     first_input_type = ops[0][0].input_type
@@ -413,29 +803,45 @@ async def operate_image(ctx: HandlerContext) -> Image.Image:
     # 执行操作序列
     for i, (op, args) in enumerate(ops):
         try:
-            img = await run_in_pool(op, img, args)
+            img = await run_in_pool(op, img, args, pool=IMGTOOL_EXECUTOR)
+        except ImageOperationUnavailableError as e:
+            raise ReplyException(str(e))
+        except ReplyException:
+            raise
         except Exception as e:
             logger.print_exc(f"执行第{i+1}个图片操作 {op.name} 失败")
             raise ReplyException(f"执行第{i+1}个图片操作 {op.name} 失败: {e}")
         
-    # 清空图片列表
-    await clear_image_list(ctx, reply=False)    
-        
     logger.info(f"{len(ops)}个图片操作全部执行完毕")
 
     if isinstance(img, list):
-        msgs = [f"{await get_image_cq(item)}#{i}" for i, item in enumerate(img)]
-        return await ctx.asend_fold_msg(msgs)
+        msgs = [f"{await get_image_cq(item)}#{i}" for i, item in enumerate(img, start=1)]
+        send_result = await ctx.asend_fold_msg(msgs)
     else:
-        return await ctx.asend_reply_msg(await get_image_cq(img))
+        send_result = await ctx.asend_reply_msg(await get_image_cq(img))
+
+    # 结果成功发出后才消费本次快照；回复其他图片不会影响保存列表，发送失败也可重试。
+    if used_saved_list:
+        await consume_image_list_snapshot(ctx, consumed_urls)
+    return send_result
+
+
+async def run_image_operation(
+    ctx: HandlerContext,
+    initial_operation: str | None = None,
+) -> Image.Image:
+    """在统一的用户互斥锁和重型任务槽位中执行一次图片操作链。"""
+    await ctx.block(f"{ctx.user_id}", 5)
+    async with imgtool_job_slot():
+        return await operate_image(ctx, initial_operation)
+
 
 # 图片操作Handler
 img_op = CmdHandler(["/img", "/imgtool"], logger, priority=1)
 img_op.check_cdrate(cd).check_wblist(gbl)
 @img_op.handle()
 async def _(ctx: HandlerContext):
-    await ctx.block(f"{ctx.user_id}", 5)
-    await operate_image(ctx)
+    await run_image_operation(ctx)
 
 # push图片列表Handler
 img_push = CmdHandler(["/img push", "/imgpush"], logger, priority=1)
@@ -1673,20 +2079,37 @@ async def _(ctx: HandlerContext):
     return await ctx.asend_reply_msg(image_cq)
 
 
-# 渲染markdown
+# ================================ Markdown转图片 ================================ #
+
+MARKDOWN_COMMAND_MAX_CHARS = 20_000
+MARKDOWN_COMMAND_MAX_HEIGHT = 10_000
+
+
 md = CmdHandler(['/md', '/markdown'], logger)
 md.check_cdrate(cd).check_wblist(gbl)
 @md.handle()
 async def _(ctx: HandlerContext):
     reply_msg = ctx.get_reply_msg()
     assert_and_reply(reply_msg, "请回复一条带有markdown内容的消息")
-    text = extract_text(reply_msg)
-    img = await markdown_to_image(text)
+    text = extract_text(reply_msg).strip()
+    assert_and_reply(text, "回复的消息中没有可渲染的Markdown文本")
+    assert_and_reply(
+        len(text) <= MARKDOWN_COMMAND_MAX_CHARS,
+        f"Markdown内容过长，最多支持{MARKDOWN_COMMAND_MAX_CHARS}个字符",
+    )
+    img = await markdown_to_image(text, max_height=MARKDOWN_COMMAND_MAX_HEIGHT)
+    assert_and_reply(img is not None, "Markdown内容过长或格式异常，无法生成图片")
     return await ctx.asend_reply_msg(await get_image_cq(img))
 
 
 
 # 色卡
+def rgb_to_hsl_values(red: int, green: int, blue: int) -> tuple[int, int, int]:
+    """将 0-255 RGB 转为用于用户展示的 HSL 整数值。"""
+    hue, lightness, saturation = colorsys.rgb_to_hls(red / 255, green / 255, blue / 255)
+    return round(hue * 360), round(saturation * 100), round(lightness * 100)
+
+
 def color_card(color, additional_text=None):
     if sum(color) > 255 * 3 / 2:
         back_color = BLACK

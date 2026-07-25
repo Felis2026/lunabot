@@ -1,5 +1,15 @@
 image_list_clean_interval: 3600   # 图片列表清理间隔(s)
 multi_image_max_num: 64           # 多图操作输入最大数量
+cpp_binary_path: data/imgtool/imgtool-cpp
+cpp_timeout_seconds: 30
+
+# 独立限制重型图片任务，避免占满 Bot 共用线程池和内存。
+max_concurrent_jobs: 2
+max_queued_jobs: 4
+output_limits:
+  static_pixels: 1024*1024*16
+  animated_pixels: 1024*1024*32
+  max_frames: 100
 
 input_res_limit:  # 操作输入分辨率限制
   default: 1024*1024*32
@@ -7,10 +17,11 @@ input_res_limit:  # 操作输入分辨率限制
     floodfill: 1024*1024*32
     ai: 1024*1024
 
-color_pick_topk: 10                # 取色器topk数量
 
 video_to_gif:
   default_max_size: 256
   default_max_fps: 10
   default_max_frame_num: 200
   size_limit: 20.0  # MB
+  probe_timeout_seconds: 15
+  convert_timeout_seconds: 120

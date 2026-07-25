@@ -11,8 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <tuple>
-#include <cassert> 
 #include <cstring>
+#include <cerrno>
+#include <climits>
+#include <limits>
+#include <new>
 
 constexpr int dx[4] = {0, 0, -1, 1};
 constexpr int dy[4] = {-1, 1, 0, 0};
@@ -47,7 +50,6 @@ bool check_pos(int y, int x) {
 }
 
 void floodfill(int t, int sy, int sx, const Color& src, const Color& dst, int tolerance) {
-    assert(!dst.a);
     static std::vector<std::tuple<int, int>> stack;
     stack.clear();
     stack.emplace_back(sy, sx);
@@ -74,11 +76,41 @@ void floodfill(int t, int sy, int sx, const Color& src, const Color& dst, int to
     }
 }
 
+bool parse_int_arg(const char* value, int min_value, int max_value, int& output) {
+    if (!value || !*value) return false;
+    errno = 0;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+        return false;
+    }
+    output = static_cast<int>(parsed);
+    return true;
+}
+
+bool write_exact(FILE* file, const void* data, size_t item_size, size_t count) {
+    return std::fwrite(data, item_size, count, file) == count;
+}
+
 
 int main(int argc, char *argv[]) {
+    if (argc < 4) {
+        std::cerr << "[imgtool-cpp] usage: <input> <output> <command> [args...]" << std::endl;
+        return 2;
+    }
+
     std::string filename = argv[1];
     std::string outname = argv[2];
     std::string command = argv[3];
+
+    if ((command == "cutout" && argc != 5) || (command == "shrink" && argc != 6)) {
+        std::cerr << "[imgtool-cpp] invalid argument count for command: " << command << std::endl;
+        return 2;
+    }
+    if (command != "cutout" && command != "shrink") {
+        std::cerr << "[imgtool-cpp] unknown command: " << command << std::endl;
+        return 2;
+    }
     
     // 读取图片数据
     FILE *fp = fopen(filename.c_str(), "rb");
@@ -86,26 +118,53 @@ int main(int argc, char *argv[]) {
         std::cerr << "[imgtool-cpp] error opening file: " << filename << std::endl;
         return 1;
     }
-    fread(&n, sizeof(int), 1, fp);
-    fread(&h, sizeof(int), 1, fp);
-    fread(&w, sizeof(int), 1, fp);
-    long long size = n * h * w * sizeof(Color);
-    if (size > 1e9) {
-        std::cerr << "[imgtool-cpp] error: image size too large" << std::endl;
+    if (std::fread(&n, sizeof(int), 1, fp) != 1 ||
+        std::fread(&h, sizeof(int), 1, fp) != 1 ||
+        std::fread(&w, sizeof(int), 1, fp) != 1) {
+        std::cerr << "[imgtool-cpp] incomplete image header" << std::endl;
         fclose(fp);
         return 1;
     }
-    img = new Color[n * h * w];
-    auto read = fread(img, sizeof(Color), n * h * w, fp);
-    assert(read == n * h * w);
+
+    constexpr size_t max_input_bytes = 1'000'000'000;
+    if (n <= 0 || h <= 0 || w <= 0) {
+        std::cerr << "[imgtool-cpp] invalid image dimensions" << std::endl;
+        fclose(fp);
+        return 1;
+    }
+    const size_t frame_pixels = static_cast<size_t>(h) * static_cast<size_t>(w);
+    if (frame_pixels > max_input_bytes / sizeof(Color) ||
+        static_cast<size_t>(n) > max_input_bytes / sizeof(Color) / frame_pixels) {
+        std::cerr << "[imgtool-cpp] image size too large" << std::endl;
+        fclose(fp);
+        return 1;
+    }
+    const size_t pixel_count = static_cast<size_t>(n) * frame_pixels;
+    img = new (std::nothrow) Color[pixel_count];
+    if (!img) {
+        std::cerr << "[imgtool-cpp] unable to allocate image buffer" << std::endl;
+        fclose(fp);
+        return 1;
+    }
+    const size_t read_count = std::fread(img, sizeof(Color), pixel_count, fp);
     fclose(fp);
+    if (read_count != pixel_count) {
+        std::cerr << "[imgtool-cpp] incomplete image payload" << std::endl;
+        delete[] img;
+        return 1;
+    }
 
     // 返回的额外数据
     std::string extra_ret{};
 
     // cutout
     if (command == "cutout") {
-        int tolerance = atoi(argv[4]);
+        int tolerance = 0;
+        if (!parse_int_arg(argv[4], 0, 255, tolerance)) {
+            std::cerr << "[imgtool-cpp] invalid cutout tolerance" << std::endl;
+            delete[] img;
+            return 2;
+        }
         tolerance = (tolerance * tolerance) * 3;
 
         std::cerr << "[imgtool-cpp] start to cutout img (" << n << "x" << h << "x" << w << ")" << std::endl;
@@ -150,13 +209,19 @@ int main(int argc, char *argv[]) {
     }
     // shrink
     else if (command == "shrink") {
-        int alpha_threshold = atoi(argv[4]);
-        int edge = atoi(argv[5]);
+        int alpha_threshold = 0;
+        int edge = 0;
+        if (!parse_int_arg(argv[4], 0, 255, alpha_threshold) ||
+            !parse_int_arg(argv[5], 0, 100, edge)) {
+            std::cerr << "[imgtool-cpp] invalid shrink arguments" << std::endl;
+            delete[] img;
+            return 2;
+        }
         // 计算alpha>threshold的最小包围盒
         int x0 = w;
         int y0 = h;
-        int x1 = 0;
-        int y1 = 0;
+        int x1 = -1;
+        int y1 = -1;
         for (int t = 0; t < n; ++t) {
             for (int y = 0; y < h; ++y) {
                 for (int x = 0; x < w; ++x) {
@@ -171,36 +236,50 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        int nw = x1 - x0 + 1;
-        int nh = y1 - y0 + 1;
-        Color* new_img = new Color[n * (nh + 2 * edge) * (nw + 2 * edge)];
-        memset(new_img, 0, n * (nh + 2 * edge) * (nw + 2 * edge) * sizeof(Color));
-        
-        for (int t = 0; t < n; ++t) {
-            for (int y = 0; y < nh + 2 * edge; ++y) {
-                for (int x = 0; x < nw + 2 * edge; ++x) {
-                    int src_x = x0 + x - edge;
-                    int src_y = y0 + y - edge;
-                    if (src_x >= 0 && src_x < w && src_y >= 0 && src_y < h) {
-                        new_img[t * (nh + 2 * edge) * (nw + 2 * edge) + y * (nw + 2 * edge) + x] = get_color(t, src_y, src_x);
+        if (x1 >= x0 && y1 >= y0) {
+            const int nw = x1 - x0 + 1;
+            const int nh = y1 - y0 + 1;
+            const int out_w = nw + 2 * edge;
+            const int out_h = nh + 2 * edge;
+            const size_t output_pixels = static_cast<size_t>(n) * static_cast<size_t>(out_h) * static_cast<size_t>(out_w);
+            if (out_w <= 0 || out_h <= 0 || output_pixels > max_input_bytes / sizeof(Color)) {
+                std::cerr << "[imgtool-cpp] shrink output size too large" << std::endl;
+                delete[] img;
+                return 1;
+            }
+
+            Color* new_img = new (std::nothrow) Color[output_pixels];
+            if (!new_img) {
+                std::cerr << "[imgtool-cpp] unable to allocate shrink output" << std::endl;
+                delete[] img;
+                return 1;
+            }
+            std::memset(new_img, 0, output_pixels * sizeof(Color));
+
+            for (int t = 0; t < n; ++t) {
+                for (int y = 0; y < out_h; ++y) {
+                    for (int x = 0; x < out_w; ++x) {
+                        const int src_x = x0 + x - edge;
+                        const int src_y = y0 + y - edge;
+                        if (src_x >= 0 && src_x < w && src_y >= 0 && src_y < h) {
+                            new_img[t * out_h * out_w + y * out_w + x] = get_color(t, src_y, src_x);
+                        }
                     }
                 }
             }
-        }
-        h = nh + 2 * edge;
-        w = nw + 2 * edge;
-        delete[] img;
-        img = new_img;
+            h = out_h;
+            w = out_w;
+            delete[] img;
+            img = new_img;
 
-        // 返回json格式的bbox，返回图像对应原图坐标
-        int bx = x0 - edge;
-        int by = y0 - edge;
-        int bw = nw + 2 * edge;
-        int bh = nh + 2 * edge;
-        extra_ret = "{\"bbox\":[" + std::to_string(bx) + "," + std::to_string(by) + "," + std::to_string(bw) + "," + std::to_string(bh) + "]}";
-    }
-    else {
-        throw std::runtime_error("[imgtool-cpp] unknown command: " + command);
+            // bbox 允许为负数，用于表示向原图边界外扩展出的透明区域。
+            extra_ret = "{\"bbox\":[" + std::to_string(x0 - edge) + "," +
+                std::to_string(y0 - edge) + "," + std::to_string(out_w) + "," +
+                std::to_string(out_h) + "]}";
+        } else {
+            // 全透明图没有可裁剪区域，保留原始尺寸，避免生成异常的 0x0 图像。
+            extra_ret = "{\"bbox\":[0,0," + std::to_string(w) + "," + std::to_string(h) + "]}";
+        }
     }
 
     // 输出处理完毕的图像
@@ -210,18 +289,24 @@ int main(int argc, char *argv[]) {
         delete[] img;
         return 1;
     }
-    fwrite(&n, sizeof(int), 1, out_fp);
-    fwrite(&h, sizeof(int), 1, out_fp);
-    fwrite(&w, sizeof(int), 1, out_fp);
-    fwrite(img, sizeof(Color), n * h * w, out_fp);
+    const size_t output_pixel_count = static_cast<size_t>(n) * static_cast<size_t>(h) * static_cast<size_t>(w);
+    bool write_ok = write_exact(out_fp, &n, sizeof(int), 1) &&
+        write_exact(out_fp, &h, sizeof(int), 1) &&
+        write_exact(out_fp, &w, sizeof(int), 1) &&
+        write_exact(out_fp, img, sizeof(Color), output_pixel_count);
 
     // 输出额外数据
     int extra_ret_len = extra_ret.size();
-    fwrite(&extra_ret_len, sizeof(int), 1, out_fp);
-    if (extra_ret_len > 0) 
-        fwrite(extra_ret.data(), sizeof(char), extra_ret_len, out_fp);
+    write_ok = write_ok && write_exact(out_fp, &extra_ret_len, sizeof(int), 1);
+    if (extra_ret_len > 0) {
+        write_ok = write_ok && write_exact(out_fp, extra_ret.data(), sizeof(char), extra_ret_len);
+    }
 
     fclose(out_fp);
     delete[] img;
+    if (!write_ok) {
+        std::cerr << "[imgtool-cpp] incomplete output write" << std::endl;
+        return 1;
+    }
     return 0;
 }

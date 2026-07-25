@@ -37,9 +37,12 @@ import os.path as osp
 from os.path import join as pjoin
 from pathlib import Path
 from copy import deepcopy
+from html import escape as escape_html
 import traceback
+import binascii
 import orjson
 import yaml
+from urllib.parse import urlsplit
 from uuid import uuid4
 from dataclasses import dataclass, field, asdict
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -48,6 +51,7 @@ import base64
 import aiohttp
 import random
 import shutil
+import subprocess
 import re
 import math
 import io
@@ -1194,69 +1198,264 @@ async def download_and_convert_svg(svg_url: str) -> Image.Image:
             utils_logger.print_exc(f'下载SVG图片失败')
             return None 
 
-async def markdown_to_image(markdown_text: str, width: int = 600) -> Image.Image:
-    """
-    将markdown文本转换为图片
-    """
-    async with PlaywrightPage() as page: # WebDriver 返回 Playwright Page
-        css_content = Path("data/utils/m2i/m2i.css").read_text()
-        try:
-            import mistune
-            md_renderer = mistune.create_markdown()
-            html = md_renderer(markdown_text)
-            full_html = f"""
+# ================================ Markdown离线渲染 ================================ #
+# Markdown 内容可能来自普通群成员。浏览器必须保持离线，不能让用户通过图片地址
+# 访问 Docker 内网、宿主机服务或公网资源；允许的内嵌图片也要限制类型和体积。
+MARKDOWN_RENDER_TIMEOUT_MS = 10_000
+MARKDOWN_INLINE_IMAGE_MAX_BYTES = 256 * 1024
+MARKDOWN_INLINE_IMAGE_HEADERS = {
+    "data:image/png;base64",
+    "data:image/jpeg;base64",
+    "data:image/gif;base64",
+    "data:image/webp;base64",
+}
+
+
+def _is_safe_inline_markdown_image(url: str) -> bool:
+    """仅允许体积受限的常见位图 data URI，禁止 SVG 和所有网络地址。"""
+    try:
+        header, encoded_data = url.split(",", 1)
+        if header.lower() not in MARKDOWN_INLINE_IMAGE_HEADERS:
+            return False
+        decoded_data = base64.b64decode(encoded_data, validate=True)
+        return len(decoded_data) <= MARKDOWN_INLINE_IMAGE_MAX_BYTES
+    except (ValueError, TypeError, binascii.Error):
+        return False
+
+
+def _create_offline_markdown_parser():
+    """创建显式转义原始 HTML、拦截外部图片的 Markdown 解析器。"""
+    import mistune
+
+    class OfflineMarkdownRenderer(mistune.HTMLRenderer):
+        def image(self, text: str, url: str, title: Optional[str] = None) -> str:
+            if _is_safe_inline_markdown_image(url):
+                return super().image(text, url, title)
+
+            alt_text = escape_html(text.strip() if text else "未命名图片")
+            return (
+                '<span class="markdown-image-blocked">'
+                f'[外部图片已拦截：{alt_text}]'
+                '</span>'
+            )
+
+    return mistune.create_markdown(renderer=OfflineMarkdownRenderer(escape=True))
+
+
+async def _block_markdown_external_request(route) -> None:
+    """作为解析器和 CSP 之外的最后防线，拒绝浏览器发起任何外部请求。"""
+    request_url = route.request.url
+    parsed_url = urlsplit(request_url)
+    if parsed_url.scheme.lower() in {"about", "data"}:
+        await route.continue_()
+        return
+
+    utils_logger.warning(
+        "已阻止Markdown渲染访问外部资源: "
+        f"scheme={parsed_url.scheme or '-'} host={parsed_url.hostname or '-'}"
+    )
+    await route.abort("blockedbyclient")
+
+
+async def markdown_to_image(
+    markdown_text: str,
+    width: int = 600,
+    max_height: Optional[int] = None,
+) -> Optional[Image.Image]:
+    """在无网络权限的浏览器页面中将 Markdown 渲染为图片。"""
+    try:
+        css_content = Path("data/utils/m2i/m2i.css").read_text(encoding="utf-8")
+        markdown_parser = _create_offline_markdown_parser()
+        rendered_html = markdown_parser(markdown_text)
+        full_html = f"""
 <html>
-    <head><style>
-        {css_content}
-        .markdown-body {{
-            padding: 32px;
-        }}
-    </style></head>
-    <body class="markdown-body">{html}</body>
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
+        <style>
+            {css_content}
+            .markdown-body {{
+                padding: 32px;
+            }}
+            .markdown-image-blocked {{
+                color: #6b7280;
+                font-style: italic;
+            }}
+        </style>
+    </head>
+    <body class="markdown-body">{rendered_html}</body>
 </html>"""
 
-            with TempFilePath('html') as html_path:
-                with open(html_path, 'w', encoding='utf-8') as f:
-                    f.write(full_html)
-                
-                await page.goto(f"file://{osp.abspath(html_path)}", wait_until="load")
-                await page.set_viewport_size({"width": width, "height": 1})
-                
-                with TempFilePath('png') as img_path:
-                    await page.screenshot(path=img_path, full_page=True)
-                    return open_image(img_path)
+        async with PlaywrightPage() as page:
+            await page.route("**/*", _block_markdown_external_request)
+            await page.set_viewport_size({"width": width, "height": 1})
+            await page.set_content(
+                full_html,
+                wait_until="load",
+                timeout=MARKDOWN_RENDER_TIMEOUT_MS,
+            )
 
-        except Exception:
-            utils_logger.print_exc(f'markdown转图片失败')
-            return None
+            content_height = int(await page.evaluate(
+                "Math.ceil(Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))"
+            ))
+            if max_height is not None and content_height > max_height:
+                utils_logger.warning(
+                    f"Markdown渲染高度超限: height={content_height} max_height={max_height}"
+                )
+                return None
 
-def convert_video_to_gif(video_path: str, save_path: str, max_fps=10, max_size=256, max_frame_num=200):
-    """
-    将视频转换为GIF格式
-    """
+            with TempFilePath('png') as img_path:
+                await page.screenshot(path=img_path, full_page=True)
+                return open_image(img_path)
+
+    except Exception:
+        utils_logger.print_exc('markdown转图片失败')
+        return None
+
+def _parse_ffmpeg_rate(value: Any) -> Optional[float]:
+    """解析 ffprobe 的整数或分数字符串，0/0 等无效值返回 None。"""
+    try:
+        if isinstance(value, (int, float)):
+            rate = float(value)
+        else:
+            numerator, denominator = str(value).split('/', 1)
+            rate = float(numerator) / float(denominator)
+        return rate if math.isfinite(rate) and rate > 0 else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _run_media_command(command: List[str], timeout_seconds: int, action: str) -> subprocess.CompletedProcess:
+    """以无 Shell 方式运行媒体命令，并将超时和 stderr 转为可读异常。"""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{action}超过{timeout_seconds}秒，已终止") from exc
+    if result.returncode != 0:
+        error_text = (result.stderr or result.stdout or "未知错误").strip()
+        raise RuntimeError(f"{action}失败({result.returncode}): {error_text[:1000]}")
+    return result
+
+
+def convert_video_to_gif(
+    video_path: str,
+    save_path: str,
+    max_fps: int = 10,
+    max_size: int = 256,
+    max_frame_num: int = 200,
+    probe_timeout_seconds: int = 15,
+    convert_timeout_seconds: int = 120,
+    max_output_bytes: Optional[int] = 20 * 1024 * 1024,
+) -> dict:
+    """将视频转换为受尺寸、帧率、帧数和文件大小约束的 GIF。"""
+    if not 64 <= int(max_size) <= 1024:
+        raise ValueError("GIF最大尺寸只能在64-1024之间")
+    if not 1 <= int(max_fps) <= 30:
+        raise ValueError("GIF最大帧率只能在1-30之间")
+    if not 1 <= int(max_frame_num) <= 300:
+        raise ValueError("GIF最大帧数只能在1-300之间")
+
     utils_logger.info(f'转换视频为GIF: {video_path}')
-    probe = ffmpeg.probe(video_path)
-    video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
-    frame_num = int(video_stream['nb_frames'])
-    fps = float(video_stream['avg_frame_rate'].split('/')[0]) / float(video_stream['avg_frame_rate'].split('/')[1])
-    duration = frame_num / fps
-    max_fps = max(min(max_fps, int(max_frame_num / duration)), 1)
-    width, height = video_stream['width'], video_stream['height']
-    if width > height:
-        if width > max_size:
-            height = int(height * max_size / width)
-            width = max_size
-    else:
-        if height > max_size:
-            width = int(width * max_size / height)
-            height = max_size
+    probe_result = _run_media_command(
+        [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries',
+            'stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration,size',
+            '-of', 'json', video_path,
+        ],
+        int(probe_timeout_seconds),
+        '读取视频信息',
+    )
+    try:
+        probe = orjson.loads(probe_result.stdout)
+        stream = probe['streams'][0]
+        width = int(stream['width'])
+        height = int(stream['height'])
+    except (KeyError, IndexError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
+        raise RuntimeError("视频中没有可读取的视频流") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError("视频分辨率无效")
 
-    palette_stream = ffmpeg.input(video_path).filter_multi_output('split')[0].filter('palettegen')
-    video_stream = ffmpeg.input(video_path)
-    filtered_video_stream = video_stream.filter('fps', fps=fps).filter('scale', width=width, height=-1, flags='lanczos')
-    stream = ffmpeg.filter([filtered_video_stream, palette_stream], 'paletteuse')
-    stream = ffmpeg.output(stream, save_path)
-    ffmpeg.run(stream, overwrite_output=True, quiet=True)
+    source_fps = (
+        _parse_ffmpeg_rate(stream.get('avg_frame_rate'))
+        or _parse_ffmpeg_rate(stream.get('r_frame_rate'))
+    )
+    if source_fps is None:
+        raise RuntimeError("无法读取视频帧率")
+
+    duration = None
+    for value in (stream.get('duration'), probe.get('format', {}).get('duration')):
+        try:
+            parsed_duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed_duration) and parsed_duration > 0:
+            duration = parsed_duration
+            break
+    if duration is None:
+        try:
+            frame_count = int(stream.get('nb_frames'))
+            if frame_count > 0:
+                duration = frame_count / source_fps
+        except (TypeError, ValueError):
+            pass
+    if duration is None or duration <= 0:
+        raise RuntimeError("无法读取视频时长")
+
+    target_fps = min(float(max_fps), source_fps, float(max_frame_num) / duration)
+    if not math.isfinite(target_fps) or target_fps <= 0:
+        raise RuntimeError("无法计算有效的GIF帧率")
+
+    scale = min(1.0, float(max_size) / max(width, height))
+    target_width = max(1, int(width * scale))
+    target_height = max(1, int(height * scale))
+    filter_graph = (
+        f"[0:v]fps={target_fps:.8f},"
+        f"scale={target_width}:{target_height}:flags=lanczos,split[v0][v1];"
+        "[v0]palettegen=stats_mode=diff[p];"
+        "[v1][p]paletteuse=dither=sierra2_4a"
+    )
+
+    remove_file(save_path)
+    _run_media_command(
+        [
+            'ffmpeg', '-v', 'error', '-nostdin', '-y', '-i', video_path,
+            '-filter_complex', filter_graph,
+            '-frames:v', str(max_frame_num), '-loop', '0', save_path,
+        ],
+        int(convert_timeout_seconds),
+        '视频转GIF',
+    )
+    if not osp.isfile(save_path) or osp.getsize(save_path) <= 0:
+        raise RuntimeError("视频转GIF未生成有效文件")
+    output_bytes = osp.getsize(save_path)
+    if max_output_bytes is not None and output_bytes > max_output_bytes:
+        remove_file(save_path)
+        raise RuntimeError(f"生成的GIF超过大小限制（{max_output_bytes / 1024 / 1024:.1f}MB）")
+
+    with Image.open(save_path) as output_image:
+        output_frame_count = getattr(output_image, 'n_frames', 1)
+    if output_frame_count > max_frame_num:
+        remove_file(save_path)
+        raise RuntimeError("生成的GIF帧数超过限制")
+
+    result = {
+        'source_fps': source_fps,
+        'target_fps': target_fps,
+        'duration': duration,
+        'width': target_width,
+        'height': target_height,
+        'frame_count': output_frame_count,
+        'output_bytes': output_bytes,
+    }
+    utils_logger.info(f"视频转GIF完成: {result}")
+    return result
     
 def concat_images(images: List[Image.Image], mode) -> Image.Image:
     """
@@ -1309,13 +1508,20 @@ def concat_images(images: List[Image.Image], mode) -> Image.Image:
     else:
         raise Exception('concat mode must be v/h/g')
 
-def frames_to_gif(frames: List[Image.Image], duration: int = 100, alpha_threshold: float = 0.5) -> Image.Image:
-    """
-    将帧列表转换为透明GIF图像
-    """
-    with TempFilePath('gif') as path:
-        save_transparent_gif(frames, duration, path, alpha_threshold)
-        return open_image(path)
+def frames_to_gif(
+    frames: List[Image.Image],
+    duration: Union[int, List[int]] = 100,
+    alpha_threshold: float = 0.5,
+) -> Image.Image:
+    """将帧列表转换为透明 GIF，并让返回对象持有完整的内存字节流。"""
+    assert frames, "GIF帧列表不能为空"
+    buffer = io.BytesIO()
+    save_transparent_gif(frames, duration, buffer, alpha_threshold)
+    buffer.seek(0)
+    image = Image.open(buffer)
+    # Pillow 对动图采用惰性解码，必须让 BytesIO 至少与 Image 同生命周期。
+    image._imgtool_source_buffer = buffer
+    return image
 
 def save_video_first_frame(video_path: str, save_path: str):
     """
@@ -1333,51 +1539,85 @@ def get_image_pixels(image: Image.Image | list[Image.Image]) -> int:
     获取图片的像素数，动图按帧数计算
     """
     if isinstance(image, list):
-        return image[0].width * image[0].height * len(image)
+        return sum(get_image_pixels(item) for item in image)
     if is_animated(image):
         return image.width * image.height * image.n_frames
     return image.width * image.height
 
-def limit_image_by_pixels(image: Image.Image | list[Image.Image], max_pixels: int) -> Image.Image | list[Image.Image]:
+def limit_image_by_pixels(
+    image: Image.Image | list[Image.Image],
+    max_pixels: int,
+    allow_frame_drop: bool = True,
+) -> Image.Image | list[Image.Image]:
     """
-    根据最大像素数限制图片大小，输入可以是静态图、动图帧列表或动图对象
+    根据最大像素数限制图片大小。
+
+    帧列表可在 ``allow_frame_drop`` 为真时抽帧；多张彼此独立的图片必须传假，
+    此时只缩放、不删图，避免用户提交的图片被当作动画帧丢弃。
     """
-    n = None
-    if isinstance(image, list):
-        n = len(image)
-        w, h = image[0].width, image[0].height
-    else:
-        w, h = image.width, image.height
-        if is_animated(image):
-            n = image.n_frames
+    if max_pixels <= 0:
+        raise ValueError("最大像素数必须大于0")
     pixels = get_image_pixels(image)
     if pixels <= max_pixels:
         return image
-    if n is not None:
-        # 仅>=10帧时才考虑抽帧 >=64*64时才考虑缩放
-        old_n = n
-        use_n_scale = n >= 10   
-        use_wh_scale = w * h >= 64 * 64
-        if use_n_scale and use_wh_scale:
-            k = (pixels / max_pixels) ** (1 / 3)
-            step = math.ceil(k)
-            w, h = int(w / k), int(h / k)
-        elif use_n_scale:
-            k = (pixels / max_pixels)
-            step = math.ceil(k)
-        else:
-            k = (pixels / max_pixels) ** 0.5
-            step = 1
-            w, h = int(w / k), int(h / k)
-        if isinstance(image, Image.Image):
-            frames = [img.resize((w, h), Image.Resampling.LANCZOS) for i, img in enumerate(ImageSequence.Iterator(image)) if i % step == 0]
-            return frames_to_gif(frames, int(get_gif_duration(image) * old_n / len(frames)))
-        else:
-            return [img.resize((w, h), Image.Resampling.LANCZOS) for i, img in enumerate(image) if i % step == 0]
-    else:
-        k = (pixels / max_pixels) ** 0.5
-        w, h = int(w / k), int(h / k)
-        return image.resize((w, h), Image.Resampling.LANCZOS)
+
+    if isinstance(image, Image.Image) and is_animated(image):
+        frames, durations = get_gif_timeline(image)
+        frames, durations = limit_gif_timeline_by_pixels(
+            frames,
+            durations,
+            max_pixels,
+            allow_frame_drop=allow_frame_drop,
+        )
+        return frames_to_gif(frames, quantize_gif_durations(durations))
+
+    if isinstance(image, list):
+        if not image:
+            return image
+
+        if not allow_frame_drop and any(is_animated(item) for item in image):
+            # 列表项是彼此独立的图片，不能删掉整项；动图内部仍可按比例抽帧和缩放。
+            ratio = max_pixels / pixels
+            limited_items = []
+            for item in image:
+                item_pixels = get_image_pixels(item)
+                item_limit = max(1, int(item_pixels * ratio))
+                limited_items.append(limit_image_by_pixels(item, item_limit, allow_frame_drop=True))
+            if get_image_pixels(limited_items) > max_pixels:
+                raise ValueError("多张动图无法缩放到指定像素预算")
+            return limited_items
+
+        frames = image
+        if allow_frame_drop and len(frames) >= 10:
+            # 同时抽帧和缩放时采用立方根分摊，避免只牺牲某一维质量。
+            ratio = pixels / max_pixels
+            step = max(1, math.ceil(ratio ** (1 / 3)))
+            if len(frames) > max_pixels:
+                step = max(step, math.ceil(len(frames) / max_pixels))
+            frames = frames[::step]
+
+        remaining_pixels = get_image_pixels(frames)
+        if remaining_pixels <= max_pixels:
+            return frames
+        if max_pixels < len(frames):
+            raise ValueError("图片数量超过像素预算")
+
+        scale = math.sqrt(max_pixels / remaining_pixels)
+        resized = [
+            frame.resize(
+                (max(1, int(frame.width * scale)), max(1, int(frame.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            for frame in frames
+        ]
+        if get_image_pixels(resized) > max_pixels:
+            raise ValueError("图片无法缩放到指定像素预算")
+        return resized
+
+    scale = math.sqrt(max_pixels / pixels)
+    width = max(1, int(image.width * scale))
+    height = max(1, int(image.height * scale))
+    return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
 # ============================= 其他 ============================ #

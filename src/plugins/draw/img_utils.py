@@ -1,10 +1,12 @@
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Optional
 from collections import defaultdict
 from random import randrange
 from itertools import chain
+from bisect import bisect_right
 from PIL import Image, ImageSequence
 import numpy as np
 from pathlib import Path
+import math
 
 
 # ============================ 透明GIF处理 ============================ #
@@ -183,17 +185,196 @@ def is_animated(image: Union[str, Image.Image]) -> bool:
 
 def get_gif_duration(img: Image.Image) -> int:
     """
-    获取GIF的帧间隔
+    获取GIF首帧的帧间隔，并保持调用前的帧游标
     """
-    return img.info.get('duration', 50)
+    original_position = img.tell()
+    try:
+        img.seek(0)
+        return img.info.get('duration', 50)
+    finally:
+        try:
+            img.seek(original_position)
+        except (EOFError, ValueError):
+            img.seek(0)
 
 def gif_to_frames(img: Image.Image) -> List[Image.Image]:
     """
-    从GIF图像中提取所有帧
+    从GIF图像中提取所有帧，并保持调用前的帧游标
     """
-    return [frame.copy() for frame in ImageSequence.Iterator(img)]
+    frames, _ = get_gif_timeline(img)
+    return frames
 
-def save_transparent_gif(image_or_frames: Union[Image.Image, List[Image.Image]], duration: int, save_path: str, alpha_threshold: float = 0.5):
+
+# ================================ GIF时间轴 ================================ #
+# GIF 延时以 10ms 为单位保存。帧和延时必须始终一起变换，否则抽帧、倒放或倍速
+# 会丢失时间，表现为“又卡又快”。
+GIF_TIME_UNIT_MS = 10
+GIF_DEFAULT_FRAME_DURATION_MS = 50
+
+
+def _normalize_gif_duration(value, fallback: int = GIF_DEFAULT_FRAME_DURATION_MS) -> int:
+    """将缺失、零值或异常的 GIF 帧延时归一化为可编码的正整数。"""
+    try:
+        duration = int(value)
+    except (TypeError, ValueError):
+        duration = fallback
+    if duration <= 0:
+        duration = fallback
+    return duration
+
+
+def get_gif_timeline(img: Image.Image) -> Tuple[List[Image.Image], List[int]]:
+    """一次解码 GIF 的全部帧及逐帧延时，并恢复调用前的帧游标。"""
+    original_position = img.tell()
+    frames: List[Image.Image] = []
+    durations: List[int] = []
+    try:
+        img.seek(0)
+        fallback = _normalize_gif_duration(img.info.get('duration'))
+        for frame in ImageSequence.Iterator(img):
+            frames.append(frame.copy())
+            durations.append(_normalize_gif_duration(frame.info.get('duration'), fallback))
+    finally:
+        try:
+            img.seek(original_position)
+        except (EOFError, ValueError):
+            img.seek(0)
+    return frames, durations
+
+
+def quantize_gif_durations(
+    durations: List[Union[int, float]],
+    min_duration_ms: int = GIF_TIME_UNIT_MS,
+) -> List[int]:
+    """按 10ms 量化逐帧延时，同时尽量保持每帧比例和精确的总播放时长。"""
+    if not durations:
+        raise ValueError("GIF延时列表不能为空")
+    normalized = [max(0.0, float(duration)) for duration in durations]
+    min_ticks = max(1, math.ceil(min_duration_ms / GIF_TIME_UNIT_MS))
+    target_ticks = max(
+        min_ticks * len(normalized),
+        round(sum(normalized) / GIF_TIME_UNIT_MS),
+    )
+    remaining_ticks = target_ticks - min_ticks * len(normalized)
+
+    # 先保证每帧达到最小延时，再按超过下限的时长权重分配剩余 tick。累计取整会
+    # 把相同余数均匀散布到整段动画，避免长短帧集中在开头或结尾形成顿挫。
+    weights = [
+        max(0.0, duration - min_ticks * GIF_TIME_UNIT_MS)
+        for duration in normalized
+    ]
+    if sum(weights) <= 0:
+        weights = [1.0] * len(normalized)
+    total_weight = sum(weights)
+    allocated_ticks: List[int] = []
+    cumulative_weight = 0.0
+    assigned_extra = 0
+    for weight in weights:
+        cumulative_weight += weight
+        target_extra = round(cumulative_weight * remaining_ticks / total_weight)
+        extra = target_extra - assigned_extra
+        allocated_ticks.append(min_ticks + extra)
+        assigned_extra = target_extra
+
+    # 浮点累计的最终误差只可能出现在最后一项，在这里收口保证总时长严格一致。
+    allocated_ticks[-1] += target_ticks - sum(allocated_ticks)
+    return [ticks * GIF_TIME_UNIT_MS for ticks in allocated_ticks]
+
+
+def resample_gif_timeline(
+    frames: List[Image.Image],
+    durations: List[Union[int, float]],
+    target_frame_count: int,
+) -> Tuple[List[Image.Image], List[float]]:
+    """按播放时间等距选取代表帧；输出分段时长之和与输入时间轴完全一致。"""
+    if not frames or len(frames) != len(durations):
+        raise ValueError("GIF帧与延时数量不匹配")
+    if target_frame_count < 1:
+        raise ValueError("目标帧数必须大于0")
+    normalized = [max(0.001, float(duration)) for duration in durations]
+    if target_frame_count == len(frames):
+        return list(frames), normalized
+
+    cumulative_ends = []
+    total_duration = 0.0
+    for duration in normalized:
+        total_duration += duration
+        cumulative_ends.append(total_duration)
+
+    bin_duration = total_duration / target_frame_count
+    output_frames: List[Image.Image] = []
+    for index in range(target_frame_count):
+        sample_time = (index + 0.5) * bin_duration
+        source_index = min(len(frames) - 1, bisect_right(cumulative_ends, sample_time))
+        output_frames.append(frames[source_index].copy())
+    return output_frames, [bin_duration] * target_frame_count
+
+
+def limit_gif_timeline_by_pixels(
+    frames: List[Image.Image],
+    durations: List[Union[int, float]],
+    max_pixels: int,
+    max_frames: Optional[int] = None,
+    allow_frame_drop: bool = True,
+) -> Tuple[List[Image.Image], List[float]]:
+    """在保留总时长的前提下限制 GIF 帧数和总像素，必要时按时间抽帧并缩放。"""
+    if not frames or len(frames) != len(durations):
+        raise ValueError("GIF帧与延时数量不匹配")
+    if max_pixels <= 0:
+        raise ValueError("最大像素数必须大于0")
+
+    limited_frames = list(frames)
+    limited_durations = [float(duration) for duration in durations]
+    target_count = len(limited_frames)
+    if max_frames is not None:
+        target_count = min(target_count, max(1, int(max_frames)))
+    if target_count < len(limited_frames):
+        limited_frames, limited_durations = resample_gif_timeline(
+            limited_frames,
+            limited_durations,
+            target_count,
+        )
+
+    total_pixels = sum(frame.width * frame.height for frame in limited_frames)
+    if allow_frame_drop and len(limited_frames) >= 10 and total_pixels > max_pixels:
+        ratio = total_pixels / max_pixels
+        step = max(1, math.ceil(ratio ** (1 / 3)))
+        target_count = max(1, math.ceil(len(limited_frames) / step))
+        if target_count < len(limited_frames):
+            limited_frames, limited_durations = resample_gif_timeline(
+                limited_frames,
+                limited_durations,
+                target_count,
+            )
+            total_pixels = sum(frame.width * frame.height for frame in limited_frames)
+
+    if total_pixels <= max_pixels:
+        return limited_frames, limited_durations
+    if max_pixels < len(limited_frames):
+        raise ValueError("GIF帧数超过像素预算")
+
+    scale = math.sqrt(max_pixels / total_pixels)
+    resized = [
+        frame.resize(
+            (
+                max(1, int(frame.width * scale)),
+                max(1, int(frame.height * scale)),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        for frame in limited_frames
+    ]
+    if sum(frame.width * frame.height for frame in resized) > max_pixels:
+        raise ValueError("GIF无法缩放到指定像素预算")
+    return resized, limited_durations
+
+
+def save_transparent_gif(
+    image_or_frames: Union[Image.Image, List[Image.Image]],
+    duration: Union[int, List[int]],
+    save_path: str,
+    alpha_threshold: float = 0.5,
+):
     """
     从帧序列保存透明GIF
     """
