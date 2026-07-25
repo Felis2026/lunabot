@@ -1757,39 +1757,55 @@ class CutoutOperation(ImageOperation):
 抠图，使用方式:
 cutout: 使用洪水算法抠图（适合纯色背景），容差为默认20
 cutout 50: 使用洪水算法抠图，容差为50
-cutout ai: 使用AI模型抠图
+cutout ai: 使用AI模型抠图（当前服务器未启用）
 """.strip()
         
     def parse_args(self, args: List[str]) -> dict:
-        ret = {'method': 'floodfill', 'tolerance': 10 }
+        assert_and_reply(len(args) <= 2, "最多只支持两个参数")
+        ret = {'method': 'floodfill', 'tolerance': 20 }
+        method_seen = False
+        tolerance_seen = False
         for arg in args:
             if arg in ['floodfill', 'ai']:
+                assert_and_reply(not method_seen, "抠图算法只能指定一次")
                 ret['method'] = arg
+                method_seen = True
             elif arg.isdigit():
+                assert_and_reply(not tolerance_seen, "容差值只能指定一次")
                 ret['tolerance'] = int(arg)
                 assert_and_reply(0 <= ret['tolerance'] <= 255, "容差值只能在0-255之间（默认容差为20）")
+                tolerance_seen = True
+            else:
+                raise ValueError(f"未知参数 {arg}，仅支持 floodfill、ai 或 0-255 容差值")
+        assert_and_reply(not (ret['method'] == 'ai' and tolerance_seen), "AI抠图不接受容差参数")
         method_limit = {
             'floodfill': parse_cfg_num(config.get('input_res_limit.cutout.floodfill')),
             'ai': parse_cfg_num(config.get('input_res_limit.cutout.ai')),
         }
-        self.input_limit = method_limit.get(ret['method'], None)
+        ret['_input_limit'] = method_limit[ret['method']]
         return ret
     
     def operate(self, img: Image.Image, args: dict=None, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        if is_animated(img):
-            frames = gif_to_frames(img)
+        animated = is_animated(img)
+        if animated:
+            frames, durations = get_gif_timeline(img)
         else:
             frames = [img]
 
         if args['method'] == 'floodfill':
             frames = cutout_image(frames, args['tolerance']).image
         elif args['method'] == 'ai':
-            from rembg import remove
+            try:
+                from rembg import remove
+            except ImportError as exc:
+                raise ImageOperationUnavailableError(
+                    "AI抠图组件当前未安装，请使用非AI抠图：/img cutout"
+                ) from exc
             for i in range(len(frames)):
                 frames[i] = remove(frames[i])
 
-        if is_animated(img):
-            return frames_to_gif(frames, get_gif_duration(img))
+        if animated:
+            return frames_to_gif(frames, quantize_gif_durations(durations))
         else:
             return frames[0]
 
@@ -1873,6 +1889,70 @@ def register_all_ops():
             obj()
 register_all_ops()
 
+
+# ================================ 裸操作快捷指令 ================================ #
+# `/img` 始终是稳定入口；裸指令只提供快捷访问。若加载到此处时命令已被其他插件
+# 占用，则跳过该快捷方式，用户仍可使用 `/img <操作>`。
+DIRECT_IMAGE_OPERATION_RESERVED_COMMANDS = {"/gif"}
+
+
+def _build_direct_image_operation_map() -> dict[str, str]:
+    """生成可安全注册的“裸指令 -> 图片操作”映射，并避开已知命令冲突。"""
+    occupied_commands = {
+        command
+        for handler in CmdHandler.cmd_handlers
+        for command in handler.commands
+    }
+    operation_map = {}
+    for operation_name in ImageOperation.all_ops:
+        command = f"/{operation_name}"
+        if command in DIRECT_IMAGE_OPERATION_RESERVED_COMMANDS:
+            continue
+        if command in occupied_commands:
+            logger.warning(
+                f"跳过图片操作快捷指令 {command}：该命令已被其他处理器占用，"
+                f"请使用 /img {operation_name}"
+            )
+            continue
+        operation_map[command] = operation_name
+    return operation_map
+
+
+DIRECT_IMAGE_OPERATION_MAP = _build_direct_image_operation_map()
+direct_img_op = CmdHandler(
+    list(DIRECT_IMAGE_OPERATION_MAP),
+    logger,
+    priority=1,
+    disable_help=True,
+)
+direct_img_op.check_cdrate(cd).check_wblist(gbl)
+
+
+@direct_img_op.handle()
+async def _(ctx: HandlerContext):
+    operation_name = DIRECT_IMAGE_OPERATION_MAP.get(ctx.trigger_cmd)
+    assert_and_reply(
+        operation_name,
+        f"图片操作快捷指令 {ctx.trigger_cmd} 当前不可用，请改用 /img <操作>",
+    )
+    await run_image_operation(ctx, operation_name)
+
+
+@on_startup()
+def _warn_late_direct_image_operation_conflicts():
+    """启动时报告后加载插件造成的裸指令冲突，便于管理员改用稳定入口排查。"""
+    for command, operation_name in DIRECT_IMAGE_OPERATION_MAP.items():
+        registered_count = sum(
+            command in handler.commands
+            for handler in CmdHandler.cmd_handlers
+        )
+        if registered_count > 1:
+            logger.warning(
+                f"图片操作快捷指令 {command} 与其他插件冲突，"
+                f"如无法触发请使用 /img {operation_name}"
+            )
+
+
 # ============================= 其他逻辑 ============================= # 
 
 
@@ -1919,45 +1999,6 @@ async def _(ctx: HandlerContext):
                 msg += f"\n无法获取图片信息: {get_exc_desc(e)}"
 
     return await ctx.asend_fold_msg_adaptive(msg.strip())
-
-
-# 用pyzbar扫描图像中所有二维码，返回结果
-scan = CmdHandler(["/scan", "/扫描", "/识别"], logger)
-scan.check_cdrate(cd).check_wblist(gbl)
-@scan.handle()
-async def _(ctx: HandlerContext):
-    img = await get_reply_fst_image(ctx)
-    from pyzbar.pyzbar import decode
-    res = decode(img)
-    assert_and_reply(res, "未发现二维码")
-    msg = "\n".join([r.data.decode("utf-8") for r in res])
-    return await ctx.asend_reply_msg(f"共识别{len(res)}个条形码/二维码:\n{msg}")
-
-
-# 用qrcode生成二维码
-gen_qrcode = CmdHandler(['/qrcode', '/二维码'], logger)
-gen_qrcode.check_cdrate(cd).check_wblist(gbl)
-@gen_qrcode.handle()
-async def _(ctx: HandlerContext):
-    args = ctx.get_args().strip()
-    assert_and_reply(args, "请输入内容")
-    import qrcode
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(args)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    try:
-        tmp_path = create_parent_folder(f"data/imgtool/tmp/{rand_filename('png')}")
-        img.save(tmp_path)
-        img = Image.open(tmp_path)
-        return await ctx.asend_reply_msg(await get_image_cq(img))
-    finally:
-        remove_file(tmp_path)
 
 
 # ================================ 即时语录图布局 ================================ #
@@ -2314,50 +2355,14 @@ async def _(ctx: HandlerContext):
     
     return await ctx.asend_reply_msg(await get_image_cq(img))
 
-# 取色器
-color_picker = CmdHandler(['/pick', '/取色'], logger, priority=1)
-color_picker.check_cdrate(cd).check_wblist(gbl)
-@color_picker.handle()
-async def _(ctx: HandlerContext):
-    img = await get_reply_fst_image(ctx)
-    img = img.convert('RGB')
-    img = np.array(img)
-
-    args = ctx.get_args().strip()
-    top_k = config.get('color_pick_topk')
-    if args:
-        top_k = int(args)
-        assert_and_reply(1 <= top_k <= 20, "取色数量只能在1-20之间")
-
-    # K聚类提取主色
-    def k_means(arr: np.ndarray, k: int):
-        from sklearn.cluster import KMeans
-        arr = arr.reshape((-1, 3))
-        estimator = KMeans(n_clusters=k)
-        estimator.fit(arr)
-        centroids = estimator.cluster_centers_
-        labels = estimator.labels_
-        return centroids, labels
-    
-    # 获取topk主色
-    centroids, labels = await run_in_pool(k_means, img, top_k)  
-    colors = [tuple(int(c) for c in centroid) for centroid in centroids]
-    colors = sorted(colors, key=lambda c: sum(c))
-    colors = colors[:top_k]
-    
-    with Canvas(bg=FillBg((200, 200, 200, 255))) as canvas:
-        with Grid(col_count=5).set_item_align('c').set_content_align('c').set_sep(8):
-            for color in colors:
-                color_card(color).set_w(180)
-                
-    return await ctx.asend_reply_msg(await get_image_cq(await canvas.get_img()))
-
-
-# 视频转gif
-video_to_gif = CmdHandler(['/gif'], logger)
-video_to_gif.check_cdrate(cd).check_wblist(gbl)
-@video_to_gif.handle()
-async def _(ctx: HandlerContext):
+# ================================ GIF智能分流 ================================ #
+# `/gif` 同时承担静态图片格式转换和视频转 GIF。必须先按回复媒体类型分流，避免
+# 同名处理器依赖 NoneBot 优先级争抢命令；显式 `/img gif` 始终只处理图片。
+async def _convert_replied_video_to_gif(
+    ctx: HandlerContext,
+    video: dict,
+):
+    """解析视频参数、执行受限转换并发送 GIF，输入 video 为回复消息的视频段。"""
     parser = ctx.get_argparser()
     parser.add_argument('--max_size', '-s', type=int, default=config.get('video_to_gif.default_max_size'))
     parser.add_argument('--max_fps', '-f', type=int, default=config.get('video_to_gif.default_max_fps'))
@@ -2371,17 +2376,72 @@ async def _(ctx: HandlerContext):
     (回复一个视频) /gif
     (回复一个视频) /gif -s 512 -f 5 -n 100
     """.strip())
+    assert_and_reply(64 <= args.max_size <= 1024, "最大尺寸只能在64-1024之间")
+    assert_and_reply(1 <= args.max_fps <= 30, "最大帧率只能在1-30之间")
+    assert_and_reply(1 <= args.max_frame_num <= 300, "最大帧数只能在1-300之间")
 
-    reply_msg = ctx.get_reply_msg()
-    assert_and_reply(reply_msg, "请回复一条带有视频的消息")
-    cqs = extract_cq_code(reply_msg)
-    assert_and_reply('video' in cqs, "回复的消息中没有视频")
-    video = cqs['video'][0]
-    video_url = video['url']
-    filesize = int(video['file_size'])
+    filesize = int(video.get('file_size') or 0)
     size_limit = int(config.get('video_to_gif.size_limit') * 1024 * 1024)
-    assert_and_reply(filesize <= size_limit, "视频文件过大，无法处理")
-    async with TempBotOrInternetFilePath('video', video['file'], ctx.bot) as video_path:
-        with TempFilePath("gif") as gif_path:
-            await run_in_pool(convert_video_to_gif, video_path, gif_path, args.max_fps, args.max_size, args.max_frame_num)
-            return await ctx.asend_reply_msg(await get_image_cq(gif_path))
+    if filesize > 0:
+        assert_and_reply(filesize <= size_limit, "视频文件过大，无法处理")
+
+    await ctx.block(f"{ctx.user_id}", 5)
+    async with imgtool_job_slot():
+        async with TempBotOrInternetFilePath('video', video['file'], ctx.bot) as video_path:
+            assert_and_reply(os.path.isfile(video_path), "视频下载失败")
+            actual_size = os.path.getsize(video_path)
+            assert_and_reply(actual_size <= size_limit, "视频文件过大，无法处理")
+            with TempFilePath("gif") as gif_path:
+                try:
+                    await run_in_pool(
+                        convert_video_to_gif,
+                        video_path,
+                        gif_path,
+                        args.max_fps,
+                        args.max_size,
+                        args.max_frame_num,
+                        int(config.get('video_to_gif.probe_timeout_seconds', 15)),
+                        int(config.get('video_to_gif.convert_timeout_seconds', 120)),
+                        size_limit,
+                        pool=IMGTOOL_EXECUTOR,
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    raise ReplyException(str(exc)) from exc
+                return await ctx.asend_reply_msg(await get_image_cq(gif_path))
+
+
+gif_command = CmdHandler(['/gif'], logger)
+gif_command.check_cdrate(cd).check_wblist(gbl)
+
+
+async def _dispatch_gif_command(ctx: HandlerContext):
+    """根据直接输入或回复中的媒体类型，将 `/gif` 分派给图片或视频处理流程。"""
+    reply_msg = ctx.get_reply_msg() or []
+    replied_videos = extract_cq_code(reply_msg).get('video', [])
+    image_datas = await ctx.aget_image_datas(
+        min_count=None,
+        max_count=MULTI_IMAGE_MAX_NUM_CFG.get(),
+    )
+
+    assert_and_reply(
+        not (image_datas and replied_videos),
+        "回复内容同时包含图片和视频，请使用 /img gif 处理图片，或单独回复视频使用 /gif",
+    )
+    if image_datas:
+        return await run_image_operation(ctx, "gif")
+    if replied_videos:
+        return await _convert_replied_video_to_gif(ctx, replied_videos[0])
+
+    # 裸操作应与 `/img gif` 一致：没有直接输入时仍允许消费当前作用域的图片列表。
+    if await get_image_list(ctx):
+        return await run_image_operation(ctx, "gif")
+
+    raise ReplyException(
+        "请回复静态图片使用 /gif 转换图片格式，或回复视频使用 /gif 转换视频\n"
+        "图片操作也可以明确使用：/img gif"
+    )
+
+
+@gif_command.handle()
+async def _(ctx: HandlerContext):
+    return await _dispatch_gif_command(ctx)
