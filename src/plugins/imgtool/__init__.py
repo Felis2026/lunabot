@@ -901,8 +901,9 @@ gif 0.8 使用优化算法以80%不透明度阈值生成GIF
 
     def parse_args(self, args: List[str]) -> dict:
         ret = { 'opt': True, 'threshold': 0.5 }
-        if args:
-            if 'n' in args:
+        assert_and_reply(len(args) <= 1, "最多只支持一个参数")
+        if len(args) == 1:
+            if args[0] == 'n':
                 ret['opt'] = False
             else:
                 ret['threshold'] = float(args[0])
@@ -1001,9 +1002,9 @@ mirror v: 垂直镜像
 """.strip()
         
     def parse_args(self, args: List[str]) -> dict:
-        args = [arg[0].lower() for arg in args]
         assert_and_reply(len(args) <= 1, "最多只支持一个参数")
-        if 'v' in args:
+        assert_and_reply(not args or args == ['v'], "参数只能是 v（垂直镜像）")
+        if args == ['v']:
             return {'mode': 'v'}
         return {'mode': 'h'}
     
@@ -1038,9 +1039,57 @@ class BackOperation(ImageOperation):
         return None
     
     def operate(self, img: Image.Image, args: dict=None, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        frames = gif_to_frames(img)
+        frames, durations = get_gif_timeline(img)
         frames.reverse()
-        return frames_to_gif(frames, get_gif_duration(img))
+        durations.reverse()
+        return frames_to_gif(frames, quantize_gif_durations(durations))
+
+
+GIF_PLAYBACK_MIN_FRAME_DURATION_MS = 20
+
+
+def _build_speed_timeline(
+    frames: List[Image.Image],
+    durations: List[int],
+    args: dict,
+) -> tuple[List[Image.Image], List[int]]:
+    """应用一次倍速并按 GIF 时间精度重采样，保证输出总时长不被重复缩短。"""
+    if 'speed' in args:
+        desired_durations = [duration / args['speed'] for duration in durations]
+    else:
+        desired_durations = [float(args['duration'])] * len(frames)
+
+    target_duration = sum(desired_durations)
+    target_ticks = max(1, round(target_duration / GIF_TIME_UNIT_MS))
+    max_playable_frames = target_ticks // (
+        GIF_PLAYBACK_MIN_FRAME_DURATION_MS // GIF_TIME_UNIT_MS
+    )
+    target_frame_count = min(
+        len(frames),
+        ANIMATED_OUTPUT_MAX_FRAMES,
+        max_playable_frames,
+    )
+    if target_frame_count < 2:
+        if 'speed' in args:
+            max_rate = sum(durations) / (GIF_PLAYBACK_MIN_FRAME_DURATION_MS * 2)
+            raise ReplyException(f"加速倍率过大！该图像最多只能加速{max_rate:.2f}倍")
+        raise ReplyException("帧间隔过短，无法生成至少两帧的有效动图")
+
+    if target_frame_count < len(frames):
+        frames, desired_durations = resample_gif_timeline(
+            frames,
+            desired_durations,
+            target_frame_count,
+        )
+    quantized_durations = quantize_gif_durations(
+        desired_durations,
+        min_duration_ms=GIF_PLAYBACK_MIN_FRAME_DURATION_MS,
+    )
+    if args.get('back', False):
+        frames.reverse()
+        quantized_durations.reverse()
+    return frames, quantized_durations
+
 
 class SpeedOperation(ImageOperation):
     def __init__(self):
@@ -1070,33 +1119,9 @@ speed 100 设置动图帧间隔为100ms
         return ret
         
     def operate(self, img: Image.Image, args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        duration = img.info.get('duration')
-        if not duration: 
-            duration = 100
-        if 'speed' in args:
-            duration = duration / args['speed']
-        elif 'duration' in args:
-            duration = int(args['duration'])
-
-        # 抽帧
-        interval = 1
-        for i in range(1, 1000):
-            interval = i
-            if int(duration * interval) >= 20:
-                duration = int(duration * interval)
-                break
-        frame_num = img.n_frames
-        if frame_num / interval <= 1:
-            max_rate = img.info['duration'] / (20 / (frame_num - 1))
-            raise ReplyException(f"加速倍率过大！该图像最多只能加速{max_rate:.2f}倍")
-
-        frames = gif_to_frames(img)
-        new_frames = []
-        for i in range(0, frame_num, interval):
-            new_frames.append(frames[i])
-        if args.get('back', False):
-            new_frames.reverse()
-        return frames_to_gif(new_frames, duration)
+        frames, durations = get_gif_timeline(img)
+        frames, durations = _build_speed_timeline(frames, durations, args)
+        return frames_to_gif(frames, durations)
 
 
 class GrayOperation(ImageOperation):
@@ -1122,8 +1147,9 @@ mid v r: 下侧贴到上侧
 """.strip()
         
     def parse_args(self, args: List[str]) -> dict:
-        args = [arg[0].lower() for arg in args]
         assert_and_reply(len(args) <= 2, "最多只支持两个参数")
+        assert_and_reply(all(arg in {'v', 'r'} for arg in args), "参数只能是 v 或 r")
+        assert_and_reply(len(args) == len(set(args)), "参数不能重复")
         ret = {}
         if 'v' in args: ret['mode'] = 'v'
         else: ret['mode'] = 'h'
@@ -1134,29 +1160,33 @@ mid v r: 下侧贴到上侧
         width, height = img.size
         mode = args['mode']
         if mode == "h":
-            left_img = img.crop((0, 0, width // 2, height))
+            source_width = (width + 1) // 2
+            left_img = img.crop((0, 0, source_width, height))
             right_img = left_img.transpose(Image.FLIP_LEFT_RIGHT)
             new_img = Image.new("RGBA", (width, height))
             new_img.paste(left_img, (0, 0))
-            new_img.paste(right_img, (width // 2, 0))
+            new_img.paste(right_img, (width - source_width, 0))
         elif mode == "v":
-            top_img = img.crop((0, 0, width, height // 2))
+            source_height = (height + 1) // 2
+            top_img = img.crop((0, 0, width, source_height))
             bottom_img = top_img.transpose(Image.FLIP_TOP_BOTTOM)
             new_img = Image.new("RGBA", (width, height))
             new_img.paste(top_img, (0, 0))
-            new_img.paste(bottom_img, (0, height // 2))
+            new_img.paste(bottom_img, (0, height - source_height))
         elif mode == "hr":
-            right_img = img.crop((width // 2, 0, width, height))
+            source_width = (width + 1) // 2
+            right_img = img.crop((width - source_width, 0, width, height))
             left_img = right_img.transpose(Image.FLIP_LEFT_RIGHT)
             new_img = Image.new("RGBA", (width, height))
             new_img.paste(left_img, (0, 0))
-            new_img.paste(right_img, (width // 2, 0))
+            new_img.paste(right_img, (width - source_width, 0))
         else:
-            bottom_img = img.crop((0, height // 2, width, height))
+            source_height = (height + 1) // 2
+            bottom_img = img.crop((0, height - source_height, width, height))
             top_img = bottom_img.transpose(Image.FLIP_TOP_BOTTOM)
             new_img = Image.new("RGBA", (width, height))
             new_img.paste(top_img, (0, 0))
-            new_img.paste(bottom_img, (0, height // 2))
+            new_img.paste(bottom_img, (0, height - source_height))
         return new_img
 
 class InvertOperation(ImageOperation):
@@ -1209,6 +1239,105 @@ repeat 1 2: 只纵向重复2次
                 new_img.paste(img, (i * small_width, j * small_height), img)
         return new_img
 
+def _parse_motion_args(args: List[str], operation_name: str) -> dict:
+    """解析 fan/flow 共用参数，拒绝未知或重复的简写。"""
+    flags = {'r'} if operation_name == 'fan' else {'v', 'r'}
+    assert_and_reply(len(args) <= len(flags) + 1, "参数过多")
+    seen_flags = set()
+    speed = 1.0
+    speed_seen = False
+    for arg in args:
+        if arg in flags:
+            assert_and_reply(arg not in seen_flags, f"参数 {arg} 不能重复")
+            seen_flags.add(arg)
+        elif arg.endswith('x'):
+            assert_and_reply(not speed_seen, "速度参数只能指定一次")
+            speed = float(arg.removesuffix('x'))
+            speed_seen = True
+        else:
+            allowed = '、'.join(sorted(flags))
+            raise ValueError(f"未知参数 {arg}，仅支持 {allowed} 和速度倍率（如 2x）")
+    assert_and_reply(0.2 <= speed <= 5.0, "速度只能在0.2-5.0之间")
+    return {'flags': seen_flags, 'speed': speed}
+
+
+def _render_motion_effect(img: Image.Image, args: dict, effect: str) -> Image.Image:
+    """生成旋转或平移动图；输入为动图时同步保留原动画内容。"""
+    animated_source = is_animated(img)
+    effect_frame_count = max(4, math.ceil(20 / args['speed']))
+    if animated_source:
+        source_frames, source_durations = get_gif_timeline(img)
+        total_duration = sum(source_durations)
+        max_timeline_frames = max(2, round(total_duration / GIF_TIME_UNIT_MS))
+        frame_count = min(
+            ANIMATED_OUTPUT_MAX_FRAMES,
+            max_timeline_frames,
+            max(len(source_frames), effect_frame_count),
+        )
+        source_frames, output_durations = resample_gif_timeline(
+            source_frames,
+            source_durations,
+            frame_count,
+        )
+        output_durations = quantize_gif_durations(output_durations)
+    else:
+        frame_count = min(ANIMATED_OUTPUT_MAX_FRAMES, effect_frame_count)
+        source_frames = [img.copy() for _ in range(frame_count)]
+        output_durations = [GIF_PLAYBACK_MIN_FRAME_DURATION_MS] * frame_count
+
+    width, height = source_frames[0].size
+    safe_width, safe_height = _fit_uniform_size(
+        width,
+        height,
+        frame_count,
+        ANIMATED_OUTPUT_PIXEL_LIMIT,
+    )
+    if (safe_width, safe_height) != (width, height):
+        logger.info(
+            f"{effect}预计输出超限，输入已缩放 {width}x{height} -> {safe_width}x{safe_height}"
+        )
+    source_frames = [
+        frame.convert('RGBA').resize((safe_width, safe_height), Image.Resampling.LANCZOS)
+        for frame in source_frames
+    ]
+
+    output_frames = []
+    effect_cycle_ms = 400 / args['speed']
+    elapsed_ms = 0
+    for index, (source_frame, frame_duration) in enumerate(zip(source_frames, output_durations)):
+        sample_time_ms = elapsed_ms + frame_duration / 2
+        phase = (
+            (sample_time_ms / effect_cycle_ms) % 1.0
+            if animated_source
+            else index / frame_count
+        )
+        elapsed_ms += frame_duration
+
+        output = Image.new('RGBA', (safe_width, safe_height), (0, 0, 0, 0))
+        if effect == 'fan':
+            angle = 360 * phase
+            if 'r' not in args['flags']:
+                angle = -angle
+            rotated = source_frame.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
+            output.alpha_composite(rotated)
+        else:
+            vertical = 'v' in args['flags']
+            reverse = 'r' in args['flags']
+            distance = safe_height if vertical else safe_width
+            offset = int(phase * distance)
+            if reverse:
+                offset = distance - offset
+            if vertical:
+                output.alpha_composite(source_frame, (0, offset))
+                output.alpha_composite(source_frame, (0, offset - distance))
+            else:
+                output.alpha_composite(source_frame, (offset, 0))
+                output.alpha_composite(source_frame, (offset - distance, 0))
+        output_frames.append(output)
+
+    return frames_to_gif(output_frames, output_durations)
+
+
 class FanOperation(ImageOperation):
     def __init__(self):
         super().__init__("fan", ImageType.Any, ImageType.Animated, 'single')
@@ -1221,43 +1350,14 @@ fan r 0.5x: 逆时针旋转，旋转速度为0.5倍
 """
 
     def parse_args(self, args: List[str]) -> dict:
-        assert_and_reply(len(args) <= 2, "最多只支持两个参数")
-        ret = {}
-        if 'r' in args: ret['mode'] = 'ccw'
-        else: ret['mode'] = 'cw'
-        ret['speed'] = 1.0
-        for arg in args:
-            if arg.endswith('x'):
-                ret['speed'] = float(arg.removesuffix('x'))
-        assert_and_reply(0.2 <= ret['speed'] <= 5.0, "旋转速度只能在0.2-5.0之间")
-        return ret
+        return _parse_motion_args(args, 'fan')
     
     def operate(self, img: Image.Image, args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        img = img.convert('RGBA')
-        if image_type == ImageType.Animated:
-            img = img.crop((0, 0, img.width, img.height))
-        speed = args['speed']
-        frame_count = int(20 / speed)
-        width, height = img.size
-        frames = []
-        for i in range(frame_count):
-            new_img = Image.new("RGBA", (width, height))
-            angle = 360 / frame_count * i
-            if args['mode'] == "cw":
-                angle = -angle
-            rotated_img = img.copy().convert('RGBA').rotate(angle, expand=False)
-            new_img.paste(rotated_img, (0, 0), rotated_img)
-            frames.append(new_img)
-        try:
-            tmp_path = create_parent_folder(f"data/imgtool/tmp/{rand_filename('gif')}")
-            save_transparent_gif(frames, 20, tmp_path)
-            return Image.open(tmp_path)
-        finally:
-            remove_file(tmp_path)
+        return _render_motion_effect(img, args, 'fan')
 
 class FlowOperation(ImageOperation):
     def __init__(self):
-        super().__init__("flow", ImageType.Any, ImageType.Animated, 'batch')
+        super().__init__("flow", ImageType.Any, ImageType.Animated, 'single')
         self.help = """
 添加平移流动效果，使用方式:
 flow: 从左到右流动
@@ -1268,48 +1368,46 @@ flow 2x: 流动速度为2倍
 """
 
     def parse_args(self, args: List[str]) -> dict:
-        assert_and_reply(len(args) <= 3, "最多只支持三个参数")
-        ret = {}
-        if 'v' in args: ret['mode'] = 'v'
-        else: ret['mode'] = 'h'
-        if 'r' in args: ret['mode'] += 'r'
-        ret['speed'] = 1.0
-        for arg in args:
-            if arg.endswith('x'):
-                ret['speed'] = float(arg.removesuffix('x'))
-        assert_and_reply(0.2 <= ret['speed'] <= 5.0, "流动速度只能在0.2-5.0之间")
-        return ret
+        return _parse_motion_args(args, 'flow')
     
     def operate(self, img: Image.Image, args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        img = img.convert('RGBA')
-        if image_type == ImageType.Animated:
-            img = img.crop((0, 0, img.width, img.height))
-        speed = args['speed']
-        frame_count = int(20 / speed)
-        width, height = img.size
-        frames = []
-        mode = args['mode']
-        for i in range(frame_count):
-            new_img = Image.new("RGBA", (width, height))
-            if mode == "h":
-                new_img.paste(img, (int(i / frame_count * width), 0))
-                new_img.paste(img, (int(i / frame_count * width) - width, 0))
-            elif mode == "v":
-                new_img.paste(img, (0, int(i / frame_count * height)))
-                new_img.paste(img, (0, int(i / frame_count * height) - height))
-            elif mode == "hr":
-                new_img.paste(img, (int(width - i / frame_count * width), 0))
-                new_img.paste(img, (int(width - i / frame_count * width) - width, 0))
-            else:
-                new_img.paste(img, (0, int(height - i / frame_count * height)))
-                new_img.paste(img, (0, int(height - i / frame_count * height) - height))
-            frames.append(new_img)
-        try:
-            tmp_path = create_parent_folder(f"data/imgtool/tmp/{rand_filename('gif')}")
-            save_transparent_gif(frames, 20, tmp_path)
-            return Image.open(tmp_path)
-        finally:
-            remove_file(tmp_path)
+        return _render_motion_effect(img, args, 'flow')
+
+def _estimate_concat_dimensions(images: List[Image.Image], mode: str) -> tuple[int, int]:
+    """按 concat_images 的布局规则估算画布尺寸。"""
+    if mode == 'v':
+        width = max(image.width for image in images)
+        height = sum(max(1, int(image.height * width / image.width)) for image in images)
+        return width, height
+    if mode == 'h':
+        height = max(image.height for image in images)
+        width = sum(max(1, int(image.width * height / image.height)) for image in images)
+        return width, height
+
+    max_width = max(image.width for image in images)
+    max_height = max(image.height for image in images)
+    columns = max(1, int(math.sqrt(len(images))))
+    rows = math.ceil(len(images) / columns)
+    return max_width * columns, max_height * rows
+
+
+def _fit_concat_inputs(images: List[Image.Image], mode: str) -> List[Image.Image]:
+    """在创建拼接画布前缩放输入，避免先分配超大画布再补救。"""
+    fitted = images
+    for _ in range(4):
+        width, height = _estimate_concat_dimensions(fitted, mode)
+        if width * height <= STATIC_OUTPUT_PIXEL_LIMIT:
+            return fitted
+        scale = math.sqrt(STATIC_OUTPUT_PIXEL_LIMIT / (width * height)) * 0.995
+        fitted = [
+            image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            for image in fitted
+        ]
+    raise ReplyException("拼接后的图片尺寸过大，无法安全处理")
+
 
 class ConcatOperation(ImageOperation):
     def __init__(self):
@@ -1324,11 +1422,13 @@ concat g: 网格拼接
     def parse_args(self, args: List[str]) -> dict:
         assert_and_reply(len(args) <= 1, "最多只支持一个参数")
         ret = {'mode': 'v'}
-        if 'h' in args: ret['mode'] = 'h'
-        elif 'g' in args: ret['mode'] = 'g'
+        if args:
+            assert_and_reply(args[0] in {'v', 'h', 'g'}, "参数只能是 v、h 或 g")
+            ret['mode'] = args[0]
         return ret
     
     def operate(self, imgs: List[Image.Image], args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
+        imgs = _fit_concat_inputs(imgs, args['mode'])
         img = concat_images(imgs, args['mode'])
         return img
 
@@ -1352,18 +1452,15 @@ stack 10: 以fps为10堆叠
     def operate(self, imgs: List[Image.Image], args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
         fps = args['fps']
         frame_count = len(imgs)
+        assert_and_reply(frame_count <= ANIMATED_OUTPUT_MAX_FRAMES, f"最多只能堆叠{ANIMATED_OUTPUT_MAX_FRAMES}张图片")
         w, h = imgs[0].size
-        frames = []
-        for i in range(frame_count):
-            # resize to first frame size
-            img = imgs[i].resize((w, h))
-            frames.append(img)
-        try:
-            tmp_path = create_parent_folder(f"data/imgtool/tmp/{rand_filename('gif')}")
-            save_transparent_gif(frames, int(1000 / fps), tmp_path)
-            return Image.open(tmp_path)
-        finally:
-            remove_file(tmp_path)
+        w, h = _fit_uniform_size(w, h, frame_count, ANIMATED_OUTPUT_PIXEL_LIMIT)
+        frames = [img.resize((w, h), Image.Resampling.LANCZOS) for img in imgs]
+        durations = quantize_gif_durations(
+            [1000 / fps] * frame_count,
+            min_duration_ms=GIF_PLAYBACK_MIN_FRAME_DURATION_MS,
+        )
+        return frames_to_gif(frames, durations)
 
 class ExtractOperation(ImageOperation):
     def __init__(self):
@@ -1390,12 +1487,12 @@ extract 2: 以间隔2帧拆分
         if interval: 
             if interval >= n_frames:
                 raise ReplyException(f"拆分间隔过大！该动图最多只能以{n_frames}帧拆分")
-            frame_num = n_frames // interval
+            frame_num = math.ceil(n_frames / interval)
             if frame_num > max_frame_num:
-                min_interval = n_frames // max_frame_num
+                min_interval = math.ceil(n_frames / max_frame_num)
                 raise ReplyException(f"拆分间隔过小！该动图最多只能以{min_interval}帧拆分")
         else:
-            interval = max(1, n_frames // max_frame_num)
+            interval = max(1, math.ceil(n_frames / max_frame_num))
         return [frames[i] for i in range(0, n_frames, interval)]
 
 class MirageOperation(ImageOperation):
@@ -1409,8 +1506,9 @@ mirage r: 使用列表中倒数第一张图片作为表面图，倒数第二张�
         
     def parse_args(self, args: List[str]) -> dict:
         assert_and_reply(len(args) <= 1, "最多只支持一个参数")
+        assert_and_reply(not args or args == ['r'], "参数只能是 r（交换表图和底图）")
         ret = {'rev': False}
-        if 'r' in args: ret['rev'] = True
+        if args == ['r']: ret['rev'] = True
         return ret
     
     def operate(self, img: List[Image.Image], args: dict, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
@@ -1421,6 +1519,27 @@ mirage r: 使用列表中倒数第一张图片作为表面图，倒数第二张�
         else:
             surface = img[-2]
             hidden = img[-1]
+        target_width = max(surface.width, hidden.width)
+        target_height = max(
+            max(1, int(surface.height * target_width / surface.width)),
+            max(1, int(hidden.height * target_width / hidden.width)),
+        )
+        safe_width, safe_height = _fit_uniform_size(
+            target_width,
+            target_height,
+            1,
+            STATIC_OUTPUT_PIXEL_LIMIT,
+        )
+        if safe_width != target_width:
+            scale = safe_width / target_width
+            surface = surface.resize(
+                (max(1, int(surface.width * scale)), max(1, int(surface.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            hidden = hidden.resize(
+                (max(1, int(hidden.width * scale)), max(1, int(hidden.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
         return generate_mirage(surface, hidden)
 
 class BrightenOperation(ImageOperation):
@@ -1685,27 +1804,36 @@ shrink 10 +10: 裁剪透明部分，透明度阈值为10，并在裁剪区域外
 """.strip()
         
     def parse_args(self, args: List[str]) -> dict:
-        ret = {'alpha_threshold': 0, 'edge': 0 }
+        ret = {'alpha_threshold': 10, 'edge': 0 }
         assert_and_reply(len(args) <= 2, "最多只支持两个参数")
+        threshold_seen = False
+        edge_seen = False
         for arg in args:
-            if '+' in arg:
-                ret['edge'] = int(arg.replace('+', ''))
+            if arg.startswith('+') and arg[1:].isdigit():
+                assert_and_reply(not edge_seen, "扩展像素只能指定一次")
+                ret['edge'] = int(arg[1:])
                 assert_and_reply(0 <= ret['edge'] <= 100, "扩展像素只能在0-100之间")
+                edge_seen = True
             elif arg.isdigit():
+                assert_and_reply(not threshold_seen, "透明度阈值只能指定一次")
                 ret['alpha_threshold'] = int(arg)
-                assert_and_reply(0 <= ret['alpha_threshold'] <= 255, "透明度阈值只能在0-255之间（默认阈值为0）")
+                assert_and_reply(0 <= ret['alpha_threshold'] <= 255, "透明度阈值只能在0-255之间（默认阈值为10）")
+                threshold_seen = True
+            else:
+                raise ValueError(f"未知参数 {arg}，仅支持透明度阈值和 +扩展像素")
         return ret
     
     def operate(self, img: Image.Image, args: dict=None, image_type: ImageType=None, frame_idx: int=0, total_frame: int=1) -> Image.Image:
-        if is_animated(img):
-            frames = gif_to_frames(img)
+        animated = is_animated(img)
+        if animated:
+            frames, durations = get_gif_timeline(img)
         else:
             frames = [img]
 
         frames = shrink_image(frames, args['alpha_threshold'], args['edge']).image
 
-        if is_animated(img):
-            return frames_to_gif(frames, get_gif_duration(img))
+        if animated:
+            return frames_to_gif(frames, quantize_gif_durations(durations))
         else:
             return frames[0]
 
@@ -2119,8 +2247,7 @@ def color_card(color, additional_text=None):
         front_color = BLACK
 
     r, g, b = color
-    h, s, l = colorsys.rgb_to_hls(r/255, g/255, b/255)
-    h, s, l = int(h*360), int(s*100), int(l*100)
+    h, s, l = rgb_to_hsl_values(r, g, b)
 
     text_style = TextStyle(DEFAULT_FONT, 20, front_color)
 
@@ -2151,7 +2278,10 @@ async def _(ctx: HandlerContext):
         elif 'hsl' in args:
             args = args.replace('hsl', '').strip()
             h, s, l = args.split()
-            h, s, l = float(h) / 360, float(s) / 100, float(l) / 100
+            h = float(h) / 360
+            s = float(s.removesuffix('%')) / 100
+            l = float(l.removesuffix('%')) / 100
+            assert 0 <= h <= 1 and 0 <= s <= 1 and 0 <= l <= 1
             r, g, b = colorsys.hls_to_rgb(h, l, s)
             r, g, b = int(r*255), int(g*255), int(b*255)
         elif 'rgbf' in args:
