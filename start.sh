@@ -7,7 +7,7 @@ set -euo pipefail
 pids=()
 
 # 退出清理：无论脚本正常退出、收到中断还是某个子进程异常退出，
-# 都尽量停止已启动的其他服务，避免残留孤儿进程。
+# 都尽量停止已启动的其他服务，避免残留进程。
 cleanup() {
     local exit_code=$?
     trap - EXIT INT TERM
@@ -34,6 +34,19 @@ start_service() {
 
 # 统一注册退出清理钩子。
 trap cleanup EXIT INT TERM
+
+# ================================ ImgTool本地二进制 ================================ #
+# 仅在二进制缺失或源码更新时现场编译；编译失败不阻断 Bot，其余图片功能和
+# shrink 的 Python 兜底仍可使用，日志会明确提示 cutout 性能组件不可用。
+imgtool_source="src/scripts/imgtool.cpp"
+imgtool_compile_script="src/scripts/compile_imgtool_cpp.sh"
+imgtool_binary="data/imgtool/imgtool-cpp"
+if [ ! -x "$imgtool_binary" ] || [ "$imgtool_source" -nt "$imgtool_binary" ] || [ "$imgtool_compile_script" -nt "$imgtool_binary" ]; then
+    echo "正在编译 ImgTool 本地处理组件..."
+    if ! bash "$imgtool_compile_script"; then
+        echo "警告：ImgTool 本地处理组件编译失败，将使用可用的 Python 兜底功能"
+    fi
+fi
 
 # 1. 启动依赖的后台服务。
 start_service "Autochat 服务" python -m src.services.autochat.serve
