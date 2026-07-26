@@ -137,18 +137,30 @@ async def _(ctx: SekaiHandlerContext):
 class SekaiUserSubHelper:
     all_subs: List['SekaiUserSubHelper'] = []
 
-    def __init__(self, id: str, name: str, regions: List[str], related_group_sub: SekaiGroupSubHelper = None, only_one_group=False, hide=False):
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        regions: List[str],
+        related_group_sub: SekaiGroupSubHelper = None,
+        only_one_group=False,
+        hide=False,
+        region_storage_names: Dict[str, str] = None,
+    ):
         self.id = id
         self.name = name
         self.regions = regions
         self.related_group_sub = related_group_sub
         self.hide = hide
+        # 订阅键包含中文区服名；区服列表为子集时可显式传入映射，避免既有键错位。
+        if region_storage_names is None:
+            region_storage_names = dict(zip(regions, ALL_SERVER_REGION_NAMES))
         self.subs = {
             region: GroupUserSubHelper(
-                f"{name}({region_name})_用户",
+                f"{name}({region_storage_names[region]})_用户",
                 file_db,
                 logger,
-            ) for region, region_name in zip(regions, ALL_SERVER_REGION_NAMES)
+            ) for region in regions
         }
         self.only_one_group = only_one_group
         SekaiUserSubHelper.all_subs.append(self)

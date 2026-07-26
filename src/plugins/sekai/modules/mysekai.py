@@ -36,9 +36,17 @@ from ...imgtool import shrink_image
 # BD_MYSEKAI_REGIONS = ['cn', 'tw', 'kr']
 MYSEKAI_REGIONS = ['cn', 'jp']
 BD_MYSEKAI_REGIONS = ['cn']
+# 手动 MySekai 查询仍支持 CN/JP，但资源自动推送目前只开放 JP。
+MSR_SUB_REGIONS = ['jp']
 
 bd_msr_sub = SekaiGroupSubHelper("msr", "msr指令权限", BD_MYSEKAI_REGIONS)
-msr_sub = SekaiUserSubHelper("msr", "烤森资源查询自动推送", MYSEKAI_REGIONS, only_one_group=True)
+msr_sub = SekaiUserSubHelper(
+    "msr",
+    "烤森资源查询自动推送",
+    MSR_SUB_REGIONS,
+    only_one_group=True,
+    region_storage_names={region: get_region_name(region) for region in MSR_SUB_REGIONS},
+)
 
 class MsrIdNotMatchException(ReplyException):
     pass
@@ -2243,8 +2251,11 @@ pjsk_mysekai_photo.check_cdrate(cd).check_wblist(gbl)
 @pjsk_mysekai_photo.handle()
 async def _(ctx: SekaiHandlerContext):
     args = ctx.get_args().strip()
-    try: seq = int(args)
-    except: raise Exception("请输入正确的照片编号（从1或-1开始）")
+    try:
+        seq = int(args)
+    except ValueError:
+        raise ReplyException("请输入正确的照片编号（从1或-1开始）")
+    assert_and_reply(seq != 0, "照片编号不能为0，请从1或-1开始")
 
     photo, time = await get_mysekai_photo_and_time(ctx, ctx.user_id, seq)
     msg = await get_image_cq(photo) + f"拍摄时间: {time.strftime('%Y-%m-%d %H:%M')}"

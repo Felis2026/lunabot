@@ -5,7 +5,12 @@ from ..handler import *
 from ..asset import *
 from ..draw import *
 from ..sub import SekaiGroupSubHelper, SekaiUserSubHelper
-from .card_extractor import CardExtractor, CardExtractResult, CardThumbnail
+from .card_extractor import (
+    CardExtractor,
+    CardExtractResult,
+    CardGridDetectionError,
+    CardThumbnail,
+)
 from ..gameapi import get_gameapi_config, request_gameapi
 from .profile import (
     get_card_full_thumbnail, 
@@ -86,9 +91,9 @@ async def _(ctx: SekaiHandlerContext):
     global card_extractor
     bot, event = ctx.bot, ctx.event
     reply_msg = ctx.get_reply_msg()
-    assert_and_reply(reply_msg, f"请回复一张图片")
+    assert_and_reply(reply_msg, "请回复一张游戏内“角色 > 成员”卡牌一览截图")
     cqs = extract_cq_code(reply_msg)
-    assert_and_reply('image' in cqs, f"请回复一张图片")
+    assert_and_reply(cqs.get('image'), "回复消息中没有可读取的图片")
     img = await download_image(cqs['image'][0]['url'])
     
     if not card_extractor.is_initialized():
@@ -123,7 +128,15 @@ async def _(ctx: SekaiHandlerContext):
         logger.info(f"CardExtractor initialized in {datetime.now() - t} seconds")
     
     t = datetime.now()
-    result: CardExtractResult = await run_in_pool(card_extractor.extract_cards, img)
+    try:
+        result: CardExtractResult = await run_in_pool(card_extractor.extract_cards, img)
+    except CardGridDetectionError as e:
+        # 该识别器只支持卡牌一览的规则方格截图；对表情包、卡面或裁剪图应给出
+        # 可操作的提示，不能把底层网格检测异常直接暴露给用户。
+        raise ReplyException(
+            f"无法识别这张图片：{e}\n"
+            "请回复游戏内“角色 > 成员”的卡牌一览截图，保留完整方格并避免旋转、拼接或过度裁剪"
+        )
     logger.info(f"CardExtractor extracted {len(result.cards)} cards in {datetime.now() - t} seconds")
     
     with Canvas(bg=FillBg(WHITE)).set_padding(BG_PADDING) as canvas:

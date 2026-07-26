@@ -5,6 +5,11 @@ from typing import List, Optional, Dict, Any, Tuple, Union
 from PIL import Image, ImageDraw, ImageFont
 import math
 
+
+class CardGridDetectionError(ValueError):
+    """卡牌一览截图中无法重建有效网格时抛出的可展示业务异常。"""
+
+
 def _load_image(path: str) -> np.ndarray:
     img = Image.open(path).convert('RGB')
     img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -330,13 +335,17 @@ class CardExtractor:
         计算数据的均值，排除异常值，异常值定义为与参考值的偏差超过一定范围（lb, ub）的数据点
         """
         data = sorted(data)
+        if not data:
+            raise CardGridDetectionError("没有检测到可用于重建网格的卡牌边框")
         if ref_index is not None:
             ref_value = data[ref_index]
         elif ref_pos is not None:
-            ref_value = data[int(len(data) * ref_pos)]
+            ref_value = data[min(int(len(data) * ref_pos), len(data) - 1)]
         else:
             raise ValueError("Either ref_index or ref_pos must be provided.")
         filtered_data = [d for d in data if lb * ref_value <= d <= ub * ref_value]
+        if not filtered_data:
+            raise CardGridDetectionError("检测到的卡牌边框尺寸不一致，无法重建网格")
         ret = np.mean(filtered_data)
         if round:
             ret = int(np.round(ret))
@@ -361,9 +370,13 @@ class CardExtractor:
                 sep = abs(b1.center()[1] - b2.center()[1])
                 if sep > 10: seps.append(sep)
         sep = self._get_mean_excluding_abnormal(seps, ref_index=0, ub=1.5)
+        if sep <= 0:
+            raise CardGridDetectionError("检测到的卡牌间距无效，无法重建网格")
         
         rows = int(np.round((end_y - start_y) / sep)) + 1 
         cols = int(np.round((end_x - start_x) / sep)) + 1
+        if rows <= 0 or cols <= 0:
+            raise CardGridDetectionError("检测到的卡牌网格行列数无效")
 
         return Grid(
             start_x=start_x,
@@ -390,15 +403,26 @@ class CardExtractor:
         """
         每次从给定的bbox列表中随机选择一部分，重构网格，返回误差最小的网格
         """
+        if len(bboxes) < 2:
+            raise CardGridDetectionError("检测到的卡牌边框少于两个，无法识别卡牌一览截图")
+
         best_grid = None
         best_err = float('inf')
+        # 少量卡牌截图也至少选两个框；原实现会向 np.random.choice 传入 size=0，
+        # 最终在均值计算中触发难以理解的 IndexError。
+        sample_size = min(len(bboxes), max(2, int(len(bboxes) * choose_ratio)))
         for _ in range(sample_time):
-            selected_bboxes = np.random.choice(bboxes, size=int(len(bboxes) * choose_ratio), replace=False)
-            grid = self._reconstruct_gird_from_selected_bboxes(list(selected_bboxes))
-            err = self._calculate_grid_err(grid, bboxes)
+            selected_bboxes = np.random.choice(bboxes, size=sample_size, replace=False)
+            try:
+                grid = self._reconstruct_gird_from_selected_bboxes(list(selected_bboxes))
+                err = self._calculate_grid_err(grid, bboxes)
+            except CardGridDetectionError:
+                continue
             if err < best_err:
                 best_err = err
                 best_grid = grid
+        if best_grid is None:
+            raise CardGridDetectionError("无法从检测到的边框中重建稳定的卡牌网格")
         return best_grid
 
     def _reconstruct_grid(self, img: np.ndarray) -> Grid:
@@ -421,9 +445,13 @@ class CardExtractor:
                     bboxes.append(_BBox(x + shrink, y + shrink, w - shrink * 2, h - shrink * 2))
 
         # 过滤掉面积过小或过大的bbox
+        if not bboxes:
+            raise CardGridDetectionError("没有检测到卡牌边框")
         bboxes.sort(key=lambda x: x.area(), reverse=True)
         ref_area = bboxes[len(bboxes) // 2].area()
         bboxes = [bbox for bbox in bboxes if 0.75 * ref_area < bbox.area() < 1.5 * ref_area]
+        if len(bboxes) < 2:
+            raise CardGridDetectionError("有效卡牌边框少于两个")
 
         grid = self._reconstruct_grid_from_bbox(bboxes)
         grid.img = img
@@ -684,6 +712,8 @@ class CardExtractor:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         grid = self._reconstruct_grid(img)
+        if not grid.get_valid_indices():
+            raise CardGridDetectionError("已检测到网格，但没有找到有效卡牌缩略图")
         
         results: List[SingleCardExtractResult] = []
         for row_idx, col_idx in grid.get_valid_indices():

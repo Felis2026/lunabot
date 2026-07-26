@@ -3048,12 +3048,12 @@ async def _(ctx: SekaiHandlerContext):
 你的{get_region_name(ctx.region)}Suite数据获取模式: {cur_mode}
 ---
 使用\"{ctx.original_trigger_cmd} 模式名\"来切换模式，可用模式名如下:
-【default】
-自己查自己时先走Haruki工具箱，失败再回退Haruki Public-API（推荐）
+【default】（推荐）
+自己查自己时先走Haruki Oauth2，失败再回退Haruki Public-API
 【oauth】
-自己查自己时只走Haruki工具箱，不再回退Public-API
+自己查自己时只走Haruki Oauth2，不再回退Public-API
 【public】
-统一只走Haruki Public-API
+统一只走Haruki Public-API（数据可能被他人直接获取）
 """.strip()
 
     ats = ctx.get_at_qids()
