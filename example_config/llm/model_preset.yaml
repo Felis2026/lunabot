@@ -1,47 +1,94 @@
+# ================================ 预设总览 ================================ #
+# 当前“纯文本部署”只切换 text/tool 主链到 DeepSeek。
+# mm/image 相关预设保留原默认值，作为以后恢复多模态/图片功能时的回退参考。
+# 如果以后要恢复 example 默认思路，优先改这几处：
+# 1. `chat.private.text/tool` 改回 `&basic_chat_mm`
+# 2. `chat.group.text/tool` 改回 `&basic_chat_mm`
+# 3. 下面所有 `na:deepseek-v4-flash` 如需恢复成 `na:gemini-2.5-flash`，
+#    必须同步恢复 `config/llm/providers/new-api.yaml` 的上游地址和模型列表，
+#    否则只改预设名并不能生效。
+
+# ================================ 基础别名 ================================ #
+# 这里是“可复用别名”。
+# 后面写 `&basic_chat_text` / `&basic_chat_mm` 时，会在代码里自动展开成真实模型名。
+basic_chat_text: na:deepseek-v4-flash
 basic_chat_mm: gg:gemini-2.5-flash-thinking
 
-translation: 
+# ================================ 文本翻译 ================================ #
+# `translation`:
+# - 给纯文本翻译链路用
+# - 是“按顺序回退”的模型列表，前一个失败才会试后一个
+# `translator`:
+# - 给图片翻译流程里的 LLM 阶段用（OCR 后的合并/翻译/校对）
+# - 这里只接受单个默认模型
+translation:
+  - na:deepseek-v4-flash
   - gg:gemini-2.5-flash
-  - na:gemini-2.5-flash
   - ay:gemini-2.5-flash
 
 translator: gg:gemini-2.5-flash
 
+# ================================ Chat 默认预设 ================================ #
+# provider 前缀说明：
+# - `gg:` = google
+# - `na:` = new-api（当前实际接的是 DeepSeek 官方）
+# - `ay:` = ai-yyds
+# - `or:` = openrouter
 chat:
+  # 普通 `/chat` 在整理回复消息、转发消息时，用来概括图片内容的模型。
+  # 注意：这只影响 `/chat` 插件，不影响 `autochat.yaml` 里的图片摘要配置。
   image_caption: gg:gemini-2.5-flash-lite
 
+  # ================================ 私聊默认模型 ================================ #
+  # `text`: 普通纯文本聊天
+  # `mm`: 用户消息里带图片时使用的多模态模型
+  # `tool`: 命中工具触发词时使用的模型
+  # `image`: 命中“生成图片”等关键词时使用的出图模型
+  # text/tool: 纯文本部署当前默认走 DeepSeek
+  # mm/image: 保留原默认值，恢复多模态时无需重新查历史配置
   private:
-    text: "&basic_chat_mm"
+    text: "&basic_chat_text"
     mm: "&basic_chat_mm"
-    tool: "&basic_chat_mm"
+    tool: "&basic_chat_text"
     image: or:gemini-2.5-flash-image
-  
+
+  # ================================ 群聊默认模型 ================================ #
+  # text/tool: 纯文本部署当前默认走 DeepSeek
+  # mm/image: 保留原默认值，恢复多模态时无需重新查历史配置
   group:
-    text: "&basic_chat_mm"
+    text: "&basic_chat_text"
     mm: "&basic_chat_mm"
-    tool: "&basic_chat_mm"
+    tool: "&basic_chat_text"
     image: or:gemini-2.5-flash-image-free
 
-cron: 
+# ================================ Cron 提醒解析 ================================ #
+# `/cron` 在把自然语言提醒需求解析成调度参数时，会按这个列表依次尝试。
+# 这是“创建提醒时”用的，不是“提醒触发时”用的。
+cron:
+  - na:deepseek-v4-flash
   - gg:gemini-2.5-flash
-  - na:gemini-2.5-flash
   - ay:gemini-2.5-flash
   - or:gemini-2.5-flash
 
+# ================================ Sekai 相关 ================================ #
+# 这部分不影响本期纯文本 chat/autochat 主链，主要服务于 sekai 插件能力。
 sekai:
+  # 表情包抠图 / 贴纸裁切用的模型列表。
   stamp_cutout:
     - or:gemini-2.5-flash-image
     - or:gemini-2.5-flash-image
 
   story_summary:
-    event: 
+    # 活动剧情总结模型列表
+    event:
+      - na:deepseek-v4-flash
       - gg:gemini-2.5-flash
-      - na:gemini-2.5-flash
       - ay:gemini-2.5-flash
       - or:gemini-2.5-flash
-    card: 
+    # 卡牌剧情总结模型列表
+    card:
+      - na:deepseek-v4-flash
       - gg:gemini-2.5-flash
-      - na:gemini-2.5-flash
       - ay:gemini-2.5-flash
       - or:gemini-2.5-flash
 

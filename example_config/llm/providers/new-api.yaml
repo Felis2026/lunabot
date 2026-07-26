@@ -34,3 +34,11 @@ models:
 
   - name: "gpt-5-nano"
     is_multimodal: false
+
+  # DeepSeek V4 默认开启 thinking；普通文本和剧情 JSON 总结使用非思考模式。
+  - name: "deepseek-v4-flash"
+    model_id: "deepseek-v4-flash"
+    is_multimodal: false
+    extra_body:
+      thinking:
+        type: "disabled"

@@ -1,9 +1,46 @@
 from ..utils import *
 from openai import AsyncOpenAI
+from urllib.parse import urlparse
 
 
 logger = get_logger("Llm")
 file_db = get_file_db("data/llm/db.json", logger)
+
+
+# ================================ DeepSeek V4 兼容 ================================ #
+
+def _is_deepseek_official_base(base_url: str) -> bool:
+    """判断供应方是否直连 DeepSeek 官方接口。"""
+
+    try:
+        parsed = urlparse((base_url or "").strip())
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "api.deepseek.com"
+
+
+def _normalize_deepseek_model_config(model_config: dict, base_url: str) -> dict:
+    """将官方接口中的旧模型名迁移到 V4，并保持原来的思考模式语义。"""
+
+    normalized = dict(model_config)
+    if not _is_deepseek_official_base(base_url):
+        return normalized
+
+    model_id = str(normalized.get("model_id") or normalized.get("name") or "").strip().lower()
+    if model_id not in {"deepseek-chat", "deepseek-reasoner"}:
+        return normalized
+
+    extra_body = dict(normalized.get("extra_body") or {})
+    extra_body["thinking"] = {
+        "type": "disabled" if model_id == "deepseek-chat" else "enabled",
+    }
+    normalized["model_id"] = "deepseek-v4-flash"
+    normalized["extra_body"] = extra_body
+    logger.warning(
+        f"DeepSeek 官方接口旧模型名 {model_id} 已自动迁移为 deepseek-v4-flash；"
+        "请同步更新模型配置"
+    )
+    return normalized
 
 
 @dataclass
@@ -98,6 +135,10 @@ class ApiProvider:
                 d[k] = nums[0] / nums[1]
             self.models = []
             for model_config in self.config.get('models', []):
+                model_config = _normalize_deepseek_model_config(
+                    model_config,
+                    self.get_base_url(),
+                )
                 parse_price(model_config, 'input_pricing')
                 parse_price(model_config, 'output_pricing')
                 self.models.append(LlmModel(**model_config))
