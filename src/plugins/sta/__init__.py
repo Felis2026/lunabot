@@ -254,7 +254,7 @@ async def _(ctx: HandlerContext):
 
 # 添加停用词汇
 msgban = CmdHandler(["/sta_ban"], logger)
-msgadd.check_superuser().check_wblist(gbl)
+msgban.check_superuser().check_wblist(gbl)
 @msgban.handle()
 async def _(ctx: HandlerContext):
     words = ctx.get_args().strip().split()
@@ -308,4 +308,3 @@ async def _(ctx: HandlerContext):
         cancel_date[group_id] = datetime.now().strftime("%Y-%m-%d")
         file_db.set("cancel_date", cancel_date)
         return await ctx.asend_reply_msg(f'取消今天的统计自动发送')
- 

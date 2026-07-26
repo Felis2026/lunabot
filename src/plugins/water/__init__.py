@@ -298,7 +298,7 @@ async def _(ctx: HandlerContext):
         return await ctx.asend_reply_msg("关闭本群的自动水果检测")
 
 water_exclude = CmdHandler(['/water_exclude', '/watered_exclude', '/水果排除'], logger)
-water_exclude.check_group().check_wblist(gbl)
+water_exclude.check_group().check_wblist(gbl).check_superuser()
 @water_exclude.handle()
 async def _(ctx: HandlerContext):
     reply_msg = ctx.get_reply_msg()
@@ -318,7 +318,7 @@ async def _(ctx: HandlerContext):
 
         return await ctx.asend_reply_msg(ret.strip())
     else:
-        cqs = extract_cq_code(reply_msg)
+        cqs = extract_cq_code(ctx.get_msg())
         ats = cqs.get('at', [])
         assert_and_reply(ats, "请回复一条消息或者at用户")
 
