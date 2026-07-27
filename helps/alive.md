@@ -6,12 +6,13 @@
 
 ## 指令目录
 
-标记 🛠️ 的指令仅限超级管理使用
+标记 🛠️ 的指令可由群管理员以上操作本群
+标记 🔒 的指令仅限 SUPERUSER 使用
 
 - [快速测试状态](#快速测试状态)
 - [查看bot状态](#查看bot状态)
-- 🛠️ [关闭bot](#关闭bot)
-- 🛠️ [开启bot状态定时通知](#开启bot状态定时通知)
+- 🔒 [关闭bot](#关闭bot)
+- 🔒 [开启bot状态定时通知](#开启bot状态定时通知)
 
 ---
 
@@ -29,12 +30,12 @@
 
 
 ### 关闭bot
-🛠️ `/killbot`
+🔒 `/killbot`
 > 关闭bot
 
 
 ### 开启bot状态定时通知
-🛠️ `/status notify on` `/status notify off`
+🔒 `/status notify on` `/status notify off`
 > 开启或关闭群聊内bot状态通知   
 开启后每天固定时间将推送一次bot状态图   
 

@@ -138,12 +138,18 @@ def resolve_rollpig(ctx: HelpStatusContext) -> Optional[HelpStatusResult]:
     helper 只负责按插件暴露的 runtime 接口读取并展示。
     """
     try:
-        from src.private.nonebot_plugin_rollpig.runtime import (
+        from src.private.nonebot_plugin_rollpig_plus.runtime import (
             is_daily_summary_enabled,
             is_group_rollpig_enabled,
         )
     except Exception:
-        return None
+        try:
+            from src.private.nonebot_plugin_rollpig.runtime import (
+                is_daily_summary_enabled,
+                is_group_rollpig_enabled,
+            )
+        except Exception:
+            return None
 
     main_enabled = bool(is_group_rollpig_enabled(str(ctx.group_id)))
     return HelpStatusResult(main_enabled=main_enabled)

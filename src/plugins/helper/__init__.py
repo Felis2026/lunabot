@@ -55,6 +55,49 @@ HELP_IMG_SCALE = 0.8
 HELP_IMG_WIDTH = 600
 HELP_IMG_INTERSECT = 20
 
+
+# ================================ 帮助站路由 ================================ #
+# config/ 在运行环境中独立维护，代码默认值保证旧配置升级时不会生成 None 链接。
+DEFAULT_HELP_SITE_BASE_URL = "https://bot.felislab.cc"
+DEFAULT_HELP_SERVICE_ROUTES = {
+    "general": "/features/general",
+    "alive": "/features/alive",
+    "sekai": "/features",
+    "gallery-tag": "/features/gallery-tag",
+    "nekochat": "/features/nekochat",
+    "rollpig": "/features/rollpig",
+    "msxray": "/features/msxray",
+    "cron": "/features/cron",
+    "imgtool": "/features/imgtool",
+    "imgexp": "/features/imgexp",
+    "random": "/features/random",
+    "math": "/features/math",
+    "record": "/features/record",
+    "sta": "/features/sta",
+    "water": "/features/water",
+}
+
+HELP_SITE_BASE_URL = str(
+    config.get('site_base_url', DEFAULT_HELP_SITE_BASE_URL)
+).rstrip('/')
+HELP_SERVICE_ROUTES = {
+    **DEFAULT_HELP_SERVICE_ROUTES,
+    **(config.get('service_routes', {}) or {}),
+}
+
+
+def get_help_web_url(help_name: str) -> str:
+    """按服务名生成正式帮助页地址，未配置时安全回退到帮助站首页。"""
+    route = str(HELP_SERVICE_ROUTES.get(help_name, '')).strip()
+    if not route:
+        return f"{HELP_SITE_BASE_URL}/"
+    return f"{HELP_SITE_BASE_URL}/{route.lstrip('/')}"
+
+
+def format_help_image_reply(help_name: str, image_cq: str) -> str:
+    """将原有帮助图片与单条精确网页链接组合，避免额外拆分消息。"""
+    return f"{image_cq}\n网页版帮助：{get_help_web_url(help_name)}"
+
 help = CmdHandler(['/help', '/帮助'], logger, block=True)
 help.check_wblist(gbl).check_cdrate(cd)
 @help.handle()
@@ -108,6 +151,7 @@ async def _(ctx: HandlerContext):
         template = template.format(
             basic_service_list="\n".join(basic_lines).strip(),
             group_service_list="\n".join(group_lines).strip(),
+            site_url=f"{HELP_SITE_BASE_URL}/",
         )
         return await ctx.asend_fold_msg_adaptive(template.strip(), need_reply=False)
 
@@ -119,7 +163,8 @@ async def _(ctx: HandlerContext):
             cache_mtime = file_db.get('help_img_cache_mtime', {})
             cache_path = create_parent_folder(f"data/helper/cache/{args}.png")
             if Path(cache_path).exists() and doc_mtime <= cache_mtime.get(args, 0):
-                return await ctx.asend_reply_msg(await get_image_cq(cache_path, low_quality=True))
+                image_cq = await get_image_cq(cache_path, low_quality=True)
+                return await ctx.asend_reply_msg(format_help_image_reply(args, image_cq))
             else:
                 logger.info(f"缓存 {args} 帮助文档不存在或已过期，重新渲染")
                 doc_text = Path(doc_path).read_text(encoding='utf-8')
@@ -141,7 +186,8 @@ async def _(ctx: HandlerContext):
                 image.save(cache_path)
                 cache_mtime[args] = doc_mtime
                 file_db.set(f'help_img_cache_mtime', cache_mtime)
-                return await ctx.asend_reply_msg(await get_image_cq(image, low_quality=True))
+                image_cq = await get_image_cq(image, low_quality=True)
+                return await ctx.asend_reply_msg(format_help_image_reply(args, image_cq))
 
         except Exception as e:
             logger.print_exc(f"渲染 {doc_path} 帮助文档失败")
