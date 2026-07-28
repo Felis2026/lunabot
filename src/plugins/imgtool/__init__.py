@@ -548,8 +548,59 @@ class ImageOperation:
             assert_and_reply(output_matches(result), f"操作 {self.name} 返回了错误的图片类型")
 
         return _enforce_output_budget(result, self.name)
-            
-                
+
+
+# ================================ 中文操作别名 ================================ #
+# 英文名是内部协议和现有教程使用的稳定标识，不能直接改名；中文名只在指令解析层
+# 归一化为英文名，因此不会影响操作参数、处理链和底层 C++ 通信。
+IMAGE_OPERATION_CHINESE_NAMES: dict[str, str] = {
+    "gif": "转gif",
+    "png": "转png",
+    "resize": "缩放",
+    "mirror": "镜像",
+    "rotate": "旋转",
+    "back": "倒放",
+    "speed": "倍速",
+    "gray": "灰度",
+    "mid": "对称",
+    "invert": "反色",
+    "repeat": "重复",
+    "fan": "转动",
+    "flow": "流动",
+    "concat": "拼接",
+    "stack": "合成动图",
+    "extract": "抽帧",
+    "mirage": "幻影坦克",
+    "demirage": "还原幻影坦克",
+    "brighten": "亮度",
+    "contrast": "对比度",
+    "sharpen": "锐度",
+    "saturate": "饱和度",
+    "blur": "模糊",
+    "crop": "裁剪",
+    "cutout": "抠图",
+    "shrink": "裁剪透明",
+    "bg": "添加背景",
+}
+IMAGE_OPERATION_ALIAS_TO_NAME = {
+    alias: operation_name
+    for operation_name, alias in IMAGE_OPERATION_CHINESE_NAMES.items()
+}
+
+
+def resolve_image_operation_name(name: str) -> str:
+    """将中文操作名归一化为内部英文名；未知内容原样返回并继续作为参数解析。"""
+    return IMAGE_OPERATION_ALIAS_TO_NAME.get(name, name)
+
+
+def get_available_image_operation_names() -> str:
+    """生成同时包含英文名和中文名的用户可见操作清单。"""
+    return ", ".join(
+        f"{operation_name}({IMAGE_OPERATION_CHINESE_NAMES[operation_name]})"
+        for operation_name in ImageOperation.all_ops
+    )
+
+
 # 从回复消息获取第一张图片
 async def get_reply_fst_image(ctx: HandlerContext, return_url=False):
     img_url = await ctx.aget_image_urls(return_first=True)
@@ -758,30 +809,33 @@ async def operate_image(
     """解析并执行图片操作链；裸快捷指令通过 initial_operation 补回首个操作名。"""
     args = ctx.get_args().strip().split()
     all_op_names = ImageOperation.all_ops.keys()
+    available_operations = get_available_image_operation_names()
     if initial_operation is not None:
+        initial_operation = resolve_image_operation_name(initial_operation)
         assert_and_reply(
             initial_operation in all_op_names,
-            f"未知图片操作 {initial_operation}, 可用的操作: {', '.join(all_op_names)}",
+            f"未知图片操作 {initial_operation}, 可用的操作: {available_operations}",
         )
         args.insert(0, initial_operation)
     assert_and_reply(args, f"""
 操作序列不能为空！
 使用方式: (回复一张图片) /img 操作1 参数1 操作2 参数2 ...
-可用的操作: {', '.join(all_op_names)}
+可用的操作: {available_operations}
 使用 /img help 操作名 获取某个操作的帮助
 """.strip())
 
     # 获取操作和参数序列
     ops: List[Tuple[ImageOperation, List[str]]] = []
     for arg in args:
-        if arg in all_op_names:
-            ops.append((ImageOperation.all_ops[arg], []))
+        operation_name = resolve_image_operation_name(arg)
+        if operation_name in all_op_names:
+            ops.append((ImageOperation.all_ops[operation_name], []))
         else:
-            assert_and_reply(ops, f"未指定初始操作, 可用的操作: {', '.join(all_op_names)}")
+            assert_and_reply(ops, f"未指定初始操作, 可用的操作: {available_operations}")
             ops[-1][1].append(arg)
     logger.info(f"请求图片操作\"{args}\" 序列: {[(op.name, args) for op, args in ops]}")
 
-    assert_and_reply(ops, f"未指定操作, 可用的操作: {', '.join(all_op_names)}")
+    assert_and_reply(ops, f"未指定操作, 可用的操作: {available_operations}")
     assert_and_reply(len(ops) <= 10, f"操作过多, 最多支持10个操作")
 
     # 操作可对多图逐张批处理，声明类型无法完整表达这条动态链路。
@@ -877,12 +931,16 @@ img_help.check_cdrate(cd).check_wblist(gbl)
 @img_help.handle()
 async def _(ctx: HandlerContext):
     ops = ImageOperation.all_ops
-    op_name = ctx.get_args().strip()
-    assert_and_reply(op_name, f"请输入要查找帮助的操作名，可用的操作: {', '.join(ops.keys())}")
+    requested_name = ctx.get_args().strip()
+    available_operations = get_available_image_operation_names()
+    assert_and_reply(requested_name, f"请输入要查找帮助的操作名，可用的操作: {available_operations}")
+    op_name = resolve_image_operation_name(requested_name)
     op = ops.get(op_name)
-    assert_and_reply(op, f"未找到操作 {op_name}, 可用的操作: {', '.join(ops.keys())}")
-    msg = f"【{op.name}】\n"
+    assert_and_reply(op, f"未找到操作 {requested_name}, 可用的操作: {available_operations}")
+    chinese_name = IMAGE_OPERATION_CHINESE_NAMES[op.name]
+    msg = f"【{op.name} / {chinese_name}】\n"
     msg += f"{op.input_type} -> {op.output_type}\n"
+    msg += f"中文快捷指令: /{chinese_name}\n"
     msg += op.help
     return await ctx.asend_reply_msg(msg.strip())
 
@@ -1890,6 +1948,25 @@ def register_all_ops():
 register_all_ops()
 
 
+def _validate_image_operation_chinese_names():
+    """确保每个已注册操作恰好拥有一个中文名，避免新增操作时静默漏掉兼容入口。"""
+    operation_names = set(ImageOperation.all_ops)
+    alias_targets = set(IMAGE_OPERATION_CHINESE_NAMES)
+    if operation_names != alias_targets:
+        missing_aliases = sorted(operation_names - alias_targets)
+        unknown_operations = sorted(alias_targets - operation_names)
+        raise RuntimeError(
+            f"图片操作中文别名未同步，缺少别名: {missing_aliases}，"
+            f"不存在的操作: {unknown_operations}"
+        )
+    aliases = list(IMAGE_OPERATION_CHINESE_NAMES.values())
+    if len(aliases) != len(set(aliases)):
+        raise RuntimeError("图片操作中文别名不能重复")
+
+
+_validate_image_operation_chinese_names()
+
+
 # ================================ 裸操作快捷指令 ================================ #
 # `/img` 始终是稳定入口；裸指令只提供快捷访问。若加载到此处时命令已被其他插件
 # 占用，则跳过该快捷方式，用户仍可使用 `/img <操作>`。
@@ -1905,16 +1982,22 @@ def _build_direct_image_operation_map() -> dict[str, str]:
     }
     operation_map = {}
     for operation_name in ImageOperation.all_ops:
-        command = f"/{operation_name}"
-        if command in DIRECT_IMAGE_OPERATION_RESERVED_COMMANDS:
-            continue
-        if command in occupied_commands:
-            logger.warning(
-                f"跳过图片操作快捷指令 {command}：该命令已被其他处理器占用，"
-                f"请使用 /img {operation_name}"
-            )
-            continue
-        operation_map[command] = operation_name
+        shortcut_names = (
+            operation_name,
+            IMAGE_OPERATION_CHINESE_NAMES[operation_name],
+        )
+        for shortcut_name in shortcut_names:
+            command = f"/{shortcut_name}"
+            if command in DIRECT_IMAGE_OPERATION_RESERVED_COMMANDS:
+                continue
+            if command in occupied_commands:
+                logger.warning(
+                    f"跳过图片操作快捷指令 {command}：该命令已被其他处理器占用，"
+                    f"请使用 /img {shortcut_name}"
+                )
+                continue
+            operation_map[command] = operation_name
+            occupied_commands.add(command)
     return operation_map
 
 
