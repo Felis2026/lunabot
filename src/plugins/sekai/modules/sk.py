@@ -32,12 +32,95 @@ import matplotlib.dates as mdates
 import matplotlib.colors as mcolors
 import matplotlib
 import matplotlib.cm as cm
+from matplotlib import font_manager
 import numpy as np
 import subprocess
 
-FONT_NAME = "Source Han Sans CN"
+# ================================ Matplotlib中文字体 ================================ #
+# RTR 等曲线图由 Matplotlib 绘制，必须优先服从全局 font 配置。项目 data 字体
+# 只作为现有部署的兼容回退，不能成为公开部署正常显示中文的隐藏前提。
+MATPLOTLIB_CJK_FALLBACK_NAMES = (
+    "Source Han Sans CN",
+    "Microsoft YaHei",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+)
+
+
+def _register_matplotlib_font(font_path: str) -> Optional[str]:
+    """注册一个明确字体文件并返回其真实 family 名称；无效文件只记录警告。"""
+
+    if not font_path or not os.path.isfile(font_path):
+        return None
+    try:
+        font_manager.fontManager.addfont(font_path)
+        return font_manager.FontProperties(fname=font_path).get_name()
+    except Exception as exc:
+        logger.warning(
+            f"Matplotlib注册中文字体失败 path={font_path}: {get_exc_desc(exc)}"
+        )
+        return None
+
+
+def _configure_matplotlib_font() -> str:
+    """
+    按“全局字体文件、项目兼容字体、已安装字体名称”的顺序选择中文字体。
+
+    这里只影响 Matplotlib；Painter 使用的项目字体仍按原有逻辑加载。
+    """
+
+    configured_path = str(global_config.get("font.path", "") or "").strip()
+    configured_name = str(global_config.get("font.name", "") or "").strip()
+    if configured_path:
+        configured_path = os.path.abspath(
+            os.path.expandvars(os.path.expanduser(configured_path))
+        )
+
+    project_font_path = os.path.abspath(
+        os.path.join(FONT_DIR, f"{DEFAULT_FONT}.otf")
+    )
+    candidate_paths = list(dict.fromkeys(
+        path for path in (configured_path, project_font_path) if path
+    ))
+    for candidate_path in candidate_paths:
+        if font_name := _register_matplotlib_font(candidate_path):
+            logger.info(
+                f"Matplotlib中文字体已加载: {font_name} ({candidate_path})"
+            )
+            return font_name
+
+    # fontManager 已扫描系统字体目录；按不区分大小写的 family 名匹配真实名称。
+    available_names = {
+        entry.name.casefold(): entry.name
+        for entry in font_manager.fontManager.ttflist
+        if entry.name
+    }
+    candidate_names = list(dict.fromkeys(
+        name
+        for name in (configured_name, *MATPLOTLIB_CJK_FALLBACK_NAMES)
+        if name
+    ))
+    for candidate_name in candidate_names:
+        if actual_name := available_names.get(candidate_name.casefold()):
+            logger.info(f"Matplotlib使用已安装中文字体: {actual_name}")
+            return actual_name
+
+    logger.warning(
+        "未找到可用的Matplotlib中文字体，RTR等曲线图可能出现方块字；"
+        f"请检查 global.yaml 的 font.path/font.name（当前路径: "
+        f"{configured_path or '未配置'}）"
+    )
+    return configured_name or "sans-serif"
+
+
+FONT_NAME = _configure_matplotlib_font()
+
 plt.switch_backend('agg')
 matplotlib.rcParams['font.family'] = [FONT_NAME]
+matplotlib.rcParams['font.sans-serif'] = [
+    FONT_NAME,
+    *MATPLOTLIB_CJK_FALLBACK_NAMES,
+]
 matplotlib.rcParams['axes.unicode_minus'] = False  
 
 SK_RECORD_TOLERANCE_CFG = config.item("sk.record_interval_tolerance")
@@ -322,6 +405,44 @@ def get_board_score_str(score: int, width: int = None, precise: bool = True) -> 
         ret = ret.rjust(width)
     return ret
 
+# ================================ 榜线数字列对齐 ================================ #
+
+# 数字区按典型最大值居中，区内右对齐，使各行末尾的 w 落在同一竖线上。
+SKL_SCORE_ALIGNMENT_REFERENCE = "27200.8720w"
+SKP_SCORE_ALIGNMENT_REFERENCE = "13723.6678w"
+SPEED_ALIGNMENT_REFERENCES = {
+    "h": "145.3073w",
+    "d": "4765.7444w",
+}
+
+
+def add_aligned_board_number_cell(
+    text: str,
+    style: TextStyle,
+    bg: WidgetBg,
+    column_width: int,
+    height: int,
+    reference_text: str,
+):
+    """绘制视觉居中的固定数字区；必要时缩小超长文本以保住末尾对齐。"""
+    reference_width = min(
+        column_width,
+        int(get_text_width(get_font(style.font, style.size), reference_text)) + 3,
+    )
+    fitted_style = style
+    while (
+        fitted_style.size > 8
+        and get_text_width(get_font(fitted_style.font, fitted_style.size), text) > reference_width
+    ):
+        fitted_style = style.replace(size=fitted_style.size - 1)
+
+    with Frame().set_bg(bg).set_size((column_width, height)).set_content_align('c'):
+        TextBox(text, fitted_style, overflow='clip') \
+            .set_size((reference_width, height)) \
+            .set_content_align('c' if text in ('-', '?') else 'r') \
+            .set_padding((0, 0))
+
+
 # 获取榜线排名字符串
 def get_board_rank_str(rank: int) -> str:
     # 每3位加一个逗号
@@ -424,7 +545,9 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                     cur_text = "-"
                     if cur_rank := find_by_predicate(latest_rankings, lambda x: x.rank == rank):
                        cur_text = get_board_score_str(cur_rank.score)
-                    TextBox(cur_text, item_style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('r').set_padding((16, 0))
+                    add_aligned_board_number_cell(
+                        cur_text, item_style, bg, gw, gh, SKP_SCORE_ALIGNMENT_REFERENCE
+                    )
 
                     for source in sources.keys():
                         forecast_final = "-"
@@ -432,7 +555,9 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                             if rank_data := forecast.rank_data.get(rank, None):
                                 if rank_data.final_score is not None:
                                     forecast_final = get_board_score_str(rank_data.final_score)
-                        TextBox(forecast_final, item_style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('r').set_padding((16, 0))
+                        add_aligned_board_number_cell(
+                            forecast_final, item_style, bg, gw, gh, SKP_SCORE_ALIGNMENT_REFERENCE
+                        )
 
                 OUTDATE_COLOR = (200, 0, 0)
                 FROZEN_COLOR = (0, 100, 200)
@@ -527,10 +652,12 @@ async def compose_skl_image(ctx: SekaiHandlerContext, event: dict = None, full: 
                             r = get_board_rank_str(rank.rank)
                             score = get_board_score_str(rank.score)
                             rt = get_readable_datetime(rank.time, show_original_time=False, use_en_unit=False)
-                            TextBox(r,          item_style, overflow='clip').set_bg(bg).set_size((140, gh)).set_content_align('r').set_padding((16, 0))
+                            TextBox(r, item_style, overflow='clip').set_bg(bg).set_size((140, gh)).set_content_align('c').set_padding((0, 0))
                             # TextBox(rank.name,  item_style,                ).set_bg(bg).set_size((160, gh)).set_content_align('l').set_padding((8,  0))
-                            TextBox(score,      item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('r').set_padding((16, 0))
-                            TextBox(rt,         item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('r').set_padding((16, 0))
+                            add_aligned_board_number_cell(
+                                score, item_style, bg, 180, gh, SKL_SCORE_ALIGNMENT_REFERENCE
+                            )
+                            TextBox(rt, item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('c').set_padding((0, 0))
             else:
                 TextBox("暂无榜线数据", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=BLACK)).set_padding(32)
     
@@ -597,6 +724,9 @@ async def compose_sks_image(ctx: SekaiHandlerContext, unit: str, event: dict = N
                 bg2 = FillBg((255, 255, 255, 100))
                 title_style = TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK)
                 item_style  = TextStyle(font=DEFAULT_FONT,      size=20, color=BLACK)
+                speed_alignment_reference = SPEED_ALIGNMENT_REFERENCES.get(
+                    unit, SPEED_ALIGNMENT_REFERENCES["h"]
+                )
                 with VSplit().set_content_align('l').set_item_align('l').set_sep(8).set_padding(8):
                     
                     TextBox(f"近{get_readable_timedelta(period)}换算{unit_text}速", title_style).set_size((420, None)).set_padding((8, 8))
@@ -614,10 +744,14 @@ async def compose_sks_image(ctx: SekaiHandlerContext, unit: str, event: dict = N
                             speed = get_board_score_str(int(dscore * unit_period.total_seconds() / dtime)) if dtime > 0 else "-"
                             score = get_board_score_str(score)
                             rt = get_readable_datetime(rt, show_original_time=False, use_en_unit=False)
-                            TextBox(r,          item_style, overflow='clip').set_bg(bg).set_size((120, gh)).set_content_align('r').set_padding((16, 0))
-                            TextBox(score,      item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('r').set_padding((16, 0))
-                            TextBox(speed,      item_style,                ).set_bg(bg).set_size((140, gh)).set_content_align('r').set_padding((8,  0))
-                            TextBox(rt,         item_style, overflow='clip').set_bg(bg).set_size((160, gh)).set_content_align('r').set_padding((16, 0))
+                            TextBox(r, item_style, overflow='clip').set_bg(bg).set_size((120, gh)).set_content_align('c').set_padding((0, 0))
+                            add_aligned_board_number_cell(
+                                score, item_style, bg, 180, gh, SKL_SCORE_ALIGNMENT_REFERENCE
+                            )
+                            add_aligned_board_number_cell(
+                                speed, item_style, bg, 140, gh, speed_alignment_reference
+                            )
+                            TextBox(rt, item_style, overflow='clip').set_bg(bg).set_size((160, gh)).set_content_align('c').set_padding((0, 0))
             else:
                 TextBox("暂无时速数据", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=BLACK)).set_padding(32)
     
