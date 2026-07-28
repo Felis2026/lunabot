@@ -135,9 +135,10 @@ class ApiProvider:
                 d[k] = nums[0] / nums[1]
             self.models = []
             for model_config in self.config.get('models', []):
+                # DeepSeek 兼容只依赖可选的顶层 base_url；Google 等供应方使用不同配置结构，
                 model_config = _normalize_deepseek_model_config(
                     model_config,
-                    self.get_base_url(),
+                    self.config.get('base_url', ''),
                 )
                 parse_price(model_config, 'input_pricing')
                 parse_price(model_config, 'output_pricing')
