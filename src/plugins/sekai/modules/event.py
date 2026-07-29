@@ -215,6 +215,11 @@ async def get_wl_events(ctx: SekaiHandlerContext, event_id: int) -> List[dict]:
         wl_event['id'] = chapter['chapterNo'] * 1000 + event['id']
         wl_event['startAt'] = chapter['chapterStartAt']
         wl_event['aggregateAt'] = chapter['aggregateAt']
+        # 终线固化与终章解析都依赖章节自身的结束字段，不能只复制基础活动时间。
+        wl_event['chapterNo'] = chapter['chapterNo']
+        wl_event['chapterEndAt'] = chapter.get('chapterEndAt')
+        wl_event['worldBloomChapterType'] = chapter.get('worldBloomChapterType', 'game_character')
+        wl_event['isSupplemental'] = chapter.get('isSupplemental', False)
         wl_event['wl_cid'] = chapter.get('gameCharacterId', None)
         wl_events.append(wl_event)
     return sorted(wl_events, key=lambda x: x['startAt'])
@@ -410,29 +415,54 @@ async def compose_event_list_image(ctx: SekaiHandlerContext, filter: EventListFi
 
     return await canvas.get_img(cache_key=cache_key)
 
-# 根据"昵称箱数"（比如saki1）获取活动，不存在返回None
-async def get_event_by_ban_name(ctx: SekaiHandlerContext, ban_name: str) -> Optional[dict]:
-    idx = None
+# ================================ 箱活简称解析 ================================ #
+# 查询和跨服 fallback 必须复用同一套参数识别规则，避免仅凭异常文本把无效参数
+# 或 MasterData 故障误判成“国服缺少活动”。
+@dataclass(frozen=True)
+class BanEventQuery:
+    nickname: str
+    cid: int
+    index: int
+
+
+class BanEventQueryNoResult(ReplyException):
+    """表示箱活简称合法，但当前区服没有对应序号的活动。"""
+
+
+def parse_ban_event_query(ban_name: str) -> Optional[BanEventQuery]:
+    """解析“角色昵称 + 箱数”参数，不访问区服数据。"""
     for nickname, cid in get_character_nickname_data().nickname_ids:
         if nickname in ban_name:
             try:
-                idx = int(ban_name.replace(nickname, "", 1))
-                break
-            except: 
-                pass
-    if not idx: return None
-    assert_and_reply(idx >= 1, "箱数必须大于等于1")
+                index = int(ban_name.replace(nickname, "", 1))
+            except ValueError:
+                continue
+            if index == 0:
+                return None
+            return BanEventQuery(nickname=nickname, cid=cid, index=index)
+    return None
+
+
+# 根据"昵称箱数"（比如saki1）获取活动，不存在返回None
+async def get_event_by_ban_name(ctx: SekaiHandlerContext, ban_name: str) -> Optional[dict]:
+    query = parse_ban_event_query(ban_name)
+    if query is None:
+        return None
+
+    assert_and_reply(query.index >= 1, "箱数必须大于等于1")
     ban_event_id_set = await get_ban_events_id_set(ctx)
     events = []
     for eid in ban_event_id_set:
         event = await ctx.md.events.find_by_id(eid)
         banner_cid = await get_event_banner_chara_id(ctx, event)
-        if banner_cid == cid:
+        if banner_cid == query.cid:
             events.append(event)
-    assert_and_reply(events, f"角色{nickname}没有箱活")
-    assert_and_reply(idx <= len(events), f"角色{nickname}只有{len(events)}个箱活")
+    if not events:
+        raise BanEventQueryNoResult(f"角色{query.nickname}没有箱活")
+    if query.index > len(events):
+        raise BanEventQueryNoResult(f"角色{query.nickname}只有{len(events)}个箱活")
     events.sort(key=lambda x: x['startAt'])
-    return events[idx-1]
+    return events[query.index - 1]
                                 
 # 解析查单个活动参数，返回活动或抛出异常
 async def parse_search_single_event_args(ctx: SekaiHandlerContext, args: str, fallback: str="next_first") -> dict:
@@ -472,15 +502,21 @@ def should_try_single_event_jp_fallback(
     exc: Exception,
 ) -> bool:
     """
-    仅对明确的活动 ID 查询做国服 miss -> 日服补查。
+    仅对明确的活动 ID miss 或合法箱活简称无结果做国服 -> 日服补查。
     """
     if not ctx.can_fallback_to_jp():
         return False
-    if not args.isdigit():
-        return False
 
-    text = str(exc)
-    return f"活动{ctx.region.upper()}-" in text and "不存在" in text
+    if args.isdigit():
+        text = str(exc)
+        return f"活动{ctx.region.upper()}-" in text and "不存在" in text
+
+    ban_event_query = parse_ban_event_query(args)
+    return (
+        ban_event_query is not None
+        and ban_event_query.index >= 1
+        and isinstance(exc, BanEventQueryNoResult)
+    )
 
 
 async def parse_search_single_event_args_with_jp_fallback(

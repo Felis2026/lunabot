@@ -81,10 +81,24 @@ stamp:
 
 deck:
   servers:
-    - url: http://127.0.0.1:12345
-      weight: 4 # 负载均衡权重
-    - url: http://127.0.0.1:45678
-      weight: 8
+    # start.sh 启动的正式组卡服务默认监听 45556。
+    - url: http://127.0.0.1:45556
+      weight: 1 # 负载均衡权重
+
+  # CN Suite + JP 未来活动规则旁路预演。缺少本段时等价于 enabled: false。
+  cn_jp_preview:
+    enabled: false
+    allowed_event_types: [marathon, world_bloom]
+    # 空列表开放全部通过闭包与原生 canary 的活动；不会裁剪底层规则集。
+    event_allowlist: []
+    servers:
+      - url: http://127.0.0.1:45557
+        weight: 1
+    max_assumed_cards: 5
+    future_card_catalog:
+      enabled: true
+    # 多 Bot 副本只能有一个 builder_owner；其余节点只消费已发布规则集。
+    builder_owner: true
 
   music_meta_urls:
     - https://storage.sekai.best/sekai-best-assets/music_metas.json

@@ -3,7 +3,13 @@ from ..common import *
 from ..handler import *
 from ..asset import *
 from ..draw import *
-from .event import get_event_banner_img, get_current_event
+from .event import (
+    BanEventQueryNoResult,
+    get_event_banner_img,
+    get_current_event,
+    get_event_by_ban_name,
+    parse_ban_event_query,
+)
 from .sk import get_wl_events
 from .profile import (
     format_suite_missing_fields_error,
@@ -28,6 +34,41 @@ from .music import (
     LEADERBOARD_LIVETYPE_PLAY_INTERVAL,
 )
 from .mysekai import MYSEKAI_REGIONS
+from src.services.deck_recommender.masterdata_spec import (
+    get_deck_masterdata_specs,
+    get_native_package_build_id,
+    get_preview_expected_filenames,
+    validate_resolved_paths,
+)
+from .deck_preview.assumed_cards import (
+    AssumedCardsContext,
+    PreviewCardError,
+    inject_explicit_assumed_cards,
+    select_result_card_masterdata,
+    validate_preview_result_cards,
+)
+from .deck_preview.ruleset import (
+    validate_event_card_closure,
+    validate_world_bloom_support_tables,
+)
+from .deck_preview.protocol import PreviewEventResolution, PreviewStatus
+from .deck_preview.router import (
+    build_preview_guide,
+    choose_world_bloom_chapter,
+    extract_explicit_event_id,
+    extract_preview_keyword,
+    format_preview_result_title,
+    select_world_bloom_turn,
+)
+from .deck_preview.scheduler import preview_manager
+from .wl_args import (
+    extract_wl_chapter_selector,
+    extract_wl_role_selector,
+    extract_wl_turn_selector,
+    get_wl_simulation_max_turn,
+    normalize_wl_args,
+    remove_matched_text,
+)
 from sekai_deck_recommend_cpp import (
     DeckRecommendOptions, 
     DeckRecommendCardConfig, 
@@ -37,6 +78,11 @@ from sekai_deck_recommend_cpp import (
     RecommendDeck,
 )
 from hashlib import md5
+import json
+import time
+
+
+PREVIEW_CUTOVER_RETRY_SECONDS = 300
 
 
 BOOST_BONUS_DICT: Dict[int, int] = {
@@ -413,6 +459,21 @@ def extract_live_type(args: str, options: DeckRecommendOptions) -> str:
         options.live_type = "multi"
     return args.strip()
 
+# ================================ 活动组卡首参数箱活简称 ================================ #
+
+def get_leading_ban_event_token(args: str) -> Optional[str]:
+    """
+    获取位于剩余参数首位的箱活简称。
+
+    只允许首参数充当活动，避免连续歌曲简称的后者误认为第二个活动；
+    """
+    normalized_args = normalize_wl_args(args)
+    if not normalized_args:
+        return None
+    first_token = normalized_args.split(maxsplit=1)[0]
+    return first_token if parse_ban_event_query(first_token) is not None else None
+
+
 # 从args获取组卡目标活动（如果是wl则会同时返回cid）返回 (活动, cid, 剩余参数)
 async def extract_target_event(
     ctx: SekaiHandlerContext, 
@@ -421,6 +482,8 @@ async def extract_target_event(
     default_return_current: bool,
     raise_if_not_found: bool,
 ) -> Tuple[Optional[dict], Optional[int], str]:
+    args = normalize_wl_args(args)
+
     def assert_and_reply_or_return(condition: bool, msg: str):
         if raise_if_not_found:
             assert_and_reply(condition, msg)
@@ -444,19 +507,29 @@ async def extract_target_event(
     event_matched_texts: list[str] = []
     wl_matched_texts: list[str] = []
 
-    # 解析WL 章节序号或角色名
-    chapter_id, chapter_nickname = None, None
-    for i in range(1, 10):
-        if f"wl{i}" in args:
-            chapter_id = i
-            wl_matched_texts.append(f"wl{i}")
-            break
-        
-    for nickname, cid in get_character_nickname_data().nickname_ids:
-        if nickname in args:
-            chapter_nickname = nickname
-            wl_matched_texts.append(nickname)
-            break
+    # ================================ WL章节选择 ================================ #
+    # wl1/wl2 已统一为“第几次WL活动”；角色章节仍必须兼容原生的裸昵称语法
+    if turn_selector := extract_wl_turn_selector(args):
+        raise ReplyException(
+            f"`{turn_selector.matched_text}` 表示第{turn_selector.turn}次WL活动，"
+            "不能和具体活动ID一起当作章节使用；请改用“章节N”或“角色昵称”"
+        )
+
+    nickname_pairs = list(get_character_nickname_data().nickname_ids)
+    chapter_id, chapter_arg = extract_wl_chapter_selector(args)
+    chapter_nickname, role_arg = extract_wl_role_selector(
+        args,
+        [nickname for nickname, _ in nickname_pairs],
+        allow_bare=True,
+    )
+    assert_and_reply_or_return(
+        not (chapter_id and chapter_nickname),
+        "不能同时指定章节号和角色章节",
+    )
+    if chapter_arg:
+        wl_matched_texts.append(chapter_arg)
+    if role_arg:
+        wl_matched_texts.append(role_arg)
     
     # 解析活动id
     event_id = None
@@ -472,6 +545,14 @@ async def extract_target_event(
             event_matched_texts.append(full_match.group(0))
     if event_id is None and forced_event_id is not None:
         event_id = forced_event_id
+
+    # 没有明确活动 ID 时，才允许首参数箱活简称成为活动目标；后续同类文本
+    # 会保留给歌曲解析，例如“mnr5 mnr4”表示第五箱使用歌曲 mnr4。
+    if event_id is None:
+        if ban_event_token := get_leading_ban_event_token(args):
+            ban_event = await get_event_by_ban_name(ctx, ban_event_token)
+            event_id = ban_event["id"]
+            event_matched_texts.append(ban_event_token)
 
     if event_id == 0:
         event_id = None
@@ -523,7 +604,10 @@ async def extract_target_event(
                     end_time = datetime.fromtimestamp(chapter['aggregateAt'] / 1000 + 1)
                     if start_time <= datetime.now() <= end_time:
                         ok_chapters.append(chapter)
-                assert_and_reply_or_return(ok_chapters, f"请指定一个要查询的WL章节，例如\"event140 wl1\"或\"event140 miku\"")
+                assert_and_reply_or_return(
+                    ok_chapters,
+                    "请指定一个要查询的WL章节，例如“event140 章节1”或“event140 角色miku”",
+                )
                 ok_chapters.sort(key=lambda x: x['startAt'], reverse=True)
                 chapter = ok_chapters[0]
         elif chapter_id:
@@ -532,7 +616,10 @@ async def extract_target_event(
         else: 
             cid = get_cid_by_nickname(chapter_nickname)
             chapter = find_by(wl_events, "wl_cid", cid)
-            assert_and_reply_or_return(chapter, f"活动 {ctx.region}-{event['id']} 没有 {chapter_nickname} 的章节 ")
+            assert_and_reply_or_return(
+                chapter,
+                f"活动 {ctx.region}-{event['id']} 没有角色{chapter_nickname}的章节",
+            )
 
         wl_cid = chapter['wl_cid']
 
@@ -541,19 +628,275 @@ async def extract_target_event(
             # 终章不把昵称解释成“WL章节”，而是作为想冲的目标角色继续向下传递。
             wl_cid = get_cid_by_nickname(chapter_nickname)
             assert_and_reply_or_return(wl_cid, f"无法识别终章目标角色 {chapter_nickname}")
+        elif chapter_id:
+            assert_and_reply_or_return(
+                False,
+                f"活动 {ctx.region}-{event['id']} 不是WL活动，无法指定章节",
+            )
+        elif chapter_nickname and re.match(
+            r"(?i)^(?:角色|role)",
+            role_arg or "",
+        ):
+            # 显式“角色xx”是章节选择器；用于非 WL 活动时应给出明确错误。
+            assert_and_reply_or_return(
+                False,
+                f"活动 {ctx.region}-{event['id']} 不是WL活动，无法指定章节",
+            )
         else:
-            # 指定 wlx 的情况报错
-            assert_and_reply_or_return(not chapter_id, f"活动 {ctx.region}-{event['id']} 不是WL活动，无法指定章节")
-            # 指定角色昵称的情况不报错，直接忽略
+            # 原版会把普通活动中的裸角色昵称留给后续参数解析，不能提前吃掉。
             wl_matched_texts = []
 
     # 确认匹配到活动
     for text in event_matched_texts:
-        args = args.replace(text, "", 1).strip()
+        args = remove_matched_text(args, text)
     for text in wl_matched_texts:
-        args = args.replace(text, "", 1).strip()
+        args = remove_matched_text(args, text)
     
     return event, wl_cid, args
+
+
+# ================================ CN未来活动Preview解析 ================================ #
+
+async def extract_preview_target_event(
+    ctx: SekaiHandlerContext,
+    args: str,
+    options: DeckRecommendOptions,
+    *,
+    preview_requested: bool,
+    match_type: str,
+    command_kind: str,
+) -> tuple[str, Optional[PreviewEventResolution], bool]:
+    """
+    在原生活动解析前处理 CN clean miss。
+
+    返回 `(剩余参数, resolution, 是否已设置活动)`；玩家 Context 始终保持 CN，
+    只有规则活动、绘图素材来源和后端池通过 resolution 单独传递。
+    """
+
+    if ctx.region != "cn":
+        return args, None, False
+
+    args = normalize_wl_args(args)
+    event_id, event_matched_text = extract_explicit_event_id(
+        args,
+        match_type=match_type,
+    )
+    turn_selector = extract_wl_turn_selector(args)
+    jp_ctx = SekaiHandlerContext.from_region("jp")
+    selected_role_nickname: str | None = None
+    selected_role_cid: int | None = None
+    rule_event: dict | None = None
+    resolved_cn_event: dict | None = None
+    leading_ban_event_token: str | None = None
+
+    # ================================ 首参数箱活简称定位 ================================ #
+    # CN 有对应箱活时仍走原生组卡规则；仅 CN 缺失且 JP 存在时，才把解析出的
+    # JP 活动 ID 交给既有预览引导/预览路由。
+    if event_id is None:
+        leading_ban_event_token = get_leading_ban_event_token(args)
+        if leading_ban_event_token:
+            try:
+                resolved_cn_event = await get_event_by_ban_name(
+                    ctx,
+                    leading_ban_event_token,
+                )
+                event_id = resolved_cn_event["id"]
+            except BanEventQueryNoResult:
+                rule_event = await get_event_by_ban_name(
+                    jp_ctx,
+                    leading_ban_event_token,
+                )
+                event_id = rule_event["id"]
+            event_matched_text = leading_ban_event_token
+
+    # ================================ 第N次WL动态定位 ================================ #
+    if turn_selector and preview_requested:
+        assert_and_reply(
+            not turn_selector.force_simulated,
+            "“预览”和“模拟WL”不能同时使用；预览只读取 JP 已存在的真实活动规则",
+        )
+        assert_and_reply(
+            event_id is None,
+            "不能同时指定活动ID和第几次WL；具体活动请改用“章节N”或“角色昵称”",
+        )
+        nickname_pairs = list(get_character_nickname_data().nickname_ids)
+        selected_role_nickname, role_arg = extract_wl_role_selector(
+            args,
+            [nickname for nickname, _ in nickname_pairs],
+            allow_bare=True,
+        )
+        assert_and_reply(
+            selected_role_nickname,
+            f"第{turn_selector.turn}次WL预览还需要指定目标角色",
+        )
+        selected_role_cid = get_cid_by_nickname(selected_role_nickname)
+        assert_and_reply(
+            selected_role_cid is not None,
+            f"无法识别WL目标角色 {selected_role_nickname}",
+        )
+        try:
+            rule_event = select_world_bloom_turn(
+                await jp_ctx.md.events.get(),
+                await jp_ctx.md.world_blooms.get(),
+                character_id=selected_role_cid,
+                turn=turn_selector.turn,
+            )
+        except ValueError as exc:
+            raise ReplyException(str(exc)) from exc
+        event_id = rule_event["id"]
+        args = remove_matched_text(args, turn_selector.matched_text)
+        args = remove_matched_text(args, role_arg)
+        event_matched_text = None
+    elif preview_requested and event_id is None:
+        raise ReplyException(
+            "未来活动预览必须指定明确活动ID，或使用“第N次WL 角色名 预览”"
+        )
+    elif event_id is None:
+        return args, None, False
+
+    assert event_id is not None
+    cn_event = resolved_cn_event or await ctx.md.events.find_by_id(event_id)
+    native_args = args
+    if cn_event and leading_ban_event_token:
+        native_args = normalize_wl_args(
+            f"event{event_id} "
+            f"{remove_matched_text(args, leading_ban_event_token)}"
+        )
+    if not preview_manager.enabled():
+        # 关闭开关必须完整恢复原生组卡路径；粘性检测记录保留在磁盘，重新
+        # 启用后继续生效，但不能在关闭期间改变命令行为。
+        if preview_requested:
+            raise ReplyException("国服未来活动预览功能未启用")
+        return native_args, None, False
+
+    state = preview_manager.get_state()
+    known_preview_event = (
+        event_id in preview_manager.tracked_event_ids()
+    )
+
+    # ================================ CN正式数据优先 ================================ #
+    if cn_event:
+        if known_preview_event and not preview_manager.is_official_active(event_id):
+            preview_manager.mark_cn_detected(
+                event_id,
+                str(cn_event.get("eventType", "")),
+            )
+            raise ReplyException("国服活动数据正在同步，请稍后再试")
+        if selected_role_nickname:
+            # 第N次WL已经唯一定位到真实活动；改写成明确活动+角色后交回原生解析。
+            args = normalize_wl_args(
+                f"event{event_id} 角色{selected_role_nickname} {args}"
+            )
+        elif leading_ban_event_token:
+            args = native_args
+        return args, None, False
+    if (
+        preview_manager.is_official_active(event_id)
+        or preview_manager.is_cn_detected(event_id)
+    ):
+        # CN_DETECTED/OFFICIAL_ACTIVE 后即使 CN 缓存短暂回退，也绝不重新使用 JP 规则。
+        raise ReplyException("国服活动数据正在同步，请稍后再试")
+
+    rule_event = rule_event or await jp_ctx.md.events.find_by_id(event_id)
+    if not rule_event:
+        if preview_requested:
+            raise ReplyException(f"日服也不存在活动 #{event_id}，无法预览")
+        return args, None, False
+
+    event_type = rule_event.get("eventType")
+    if event_type not in {"marathon", "world_bloom"}:
+        if preview_requested:
+            raise ReplyException(
+                f"活动 #{event_id} 暂不支持预览；"
+                "目前仅支持普通活动和 World Link 活动"
+            )
+        return args, None, False
+    if not preview_manager.event_allowed_by_config(event_id, event_type):
+        if preview_requested:
+            raise ReplyException(f"活动 #{event_id} 暂未开放预览")
+        return args, None, False
+
+    if not preview_requested:
+        explicit_cn = str(ctx.original_trigger_cmd).lower().startswith("/cn")
+        raise ReplyException(build_preview_guide(
+            event_id,
+            explicit_cn=explicit_cn,
+            command_kind=command_kind,
+        ))
+
+    if state.status != PreviewStatus.READY:
+        preview_manager.wake()
+        if state.status == PreviewStatus.ERROR:
+            raise ReplyException("预览组卡暂时不可用，请稍后再试")
+        raise ReplyException("预览数据正在准备，请稍后再试")
+    if event_id not in set(state.manifest.get("event_ids", [])):
+        raise ReplyException(f"活动 #{event_id} 暂时无法预览，请稍后再试")
+
+    # ================================ Preview WL章节选择 ================================ #
+    wl_cid = None
+    chapter_arg = None
+    role_arg = None
+    if event_type == "world_bloom":
+        chapters = [
+            chapter
+            for chapter in await jp_ctx.md.world_blooms.get()
+            if chapter.get("eventId") == event_id
+        ]
+        chapter_no, chapter_arg = extract_wl_chapter_selector(args)
+        if selected_role_cid is None:
+            nickname_pairs = list(get_character_nickname_data().nickname_ids)
+            role_nickname, role_arg = extract_wl_role_selector(
+                args,
+                [nickname for nickname, _ in nickname_pairs],
+                # Preview 只替换活动规则来源，命令语法必须与原生 WL 组卡一致。
+                allow_bare=True,
+            )
+            selected_role_cid = (
+                get_cid_by_nickname(role_nickname)
+                if role_nickname
+                else None
+            )
+        assert_and_reply(
+            not (chapter_no and selected_role_cid),
+            "不能同时指定 WL 章节号和角色章节",
+        )
+        try:
+            chapter = choose_world_bloom_chapter(
+                chapters,
+                chapter_no=chapter_no,
+                character_id=selected_role_cid,
+            )
+        except ValueError as exc:
+            raise ReplyException(str(exc)) from exc
+        wl_cid = chapter["gameCharacterId"]
+    else:
+        chapter_no, chapter_arg = extract_wl_chapter_selector(args)
+        role_nickname, role_arg = extract_wl_role_selector(
+            args,
+            [nickname for nickname, _ in get_character_nickname_data().nickname_ids],
+            allow_bare=False,
+        )
+        assert_and_reply(
+            chapter_no is None and role_nickname is None,
+            f"活动 #{event_id} 不是 WL，不能指定章节",
+        )
+
+    for matched_text in (event_matched_text, chapter_arg, role_arg):
+        if matched_text:
+            args = remove_matched_text(args, matched_text)
+
+    options.event_id = event_id
+    options.world_bloom_character_id = wl_cid
+    resolution = PreviewEventResolution(
+        event_id=event_id,
+        event_type=event_type,
+        rule_event=rule_event,
+        world_bloom_character_id=wl_cid,
+        scope_fingerprint=state.scope_fingerprint,
+        future_card_ids=frozenset(preview_manager.future_card_ids()),
+    )
+    return args, resolution, True
+
 
 # 从args同时获取组卡目标活动或者指定属性&团模拟活动 直接修改options 返回剩余参数
 async def extract_target_event_or_simulate_event(
@@ -561,17 +904,7 @@ async def extract_target_event_or_simulate_event(
     args: str,
     options: DeckRecommendOptions,
 ) -> str:
-    force_simulated_wl = False
-    force_simulated_wl_turn = None
-    force_simulated_wl_match = re.search(r"(?:模拟|sim)\s*wl([12])", args)
-    if force_simulated_wl_match:
-        force_simulated_wl = True
-        force_simulated_wl_turn = int(force_simulated_wl_match.group(1))
-        args = (
-            args[:force_simulated_wl_match.start()]
-            + f" wl{force_simulated_wl_turn} "
-            + args[force_simulated_wl_match.end():]
-        ).strip()
+    args = normalize_wl_args(args)
 
     # ================================ 终章目标角色直通 ================================ #
     # 终章和普通 WL 不同，角色名表示“想冲的目标角色”，不是章节昵称。
@@ -589,127 +922,66 @@ async def extract_target_event_or_simulate_event(
                 options.world_bloom_character_id = cid
                 return args
 
-    # ================================ 优先命中真实WL活动 ================================ #
-    # 历史逻辑里，只要参数同时出现「wl1/wl2」和角色昵称，就会直接走模拟WL。
-    # 这会让当前正在进行的真实WL章节也被错误分流到 fake event，
-    # 从而漏掉真实活动的当期卡加成。
-    #
-    # 这里先尝试按“真实活动 + 章节/角色”解释；只有当前/指定活动无法命中WL章节时，
-    # 才回退到旧的模拟语义。这样能一次修正所有角色、所有团的同类问题。
-    wl_turn_hint = None
-    wl_nickname_hint = None
-    for turn in (1, 2):
-        if f"wl{turn}" in args:
-            wl_turn_hint = turn
-            break
-    if wl_turn_hint is not None:
-        for nickname, _ in get_character_nickname_data().nickname_ids:
-            if nickname in args:
-                wl_nickname_hint = nickname
-                break
-
-    if not force_simulated_wl and wl_turn_hint is not None and wl_nickname_hint is not None:
+    # ================================ WL活动轮次 ================================ #
+    # 真实轮次完全按 worldBlooms 中是否包含目标角色动态定位，VS 也不再依赖
+    # [140, 179] 这类会随第三轮实装失效的固定活动 ID。
+    if turn_selector := extract_wl_turn_selector(args):
+        args_without_turn = remove_matched_text(args, turn_selector.matched_text)
         explicit_event_match = (
-            re.search(r"(?:活动|event)(\d+)", args) or
-            re.search(r"(?:^|\s)(\d{1,3})(?=$|\s)", args)
+            re.search(r"(?:活动|event)\s*(\d+)", args_without_turn, re.IGNORECASE)
+            or re.search(r"(?:^|\s)(\d{1,3})(?=$|\s)", args_without_turn)
+        )
+        assert_and_reply(
+            not explicit_event_match,
+            "不能同时指定活动ID和第几次WL；具体活动的章节请使用“章节N”或“角色昵称”",
         )
 
-        async def resolve_real_wl_event() -> Optional[Tuple[dict, int, str]]:
-            if explicit_event_match:
-                # 这里的 wl1/wl2 是“第几轮WL”的口语缩写，不是章节号。
-                # 当用户已经显式给出活动ID且同时给了角色昵称时，优先按角色章节解析，
-                # 避免把 wl2 错当成 chapterNo=2。
-                explicit_args = args.replace(f"wl{wl_turn_hint}", "", 1).strip()
-                return await extract_target_event(
-                    ctx,
-                    explicit_args,
-                    match_type="all",
-                    default_return_current=True,
-                    raise_if_not_found=True,
+        nickname_pairs = list(get_character_nickname_data().nickname_ids)
+        wl_nickname, nickname_arg = extract_wl_role_selector(
+            args_without_turn,
+            [nickname for nickname, _ in nickname_pairs],
+            allow_bare=True,
+        )
+        assert_and_reply(
+            wl_nickname,
+            f"第{turn_selector.turn}次WL还需要指定目标角色，例如“第{turn_selector.turn}次WL ena”",
+        )
+        cid = get_cid_by_nickname(wl_nickname)
+        assert_and_reply(cid, f"无法识别WL目标角色 {wl_nickname}")
+        remaining_args = remove_matched_text(args_without_turn, nickname_arg)
+        unit = get_unit_by_chara_id(cid)
+
+        if not turn_selector.force_simulated:
+            try:
+                target_event = select_world_bloom_turn(
+                    await ctx.md.events.get(),
+                    await ctx.md.world_blooms.get(),
+                    character_id=cid,
+                    turn=turn_selector.turn,
+                )
+                options.event_id = target_event["id"]
+                options.world_bloom_character_id = cid
+                return remaining_args
+            except ValueError:
+                raise ReplyException(
+                    f"找不到{get_region_name(ctx.region)}已实装的第"
+                    f"{turn_selector.turn}次WL（角色{wl_nickname}）；"
+                    f"如需强制模拟请使用“模拟WL{turn_selector.turn} {wl_nickname}”"
                 )
 
-            cid = get_cid_by_nickname(wl_nickname_hint)
-            if not cid:
-                return None
-            unit = get_unit_by_chara_id(cid)
-            now = datetime.now()
-
-            # ================================ VS真实WL特殊映射 ================================ #
-            # CN 的 VS 第二轮WL（event179）在 MasterData 里 unit=none，
-            # 不能沿用“按团(unit)筛活动”的真人团逻辑。
-            # 当前先只把用户明确提到的 wl2 + VS角色 映射到真实179；
-            # wl1 仍保持旧的模拟WL语义，避免在缺失真实首轮映射时误导用户。
-            if unit == "piapro":
-                if wl_turn_hint != 2:
-                    return None
-                event_179 = await ctx.md.events.find_by_id(179)
-                if not (event_179 and event_179.get('eventType') == 'world_bloom'):
-                    return None
-                target_event = event_179
-            else:
-                unit_events = [
-                    event for event in await ctx.md.events.get()
-                    if event.get('eventType') == 'world_bloom' and event.get('unit') == unit
-                ]
-                unit_events.sort(key=lambda x: x['startAt'])
-                if wl_turn_hint > len(unit_events):
-                    return None
-                target_event = unit_events[wl_turn_hint - 1]
-
-            chapter_candidates: list[tuple[tuple[int, int], int]] = []
-            for chapter in await get_wl_events(ctx, target_event['id']):
-                if chapter.get('wl_cid') != cid:
-                    continue
-                start_at = chapter['startAt']
-                aggregate_at = chapter['aggregateAt']
-                start_time = datetime.fromtimestamp(start_at / 1000)
-                end_time = datetime.fromtimestamp(aggregate_at / 1000 + 1)
-                if start_time <= now <= end_time:
-                    rank = (0, -start_at)
-                elif start_time > now:
-                    rank = (1, start_at)
-                else:
-                    rank = (2, -aggregate_at)
-                chapter_candidates.append((rank, target_event['id']))
-
-            if not chapter_candidates:
-                return None
-
-            chapter_candidates.sort(key=lambda x: x[0])
-            event_id = chapter_candidates[0][1]
-            implicit_args = args.replace(f"wl{wl_turn_hint}", "", 1).strip()
-            return await extract_target_event(
-                ctx,
-                f"event{event_id} {implicit_args}",
-                match_type="all",
-                default_return_current=True,
-                raise_if_not_found=True,
-            )
-
-        try:
-            resolved = await resolve_real_wl_event()
-            if resolved:
-                event, wl_cid, new_args = resolved
-                options.event_id = event['id']
-                options.world_bloom_character_id = wl_cid
-                return new_args
-        except ReplyException:
-            # 用户显式指定了活动时，说明意图已经非常明确，真实活动解析失败就应该报错，
-            # 不能再悄悄退回到模拟WL，否则结果会完全变成另一套语义。
-            if explicit_event_match:
-                raise
-
-    # 匹配模拟WL活动（角色名+wl1 / wl2）
-    for turn in (1, 2):
-        if f"wl{turn}" in args:
-            for nickname, cid in get_character_nickname_data().nickname_ids:
-                if nickname in args:
-                    args = args.replace(f"wl{turn}", "", 1).replace(nickname, "", 1).strip()
-                    unit = get_unit_by_chara_id(cid)
-                    options.event_unit = unit
-                    options.world_bloom_event_turn = turn
-                    options.world_bloom_character_id = cid
-                    return args
+        # 只有“模拟WLN”显式语法才允许进入没有真实活动规则的模拟分支；
+        # 最大轮次由 start.sh 完成原生能力验证后注入，不只凭用户参数放行。
+        simulation_max_turn = get_wl_simulation_max_turn()
+        assert_and_reply(
+            1 <= turn_selector.turn <= simulation_max_turn,
+            f"当前原生组卡库仅支持模拟 WL1～WL{simulation_max_turn}；"
+            f"第{turn_selector.turn}次 WL 如已实装，请使用"
+            "“第N次WL 角色名”动态定位",
+        )
+        options.event_unit = unit
+        options.world_bloom_event_turn = turn_selector.turn
+        options.world_bloom_character_id = cid
+        return remaining_args
 
     # 25需要优先匹配团队，对于活动id内包含25的情况，必须让团队的25两边不能有数字或者"event"、"活动"
     # 这样只有想以单独数字25指定25期活动时可能产生歧义，为该情况额外添加用户提示
@@ -1181,6 +1453,7 @@ async def extract_event_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     args = ctx.get_args().strip().lower()
     options = DeckRecommendOptions()
 
+    preview_requested, args = extract_preview_keyword(args)
     additional, args = extract_addtional_options(args)
 
     args = extract_live_type(args, options)
@@ -1199,7 +1472,16 @@ async def extract_event_options(ctx: SekaiHandlerContext, args: str) -> Dict:
         options.timeout_ms = int(SINGLE_ALG_RECOMMEND_TIMEOUT_CFG.get() * 1000)
 
     # 活动id
-    args = await extract_target_event_or_simulate_event(ctx, args, options)
+    args, preview_resolution, preview_handled = await extract_preview_target_event(
+        ctx,
+        args,
+        options,
+        preview_requested=preview_requested,
+        match_type="all",
+        command_kind="event",
+    )
+    if not preview_handled:
+        args = await extract_target_event_or_simulate_event(ctx, args, options)
         
     # 歌曲id和难度
     args = await extract_music_and_diff(ctx, args, options, "event", options.live_type, additional)
@@ -1215,6 +1497,7 @@ async def extract_event_options(ctx: SekaiHandlerContext, args: str) -> Dict:
         'options': options,
         'last_args': args.strip(),
         'additional': additional,
+        'preview_resolution': preview_resolution,
     }
 
 # 从args中提取挑战组卡参数
@@ -1222,6 +1505,11 @@ async def extract_challenge_options(ctx: SekaiHandlerContext, args: str) -> Dict
     args = ctx.get_args().strip().lower()
     options = DeckRecommendOptions()
 
+    preview_requested, args = extract_preview_keyword(args)
+    assert_and_reply(
+        not preview_requested,
+        "预览仅支持活动组卡和加成组卡",
+    )
     additional, args = extract_addtional_options(args)
 
     args = extract_live_type(args, options)
@@ -1283,6 +1571,11 @@ async def extract_no_event_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     args = ctx.get_args().strip().lower()
     options = DeckRecommendOptions()
 
+    preview_requested, args = extract_preview_keyword(args)
+    assert_and_reply(
+        not preview_requested,
+        "预览仅支持活动组卡和加成组卡",
+    )
     additional, args = extract_addtional_options(args)
 
     args = extract_live_type(args, options)
@@ -1324,6 +1617,7 @@ async def extract_bonus_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     args = ctx.get_args().strip().lower()
     options = DeckRecommendOptions()
 
+    preview_requested, args = extract_preview_keyword(args)
     additional, args = extract_addtional_options(args)
 
     options.algorithm = "dfs"
@@ -1339,14 +1633,23 @@ async def extract_bonus_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     options.rarity_birthday_config = NOCHANGE_CARD_CONFIG
 
     # 活动id
-    event, wl_cid, args = await extract_target_event(
-        ctx, args, 
+    args, preview_resolution, preview_handled = await extract_preview_target_event(
+        ctx,
+        args,
+        options,
+        preview_requested=preview_requested,
         match_type="full",
-        default_return_current=True,
-        raise_if_not_found=True,
+        command_kind="bonus",
     )
-    options.event_id = event['id']
-    options.world_bloom_character_id = wl_cid
+    if not preview_handled:
+        event, wl_cid, args = await extract_target_event(
+            ctx, args,
+            match_type="full",
+            default_return_current=True,
+            raise_if_not_found=True,
+        )
+        options.event_id = event['id']
+        options.world_bloom_character_id = wl_cid
         
     # 歌曲id和难度
     await extract_music_and_diff(ctx, "", options, "event", options.live_type, additional)
@@ -1368,6 +1671,7 @@ async def extract_bonus_options(ctx: SekaiHandlerContext, args: str) -> Dict:
         'options': options,
         'last_args': '',
         'additional': additional,
+        'preview_resolution': preview_resolution,
     }
 
 # 从args中提取烤森组卡参数
@@ -1375,6 +1679,11 @@ async def extract_mysekai_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     args = ctx.get_args().strip().lower()
     options = DeckRecommendOptions()
 
+    preview_requested, args = extract_preview_keyword(args)
+    assert_and_reply(
+        not preview_requested,
+        "烤森组卡暂不支持预览",
+    )
     additional, args = extract_addtional_options(args)
 
     options.algorithm = "ga"
@@ -1490,9 +1799,14 @@ async def do_deck_recommend_batch(
     ctx: SekaiHandlerContext, 
     options_list: list[DeckRecommendOptions],
     user_data: bytes,
+    servers_override: Optional[list[dict]] = None,
 ) -> list[Tuple[DeckRecommendResult, List[str], Dict[str, Tuple[timedelta, timedelta]]]]:
     # 获取组卡后端相关信息
-    servers = RECOMMEND_SERVERS_CFG.get()
+    servers = (
+        servers_override
+        if servers_override is not None
+        else RECOMMEND_SERVERS_CFG.get()
+    )
     if not servers:
         raise ReplyException("未配置可用的组卡服务")
     server_urls = [s['url'] for s in servers]
@@ -1795,12 +2109,15 @@ async def compose_deck_recommend_image(
     options: DeckRecommendOptions,
     last_args: str,
     additional: dict,
+    preview_resolution: Optional[PreviewEventResolution] = None,
 ) -> Image.Image:
     # ---------------------------- 判断组卡类型方便后续处理 ---------------------------- #
 
     NO_MUSIC_TYPES = ["bonus", "wl_bonus", "mysekai"]
 
     is_wl = options.world_bloom_character_id or options.event_id == 180
+    is_preview = preview_resolution is not None
+    jp_ctx = SekaiHandlerContext.from_region('jp')
 
     if options.live_type == "mysekai":
         recommend_type = "mysekai"
@@ -1828,6 +2145,8 @@ async def compose_deck_recommend_image(
             recommend_type = "no_event"
 
     war_prepare = additional.get('war_prepare', False)
+    # Preview 后端返回的活动 PT 与原生组卡结果同构，备战只依赖该 PT、
+    # 火耗和周回参数，因此可以复用同一套估算。
     if war_prepare:
         assert_and_reply(
             recommend_type not in ("challenge", "challenge_all", "no_event", "bonus", "wl_bonus", "mysekai"),
@@ -1887,6 +2206,9 @@ async def compose_deck_recommend_image(
             uid = profile['userGamedata']['userId']
 
     original_usercards = profile['userCards']
+    assumed_cards_context: AssumedCardsContext | None = None
+    assumed_usercards_by_id: dict[int, dict] = {}
+    jp_cards_by_id: dict[int, dict] = {}
     # 组合卡牌过滤
     unit_filter = additional.get('unit_filter', None)
     if unit_filter:
@@ -1942,6 +2264,79 @@ async def compose_deck_recommend_image(
                 else:
                     # suite中没有该卡，提示需要抓包更新
                     raise ReplyException(f"当前卡组中的卡牌 {bp_card['cardId']} 不在Suite数据中，请更新抓包数据")
+
+    # ================================ 显式未来卡假设 ================================ #
+    # 必须在 CN 过滤/当前队伍处理完成后注入，而且先复制列表，避免临时卡污染
+    # 用于头像和玩家信息绘制的原始 Suite 对象。
+    if preview_resolution is not None:
+        profile['userCards'] = list(profile['userCards'])
+        future_fixed_ids = [
+            card_id
+            for card_id in (options.fixed_cards or [])
+            if card_id in preview_resolution.future_card_ids
+        ]
+        jp_episodes_by_card_id: dict[int, list[dict]] = {}
+        for card_id in future_fixed_ids:
+            card = await jp_ctx.md.cards.find_by_id(card_id)
+            if card:
+                jp_cards_by_id[card_id] = card
+            jp_episodes_by_card_id[card_id] = await jp_ctx.md.card_episodes.find_by(
+                "cardId",
+                card_id,
+                mode="all",
+            )
+        # 单卡设置优先叠加在对应稀有度设置上，保证临时 Suite 与实际下发给
+        # 原生库的满技、满破和剧情状态一致。
+        rarity_configs = {
+            "rarity_1": options.rarity_1_config,
+            "rarity_2": options.rarity_2_config,
+            "rarity_3": options.rarity_3_config,
+            "rarity_4": options.rarity_4_config,
+            "rarity_birthday": options.rarity_birthday_config,
+        }
+        single_configs = {
+            int(single.card_id): single
+            for single in (options.single_card_configs or [])
+        }
+        assumed_config_overrides: dict[int, dict[str, bool]] = {}
+        for card_id, card in jp_cards_by_id.items():
+            rarity_config = rarity_configs.get(card.get("cardRarityType"))
+            single_config = single_configs.get(card_id)
+            assumed_config_overrides[card_id] = {
+                key: bool(
+                    getattr(rarity_config, key, False)
+                    or getattr(single_config, key, False)
+                )
+                for key in ("episode_read", "master_max", "skill_max")
+            }
+        try:
+            max_assumed_cards = int(config.get(
+                "deck.cn_jp_preview.max_assumed_cards"
+            ))
+        except Exception:
+            max_assumed_cards = 5
+        try:
+            assumed_cards_context = inject_explicit_assumed_cards(
+                profile,
+                fixed_card_ids=options.fixed_cards or [],
+                cn_catalog_card_ids={
+                    card["id"]
+                    for card in await ctx.md.cards.get()
+                    if isinstance(card.get("id"), int)
+                },
+                future_card_ids=set(preview_resolution.future_card_ids),
+                jp_cards_by_id=jp_cards_by_id,
+                jp_episodes_by_card_id=jp_episodes_by_card_id,
+                max_assumed_cards=max_assumed_cards,
+                card_config_overrides=assumed_config_overrides,
+            )
+        except PreviewCardError as exc:
+            raise ReplyException(str(exc)) from exc
+        assumed_usercards_by_id = {
+            user_card["cardId"]: user_card
+            for user_card in profile["userCards"]
+            if user_card.get("cardId") in assumed_cards_context.assumed_card_ids
+        }
 
     # ================================ 终章目标与牌子模拟 ================================ #
     # 终章的支援和额外加成都跟队长角色绑定，因此要先把目标角色固化，再决定后续裁卡池策略。
@@ -2119,11 +2514,54 @@ async def compose_deck_recommend_image(
         # 正常组卡
         all_options = [options]
 
+    # ================================ 组卡后端路由 ================================ #
+    servers_override = None
+    if preview_resolution is not None:
+        preview_state = preview_manager.get_state()
+        assert_and_reply(
+            preview_state.status == PreviewStatus.READY
+            and preview_state.scope_fingerprint == preview_resolution.scope_fingerprint,
+            "预览数据刚刚更新，请重新发送指令",
+        )
+        servers_override = [
+            {
+                "url": server["url"],
+                "weight": server["weight"],
+            }
+            for server in preview_manager.ready_servers()
+        ]
+        assert_and_reply(
+            servers_override,
+            "预览组卡暂时不可用，请稍后再试",
+        )
+    elif preview_manager.enabled() and options.event_id and (
+        official_entry := preview_manager.official_entry(options.event_id)
+    ):
+        # 已由 preview 粘性切回的活动，只允许路由到确认加载正式 CN 指纹的节点。
+        acked_urls = {
+            str(url).rstrip("/")
+            for url in official_entry.get("acked_servers", [])
+        }
+        servers_override = [
+            server
+            for server in RECOMMEND_SERVERS_CFG.get()
+            if str(server.get("url", "")).rstrip("/") in acked_urls
+        ]
+        assert_and_reply(
+            servers_override,
+            "国服活动数据正在同步，请稍后再试",
+        )
+
     # 调用组卡并合并批次结果
     cost_times, wait_times = {}, {}
     result_decks = []
     result_algs = []
-    for res, algs, cost_and_wait_times in await do_deck_recommend_batch(ctx, all_options, user_data):
+    for res, algs, cost_and_wait_times in await do_deck_recommend_batch(
+        ctx,
+        all_options,
+        user_data,
+        servers_override=servers_override,
+    ):
         result_decks.extend(res.decks)
         result_algs.extend(algs)
         for alg, (cost, wait) in cost_and_wait_times.items():
@@ -2145,9 +2583,23 @@ async def compose_deck_recommend_image(
         result_decks = result_decks[:1]
         result_algs = result_algs[:1]
 
-    # ---------------------------- 绘图数据获取 ---------------------------- #
+    if preview_resolution is not None and assumed_cards_context is not None:
+        try:
+            validate_preview_result_cards(
+                result_decks,
+                assumed_cards_context,
+                fixed_card_ids=options.fixed_cards or [],
+            )
+        except PreviewCardError as exc:
+            logger.error(
+                "预演组卡结果集合越界: "
+                f"event={preview_resolution.event_id} "
+                f"fp={preview_resolution.scope_fingerprint} "
+                f"error={get_exc_desc(exc)}"
+            )
+            raise ReplyException("预演结果安全校验失败，本次结果已作废") from exc
 
-    jp_ctx = SekaiHandlerContext.from_region('jp')
+    # ---------------------------- 绘图数据获取 ---------------------------- #
 
     if not music_compare:
         # 获取一般情况音乐标题和封面
@@ -2161,7 +2613,7 @@ async def compose_deck_recommend_image(
             music_cover = await get_music_cover_thumb(jp_ctx, options.music_id)
 
     # ================================ 备战结果计算 ================================ #
-    # 这一块直接复用 moe 的公式：基于当前最优活动PT结果，继续估算
+    # 这一块直接复用公式：基于当前最优活动PT结果，继续估算
     # 单局PT、时速、局数、预计时间和火耗。
     war_prepare_info = None
     if war_prepare and result_decks:
@@ -2220,9 +2672,14 @@ async def compose_deck_recommend_image(
     live_name = "协力"
     event_id = options.event_id
     if recommend_type in ["event", "wl", "bonus", "wl_bonus", "mysekai"] and event_id:
-        event = await ctx.md.events.find_by_id(event_id)
+        event_asset_ctx = jp_ctx if is_preview else ctx
+        event = (
+            preview_resolution.rule_event
+            if preview_resolution is not None
+            else await ctx.md.events.find_by_id(event_id)
+        )
         if event:
-            event_banner = await get_event_banner_img(ctx, event)
+            event_banner = await get_event_banner_img(event_asset_ctx, event)
             event_title = event['name']
             if event['eventType'] == 'cheerful_carnival':
                 live_name = "5v5" 
@@ -2261,7 +2718,45 @@ async def compose_deck_recommend_image(
 
     # 获取卡组卡牌缩略图
     draw_eventbonus = recommend_type in ["bonus", "wl_bonus"]
-    async def _get_thumb(card, pcard):
+
+    # ================================ 结果卡牌元数据 ================================ #
+    # Preview 后端能返回显式固定的 JP 未实装卡。后续缩略图和角色判断必须复用
+    # JP 元数据，不能重新去 CN cards 表查询并把合法的 None 当成字典使用。
+    result_card_masterdata_cache: dict[int, dict] = {}
+
+    async def _get_result_card_masterdata(card_id: int) -> dict:
+        if cached := result_card_masterdata_cache.get(card_id):
+            return cached
+
+        assumed = bool(
+            assumed_cards_context
+            and card_id in assumed_cards_context.assumed_card_ids
+        )
+        if assumed:
+            cn_card = None
+            jp_card = (
+                jp_cards_by_id.get(card_id)
+                or await jp_ctx.md.cards.find_by_id(card_id)
+            )
+        else:
+            cn_card = await ctx.md.cards.find_by_id(card_id)
+            jp_card = None
+
+        try:
+            selected = select_result_card_masterdata(
+                card_id,
+                assumed_cards_context,
+                cn_card=cn_card,
+                jp_card=jp_card,
+            )
+        except PreviewCardError as exc:
+            raise ReplyException(str(exc)) from exc
+
+        result = dict(selected)
+        result_card_masterdata_cache[card_id] = result
+        return result
+
+    async def _get_thumb(draw_ctx, card, pcard):
         try: 
             custom_text = None
             if draw_eventbonus:
@@ -2269,14 +2764,28 @@ async def compose_deck_recommend_image(
                 if abs(bonus - int(bonus)) < 0.01:
                     bonus = int(bonus)
                 custom_text = f"+{bonus}%"
-            return await get_card_full_thumbnail(ctx, card, pcard=pcard, custom_text=custom_text)
+            return await get_card_full_thumbnail(
+                draw_ctx,
+                card,
+                pcard=pcard,
+                custom_text=custom_text,
+            )
         except: 
             return UNKNOWN_IMG
     card_imgs, card_keys = [], []
     for deck in result_decks:
         for deckcard in deck.cards:
-            card = await ctx.md.cards.find_by_id(deckcard.card_id)
-            usercard = find_by(profile['userCards'], 'cardId', deckcard.card_id)
+            assumed = bool(
+                assumed_cards_context
+                and deckcard.card_id in assumed_cards_context.assumed_card_ids
+            )
+            card_ctx = jp_ctx if assumed else ctx
+            card = await _get_result_card_masterdata(deckcard.card_id)
+            usercard = (
+                assumed_usercards_by_id.get(deckcard.card_id)
+                if assumed
+                else find_by(profile['userCards'], 'cardId', deckcard.card_id)
+            )
             pcard = {
                 'cardId': deckcard.card_id,
                 'defaultImage': deckcard.default_image,                                 # 默认图片跟随组卡结果
@@ -2288,7 +2797,7 @@ async def compose_deck_recommend_image(
             card_key = f"{deckcard.card_id}_{deckcard.default_image}"
             if card_key not in card_keys:
                 card_keys.append(card_key)
-                card_imgs.append(_get_thumb(card, pcard))
+                card_imgs.append(_get_thumb(card_ctx, card, pcard))
     card_imgs = await asyncio.gather(*card_imgs)
     card_imgs = { key : img for key, img in zip(card_keys, card_imgs) }
 
@@ -2299,7 +2808,7 @@ async def compose_deck_recommend_image(
         except: challenge_live_info = {}
         for deck in result_decks:
             card_id = deck.cards[0].card_id
-            chara_id = (await ctx.md.cards.find_by_id(card_id))['characterId']
+            chara_id = (await _get_result_card_masterdata(card_id))['characterId']
             _, high_score, _, _ = challenge_live_info.get(chara_id, (None, 0, None, None))
             challenge_score_dlt.append(deck.score - high_score)
 
@@ -2350,6 +2859,11 @@ async def compose_deck_recommend_image(
                             title += "(单人)"
                         elif options.live_type == "auto":
                             title += "(AUTO)"
+
+                    if preview_resolution is not None:
+                        # Preview 只追加模式标记，活动类型、编号和 Live 描述继续
+                        # 完全复用原组卡标题，避免产生另一套视觉命名规则。
+                        title = format_preview_result_title(title)
                     
                     score_name = "PT"
                     if recommend_type in ["challenge", "challenge_all", "no_event"]:
@@ -2446,6 +2960,16 @@ async def compose_deck_recommend_image(
                                     TextBox("🥀最小值", skill_text_style)
                     
                     info_text = ""
+
+                    if preview_resolution is not None:
+                        info_text += (
+                            f"活动规则：JP-{preview_resolution.event_id}"
+                            "｜玩家数据：CN Suite\n"
+                        )
+                        info_text += (
+                            "按日服活动规则与当前国服账号数据预演，"
+                            "请以国服上线后的实际规则为准。\n"
+                        )
 
                     if last_args:
                         arg_unit, args = extract_unit(last_args)
@@ -2592,7 +3116,9 @@ async def compose_deck_recommend_image(
                                     with HSplit().set_content_align('c').set_item_align('c').set_sep(8).set_padding(0):
                                         for card in deck.cards:
                                             card_id = card.card_id
-                                            character_id = (await ctx.md.cards.find_by_id(card_id))['characterId']
+                                            character_id = (
+                                                await _get_result_card_masterdata(card_id)
+                                            )['characterId']
                                             event_bonus = card.event_bonus_rate
                                             ep1_read, ep2_read = card.episode1_read, card.episode2_read
                                             slv, sup = card.skill_level, int(card.skill_score_up)
@@ -2831,44 +3357,42 @@ async def get_deckrec_masterdata_paths(ctx: SekaiHandlerContext) -> List[str]:
     这里必须和 deck_recommender 服务端实际消费的文件集合保持一致，
     否则单个文件热更新时会出现版本号一致但内容不一致的情况。
     """
+    specs = get_deck_masterdata_specs(
+        include_mysekai=ctx.region in MYSEKAI_REGIONS,
+        include_wl_limited_bonus=bool(await ctx.md.events.find_by_id(180)),
+    )
     masterdata_tasks = [
-        ctx.md.area_item_levels.get_path(),
-        ctx.md.area_items.get_path(),
-        ctx.md.areas.get_path(),
-        ctx.md.card_episodes.get_path(),
-        ctx.md.cards.get_path(),
-        ctx.md.card_rarities.get_path(),
-        ctx.md.character_ranks.get_path(),
-        ctx.md.event_cards.get_path(),
-        ctx.md.event_deck_bonuses.get_path(),
-        ctx.md.event_exchange_summaries.get_path(),
-        ctx.md.events.get_path(),
-        ctx.md.event_items.get_path(),
-        ctx.md.event_rarity_bonus_rates.get_path(),
-        ctx.md.game_characters.get_path(),
-        ctx.md.game_character_units.get_path(),
-        ctx.md.honors.get_path(),
-        ctx.md.master_lessons.get_path(),
-        ctx.md.music_diffs.get_path(),
-        ctx.md.musics.get_path(),
-        ctx.md.music_vocals.get_path(),
-        ctx.md.shop_items.get_path(),
-        ctx.md.skills.get_path(),
-        ctx.md.world_bloom_different_attribute_bonuses.get_path(),
-        ctx.md.world_blooms.get_path(),
-        ctx.md.world_bloom_support_deck_bonuses.get_path(),
+        getattr(ctx.md, spec.attribute).get_path()
+        for spec in specs
     ]
-    if ctx.region in MYSEKAI_REGIONS:
-        masterdata_tasks += [
-            ctx.md.card_mysekai_canvas_bonuses.get_path(),
-            ctx.md.mysekai_fixture_game_character_groups.get_path(),
-            ctx.md.mysekai_fixture_game_character_group_performance_bonuses.get_path(),
-            ctx.md.mysekai_gates.get_path(),
-            ctx.md.mysekai_gate_levels.get_path(),
-        ]
-    if await ctx.md.events.find_by_id(180):
-        masterdata_tasks.append(ctx.md.world_bloom_support_deck_unit_event_limited_bonuses.get_path())
-    return await asyncio.gather(*masterdata_tasks)
+    paths = await asyncio.gather(*masterdata_tasks)
+    validate_resolved_paths(specs, paths)
+    return paths
+
+
+async def get_deckrec_masterdata_path_map(
+    ctx: SekaiHandlerContext,
+    *,
+    include_mysekai: bool,
+    include_wl_limited_bonus: bool,
+) -> dict[str, str]:
+    """按共享规格返回文件名到来源路径的映射，供 preview builder 冻结快照。"""
+
+    specs = get_deck_masterdata_specs(
+        include_mysekai=include_mysekai,
+        include_wl_limited_bonus=include_wl_limited_bonus,
+    )
+    paths = await asyncio.gather(*[
+        getattr(ctx.md, spec.attribute).get_path()
+        for spec in specs
+    ])
+    validate_resolved_paths(specs, paths)
+    path_map = {
+        spec.filename: path
+        for spec, path in zip(specs, paths)
+    }
+    assert set(path_map) == set(get_preview_expected_filenames())
+    return path_map
 
 
 def calc_deckrec_masterdata_fingerprint(masterdata_paths: List[str]) -> str:
@@ -2881,6 +3405,386 @@ def calc_deckrec_masterdata_fingerprint(masterdata_paths: List[str]) -> str:
         stat = os.stat(path)
         digest.update(f"{os.path.basename(path)}:{stat.st_size}:{stat.st_mtime_ns}\n".encode('utf-8'))
     return digest.hexdigest()
+
+
+# ================================ Preview来源与正式切回核验 ================================ #
+
+async def _validate_cn_event_rules_for_cutover(
+    ctx: SekaiHandlerContext,
+    event: dict,
+) -> bool:
+    """检查 CN 已出现的活动是否具备正式组卡所需的类型化闭包。"""
+
+    event_id = event["id"]
+    if event.get("eventType") not in {"marathon", "world_bloom"}:
+        return False
+    bonuses = await ctx.md.event_deck_bonuses.find_by(
+        "eventId",
+        event_id,
+        mode="all",
+    )
+    if not bonuses:
+        return False
+    cards = await ctx.md.cards.get()
+    card_ids = {
+        card["id"]
+        for card in cards
+        if isinstance(card.get("id"), int)
+    }
+    unit_ids = {
+        item["id"]
+        for item in await ctx.md.game_character_units.get()
+    }
+    valid_attrs = {
+        item["attr"]
+        for item in cards
+    }
+    for bonus in bonuses:
+        unit_id = bonus.get("gameCharacterUnitId")
+        attr = bonus.get("cardAttr")
+        rate = bonus.get("bonusRate")
+        if unit_id is not None and unit_id not in unit_ids:
+            return False
+        if attr is not None and attr not in valid_attrs:
+            return False
+        if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate < 0:
+            return False
+
+    # ================================ 活动卡闭包 ================================ #
+    # 活动行和加成行可能先于卡牌/剧情分批落地；eventCards 为空不能被当成
+    # “无需校验”，否则会在 CN 卡池尚未完整时永久切回正式服务。
+    event_cards = await ctx.md.event_cards.find_by(
+        "eventId",
+        event_id,
+        mode="all",
+    ) or []
+    if not event_cards:
+        return False
+
+    event_card_ids = [event_card.get("cardId") for event_card in event_cards]
+    if any(not isinstance(card_id, int) for card_id in event_card_ids):
+        return False
+
+    episode_groups = await asyncio.gather(*[
+        ctx.md.card_episodes.find_by("cardId", card_id, mode="all")
+        for card_id in event_card_ids
+    ])
+    episode_card_ids = {
+        card_id
+        for card_id, episodes in zip(event_card_ids, episode_groups)
+        if episodes
+    }
+    if not validate_event_card_closure(
+        event_cards,
+        cards,
+        await ctx.md.skills.get(),
+        episode_card_ids,
+    ):
+        return False
+
+    if event["eventType"] == "world_bloom":
+        chapters = [
+            chapter
+            for chapter in await ctx.md.world_blooms.get()
+            if chapter.get("eventId") == event_id
+        ]
+        if not chapters:
+            return False
+        character_ids = {
+            character["id"]
+            for character in await ctx.md.game_characters.get()
+        }
+        chapter_keys: set[tuple[int, int]] = set()
+        for chapter in chapters:
+            chapter_no = chapter.get("chapterNo")
+            character_id = chapter.get("gameCharacterId")
+            chapter_key = (chapter_no, character_id)
+            if (
+                not isinstance(chapter_no, int)
+                or chapter_no <= 0
+                or character_id not in character_ids
+                or chapter_key in chapter_keys
+            ):
+                return False
+            chapter_keys.add(chapter_key)
+
+        # ================================ WL支援规则闭包 ================================ #
+        # 原生探针只能证明“算得出来”；这里还要确认 WL3 使用的全局倍率表
+        # 结构完整且每个嵌套倍率有效，避免旧表返回一个看似正常的有限数。
+        support_bonus_rows, different_attr_rows = await asyncio.gather(
+            ctx.md.world_bloom_support_deck_bonuses.get(),
+            ctx.md.world_bloom_different_attribute_bonuses.get(),
+        )
+        if not validate_world_bloom_support_tables(
+            support_bonus_rows,
+            different_attr_rows,
+        ):
+            return False
+
+        limited = [
+            item
+            for item in await (
+                ctx.md.world_bloom_support_deck_unit_event_limited_bonuses.get()
+            )
+            if item.get("eventId") == event_id
+        ]
+        for item in limited:
+            rate = item.get("bonusRate")
+            if (
+                item.get("cardId") not in card_ids
+                or item.get("gameCharacterId") not in character_ids
+                or not isinstance(rate, (int, float))
+                or not math.isfinite(rate)
+                or rate < 0
+            ):
+                return False
+        exchange_summaries, event_items = await asyncio.gather(
+            ctx.md.event_exchange_summaries.find_by(
+                "eventId",
+                event_id,
+                mode="all",
+            ),
+            ctx.md.event_items.find_by(
+                "eventId",
+                event_id,
+                mode="all",
+            ),
+        )
+        if not exchange_summaries or not event_items:
+            return False
+    return True
+
+
+async def _get_official_loaded_servers(
+    expected_fingerprint: str,
+) -> list[str]:
+    """只返回 DB 与全部 worker 都确认当前 CN 指纹的正式节点。"""
+
+    async def check(server: dict) -> Optional[str]:
+        url = str(server["url"]).rstrip("/")
+        try:
+            async with get_client_session().get(
+                url + "/data_status",
+                params={"region": "cn"},
+            ) as response:
+                if response.status != 200:
+                    return None
+                status = await response.json()
+            loaded = status.get("loaded_fingerprints")
+            if (
+                status.get("instance_role") != "official"
+                or status.get("maintenance")
+                or status.get("data_healthy") is not True
+                or status.get("stored_fingerprint") != expected_fingerprint
+                or not isinstance(loaded, dict)
+                or not loaded
+                or set(loaded.values()) != {expected_fingerprint}
+            ):
+                return None
+            return url
+        except Exception:
+            return None
+
+    unique_servers = {
+        str(server["url"]).rstrip("/"): server
+        for server in RECOMMEND_SERVERS_CFG.get()
+        if int(server.get("weight", 0)) > 0
+    }
+    results = await asyncio.gather(*[
+        check(server)
+        for server in unique_servers.values()
+    ])
+    return sorted({url for url in results if url})
+
+
+async def provide_preview_builder_source() -> dict:
+    """
+    等待资源管理器异步准备 CN/JP 路径，并组装一次性 builder 请求。
+
+    大 JSON 读取、哈希、合并、canary 与压缩全部留给 builder 子进程。
+    """
+
+    cn_ctx = SekaiHandlerContext.from_region("cn")
+    jp_ctx = SekaiHandlerContext.from_region("jp")
+    cn_version, jp_version = await asyncio.gather(
+        cn_ctx.md.get_version(),
+        jp_ctx.md.get_version(),
+    )
+    cn_paths, jp_paths = await asyncio.gather(
+        get_deckrec_masterdata_path_map(
+            cn_ctx,
+            include_mysekai=True,
+            include_wl_limited_bonus=True,
+        ),
+        get_deckrec_masterdata_path_map(
+            jp_ctx,
+            include_mysekai=True,
+            include_wl_limited_bonus=True,
+        ),
+    )
+    current_cn_fingerprint = calc_deckrec_masterdata_fingerprint(
+        list(cn_paths.values())
+    )
+    current_jp_fingerprint = calc_deckrec_masterdata_fingerprint(
+        list(jp_paths.values())
+    )
+    current_manifest = preview_manager.get_state().manifest
+
+    # ================================ 缓存版本号兜底 ================================ #
+    # 资源源暂时不可达时，WebMasterData 仍可能从完整本地缓存提供全部文件，
+    # 但 get_version() 会返回 0.0.0.0。版本号只作可读标签，真正的数据身份由
+    # 逐文件哈希和来源指纹保证，因此这里改用稳定的缓存指纹，不能用裸 assert
+    # 把可用缓存误判为初始化失败。
+    def effective_version(
+        region: str,
+        version: Any,
+        source_fingerprint: str,
+    ) -> str:
+        version_text = str(version)
+        if version_text != DEFAULT_VERSION:
+            return version_text
+        fallback = f"cache:{source_fingerprint}"
+        if current_manifest.get(
+            f"{region}_masterdata_version"
+        ) != fallback:
+            logger.warning(
+                f"{region.upper()} MasterData 版本源暂不可用，"
+                f"preview 使用本地缓存指纹 {source_fingerprint[:8]}"
+            )
+        return fallback
+
+    cn_version_text = effective_version(
+        "cn",
+        cn_version,
+        current_cn_fingerprint,
+    )
+    jp_version_text = effective_version(
+        "jp",
+        jp_version,
+        current_jp_fingerprint,
+    )
+
+    # 触发 WebJson 的异步下载/磁盘兜底，builder 只读取已经稳定落盘的缓存。
+    await musicmetas_json.get()
+    musicmetas_update_time = await musicmetas_json.get_update_time()
+    musicmetas_path = musicmetas_json.file_cache_path
+    assert musicmetas_path and os.path.isfile(musicmetas_path)
+
+    try:
+        allowed_event_types = config.get(
+            "deck.cn_jp_preview.allowed_event_types"
+        )
+    except Exception:
+        allowed_event_types = ["marathon", "world_bloom"]
+    try:
+        event_allowlist = config.get("deck.cn_jp_preview.event_allowlist")
+    except Exception:
+        event_allowlist = []
+    try:
+        builder_owner = bool(config.get("deck.cn_jp_preview.builder_owner"))
+    except Exception:
+        builder_owner = True
+
+    output_root = "data/sekai/deckrec/rulesets/cn_jp_preview_v1"
+    builder_request = {
+        "cn_paths": cn_paths,
+        "jp_paths": jp_paths,
+        "output_root": output_root,
+        "cn_masterdata_version": cn_version_text,
+        "jp_masterdata_version": jp_version_text,
+        "include_mysekai": True,
+        "include_wl_limited_bonus": True,
+        "musicmetas_path": musicmetas_path,
+        "musicmetas_update_ts": int(musicmetas_update_time.timestamp()),
+        "native_package_build_id": get_native_package_build_id(),
+        "allowed_event_types": allowed_event_types,
+        # 原生索引对未来活动表存在未公开的跨活动闭包约束。路由白名单只限制
+        # 玩家入口，不能用来裁剪底层 MasterData；否则两场活动的稀疏规则集会冷加载失败。
+        "event_allowlist": [],
+        "route_event_allowlist": event_allowlist,
+        "run_canaries": True,
+    }
+
+    # ================================ 正式活动粘性激活候选 ================================ #
+    builder_request["cn_source_fingerprint"] = current_cn_fingerprint
+    builder_request["jp_source_fingerprint"] = current_jp_fingerprint
+    acked_servers: list[str] | None = None
+    activation_candidates: list[dict] = []
+    for event_id in preview_manager.tracked_event_ids():
+        if preview_manager.is_official_active(event_id):
+            continue
+        event = await cn_ctx.md.events.find_by_id(event_id)
+        if not event:
+            continue
+        preview_manager.mark_cn_detected(
+            event_id,
+            str(event.get("eventType", "")),
+        )
+        if not await _validate_cn_event_rules_for_cutover(
+            cn_ctx,
+            event,
+        ):
+            continue
+        if acked_servers is None:
+            acked_servers = await _get_official_loaded_servers(
+                current_cn_fingerprint
+            )
+        if acked_servers:
+            activation_candidates.append({
+                "event_id": event_id,
+                "event_type": event["eventType"],
+                "cn_masterdata_version": cn_version_text,
+                "cn_fingerprint": current_cn_fingerprint,
+                "acked_servers": acked_servers,
+            })
+
+    # 原生探针在低优先级 builder 子进程中运行，玩家命令和主事件循环不加载 CN 大文件。
+    builder_request["official_canary_candidates"] = activation_candidates
+    builder_request["official_canary_fingerprint"] = current_cn_fingerprint
+    refresh_fingerprint = md5(
+        json.dumps(
+            {
+                "cn_source_fingerprint": current_cn_fingerprint,
+                "jp_source_fingerprint": current_jp_fingerprint,
+                "cn_masterdata_version": cn_version_text,
+                "jp_masterdata_version": jp_version_text,
+                "musicmetas_update_ts": builder_request[
+                    "musicmetas_update_ts"
+                ],
+                "native_package_build_id": builder_request[
+                    "native_package_build_id"
+                ],
+                "allowed_event_types": sorted(
+                    str(value)
+                    for value in allowed_event_types
+                ),
+                "route_event_allowlist": sorted(
+                    int(value)
+                    for value in event_allowlist
+                ),
+                "official_activation_candidates": activation_candidates,
+                # 正式节点与 CN 数据都就绪后，原生 canary 若遇到瞬时失败，
+                # 必须定期重试；同时用五分钟时间桶避免恢复成每 30 秒重建。
+                "official_canary_retry_bucket": (
+                    int(time.time() // PREVIEW_CUTOVER_RETRY_SECONDS)
+                    if activation_candidates
+                    else None
+                ),
+                "builder_owner": builder_owner,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "builder_request": builder_request,
+        "official_activation_candidates": activation_candidates,
+        "refresh_fingerprint": refresh_fingerprint,
+    }
+
+
+preview_manager.configure(provide_preview_builder_source)
 
 
 @repeat_with_interval(DECKREC_DATA_UPDATE_INTERVAL_CFG, "组卡数据更新", logger)
@@ -2959,3 +3863,6 @@ async def deckrec_update_data():
 
         except Exception as e:
             logger.warning(f"更新组卡数据失败 ({region}): {get_exc_desc(e)}")
+
+    # Preview 初始化是去重后台任务，不等待 builder 或旁路节点，不阻塞正式同步周期。
+    preview_manager.wake()

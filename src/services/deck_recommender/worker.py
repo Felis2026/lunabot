@@ -13,6 +13,7 @@ from hashlib import md5
 import multiprocessing as mp
 from multiprocessing import Queue, Process
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from queue import Empty
 from typing import Any
 import threading
@@ -38,7 +39,9 @@ class Worker:
         self.recommender = SekaiDeckRecommend()
         self.masterdata_version: dict[str, str] = {}
         self.masterdata_fingerprint: dict[str, str] = {}
+        self.masterdata_path: dict[str, str] = {}
         self.musicmetas_update_ts: dict[str, int] = {}
+        self.musicmetas_path: dict[str, str] = {}
         self.userdata_cache: list[tuple[str, DeckRecommendUserData]] = []
         self.inited = True
 
@@ -77,29 +80,73 @@ class Worker:
 
         masterdata_version = db.get('masterdata_version', {}).get(region)
         masterdata_fingerprint = db.get('masterdata_fingerprint', {}).get(region)
+        local_md_dir = db.get("masterdata_paths", {}).get(
+            region,
+            pjoin(DATA_DIR, "masterdata", region),
+        )
 
         # ================================ MasterData热更新兜底 ================================ #
         # 只比较版本号会漏掉“同版本下单文件热修”的场景。
-        # 指纹变化时也要强制重新加载本地 masterdata，避免 worker 保留旧索引。
+        # 指纹或原子版本目录变化时都要重新加载，避免 worker 保留旧索引。
         if (
             self.masterdata_version.get(region) != masterdata_version or
-            self.masterdata_fingerprint.get(region) != masterdata_fingerprint
+            self.masterdata_fingerprint.get(region) != masterdata_fingerprint or
+            self.masterdata_path.get(region) != local_md_dir
         ):
-            local_md_dir = pjoin(DATA_DIR, 'masterdata', region)
+            if not os.path.isdir(local_md_dir):
+                raise FileNotFoundError(f"MasterData目录不存在: {local_md_dir}")
             self.recommender.update_masterdata(local_md_dir, region)
             self.masterdata_version[region] = masterdata_version
             self.masterdata_fingerprint[region] = masterdata_fingerprint
+            self.masterdata_path[region] = local_md_dir
             self.log(
                 f"加载 {region} MasterData: "
                 f"v{masterdata_version} fp={(masterdata_fingerprint or 'None')[:8]}"
             )
 
         musicmetas_update_ts = db.get('musicmetas_update_ts', {}).get(region)
-        if self.musicmetas_update_ts.get(region) != musicmetas_update_ts:
-            local_mm_path = pjoin(DATA_DIR, f'musicmetas_{region}.json')
+        local_mm_path = db.get("musicmetas_paths", {}).get(
+            region,
+            pjoin(DATA_DIR, f"musicmetas_{region}.json"),
+        )
+        if (
+            self.musicmetas_update_ts.get(region) != musicmetas_update_ts or
+            self.musicmetas_path.get(region) != local_mm_path
+        ):
+            if not musicmetas_update_ts:
+                raise RuntimeError(f"{region} MusicMetas 尚未初始化")
+            if not os.path.isfile(local_mm_path):
+                raise FileNotFoundError(f"MusicMetas文件不存在: {local_mm_path}")
             self.recommender.update_musicmetas(local_mm_path, region)
             self.musicmetas_update_ts[region] = musicmetas_update_ts
+            self.musicmetas_path[region] = local_mm_path
             self.log(f"加载 {region} MusicMetas: {datetime.fromtimestamp(musicmetas_update_ts).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def ensure_data_loaded(self, region: str, expected_fingerprint: str | None) -> dict:
+        """在维护窗口内强制加载 DB 当前指针，并回报 worker 实际指纹。"""
+
+        self.init()
+        try:
+            self._update_data(region)
+            loaded_fingerprint = self.masterdata_fingerprint.get(region)
+            if expected_fingerprint is not None and loaded_fingerprint != expected_fingerprint:
+                raise RuntimeError(
+                    "Worker加载指纹不一致: "
+                    f"expected={expected_fingerprint} actual={loaded_fingerprint}"
+                )
+            return {
+                "status": "success",
+                "worker_id": self.worker_id,
+                "loaded_fingerprint": loaded_fingerprint,
+                "masterdata_path": self.masterdata_path.get(region),
+            }
+        except BaseException as e:
+            self.error("加载数据确认失败:", get_exc_desc(e))
+            return {
+                "status": "error",
+                "worker_id": self.worker_id,
+                "message": get_exc_desc(e),
+            }
 
     def cache_userdata(self, userdata_bytes: bytes) -> dict:
         self.init()
@@ -168,6 +215,8 @@ class Worker:
                 'status': 'success',
                 'result': res.to_dict(),
                 'cost_time': cost_time.total_seconds(),
+                'worker_id': self.worker_id,
+                'loaded_fingerprint': self.masterdata_fingerprint.get(region),
             }
         except BaseException as e:
             self.error(f"组卡任务#{seq}失败:", get_exc_desc(e))
@@ -332,6 +381,32 @@ class WorkerContext:
             ctx.worker = w
             yield ctx
 
+    @classmethod
+    @asynccontextmanager
+    async def reserve_all_workers(cls, task_timeout: float = 120):
+        """
+        等待所有在途推荐结束后独占全部 worker。
+
+        仅用于低频数据发布；维护标记必须在调用前设置，防止新请求持续进入队列。
+        """
+
+        if not cls.available_workers or cls.worker_num <= 0:
+            raise RuntimeError("Please call WorkerContext.init_workers() first")
+        contexts: list[WorkerContext] = []
+        try:
+            for _ in range(cls.worker_num):
+                worker = await cls.available_workers.get()
+                current = cls.all_workers.get(worker.worker_id, worker)
+                ctx = WorkerContext(task_timeout=task_timeout)
+                ctx.worker = current
+                contexts.append(ctx)
+            yield contexts
+        finally:
+            for ctx in contexts:
+                if ctx.worker is not None:
+                    current = cls.all_workers.get(ctx.worker.worker_id, ctx.worker)
+                    cls.available_workers.put_nowait(current)
+
     async def _get_result(self):
         worker_id = self.worker.worker_id
         result_queue = self.result_queues[worker_id]
@@ -366,6 +441,18 @@ class WorkerContext:
     
     async def recommend(self, region: str, options: dict, userdata_hash: str) -> dict:
         self.task_queues[self.worker.worker_id].put(('recommend', (region, options, userdata_hash,), {},))
+        return await self._get_result()
+
+    async def ensure_data_loaded(
+        self,
+        region: str,
+        expected_fingerprint: str | None,
+    ) -> dict:
+        self.task_queues[self.worker.worker_id].put((
+            "ensure_data_loaded",
+            (region, expected_fingerprint),
+            {},
+        ))
         return await self._get_result()
 
 
