@@ -1,6 +1,12 @@
 from ...utils import *
 from ..common import *
 import aiosqlite
+import json
+
+from src.services.event_tracker.final_cutoff import (
+    FinalCutoffSample,
+    get_stable_final_cutoff_sample,
+)
 
 RANKING_NAME_LEN_LIMIT = 32
 
@@ -8,6 +14,22 @@ DB_PATH = SEKAI_DATA_DIR + "/db/sk_{region}/{event_id}_ranking.db"
 
 _conns: Dict[str, aiosqlite.Connection] = {}
 _created_table_keys: Dict[str, bool] = {}
+
+
+@dataclass(frozen=True)
+class ArchiveResult:
+    """SQLite 归档前检查结果；success=False 时调用方绝不能继续压缩或删除。"""
+
+    success: bool
+    db_path: str
+    journal_mode: str = ""
+    wal_exists: bool = False
+    shm_exists: bool = False
+    integrity: str = ""
+    row_count: int = 0
+    max_id: Optional[int] = None
+    max_ts: Optional[float] = None
+    error: Optional[str] = None
 
 
 async def get_conn(region, event_id, create) -> Optional[aiosqlite.Connection]:
@@ -47,19 +69,42 @@ async def get_conn(region, event_id, create) -> Optional[aiosqlite.Connection]:
             CREATE INDEX IF NOT EXISTS idx_ranking_uid 
             ON ranking (uid)
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ranking_observation (
+                rank INTEGER PRIMARY KEY,
+                observed_ts REAL NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS final_cutoff_sample (
+                interval_seconds INTEGER NOT NULL,
+                slot INTEGER NOT NULL,
+                observed_ts REAL NOT NULL,
+                complete INTEGER NOT NULL,
+                scores_json TEXT NOT NULL,
+                PRIMARY KEY (interval_seconds, slot)
+            )
+        """)
         await conn.commit()
         _created_table_keys[cache_key] = True
 
     return conn
 
 
-async def archive_database(region: str, event_id: int):
+async def archive_database(region: str, event_id: int) -> ArchiveResult:
     """
-    归档数据库：合并WAL数据，删除临时文件，并优化文件大小。
+    为压缩准备数据库：精确 checkpoint、切换 DELETE journal 并做完整性检查。
+
+    任一步骤失败都会返回 success=False。调用方必须保留 DB/WAL/SHM，
+    不能继续生成正式 ZIP；这是防止末尾榜线只留在 WAL 中的关键约束。
     """
     path = DB_PATH.format(region=region, event_id=event_id)
     if not os.path.exists(path):
-        return
+        return ArchiveResult(
+            success=False,
+            db_path=path,
+            error="数据库文件不存在",
+        )
     
     global _conns, _created_table_keys
     if path in _conns:
@@ -69,22 +114,89 @@ async def archive_database(region: str, event_id: int):
         if cache_key in _created_table_keys:
             del _created_table_keys[cache_key]
 
-    async with aiosqlite.connect(path) as conn:
-        logger.info(f"尝试归档数据库 {path} ...")
-        await conn.execute("VACUUM;")
-        cursor = await conn.execute("PRAGMA journal_mode = DELETE;")
-        mode = await cursor.fetchone()
-        await cursor.close()
-        if mode[0] != 'delete':
-            logger.warning(f"切换模式失败，当前模式: {mode[0]}。可能是仍有其他程序连接着数据库。")
-        await conn.commit()
+    journal_mode = ""
+    integrity = ""
+    row_count = 0
+    max_id = None
+    max_ts = None
+    try:
+        logger.info(f"尝试安全归档数据库 {path} ...")
+        async with aiosqlite.connect(path, timeout=10) as conn:
+            await conn.execute("PRAGMA busy_timeout = 10000;")
+
+            cursor = await conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            checkpoint = await cursor.fetchone()
+            await cursor.close()
+            # wal_checkpoint 返回 (busy, log_frames, checkpointed_frames)。
+            if checkpoint and int(checkpoint[0]) != 0:
+                raise RuntimeError(f"WAL checkpoint仍被占用: {checkpoint}")
+
+            cursor = await conn.execute("PRAGMA journal_mode = DELETE;")
+            row = await cursor.fetchone()
+            await cursor.close()
+            journal_mode = str(row[0]).lower() if row else ""
+            if journal_mode != "delete":
+                raise RuntimeError(f"无法切换到DELETE日志模式: {row}")
+
+            cursor = await conn.execute("PRAGMA integrity_check;")
+            row = await cursor.fetchone()
+            await cursor.close()
+            integrity = str(row[0]) if row else ""
+            if integrity.lower() != "ok":
+                raise RuntimeError(f"integrity_check失败: {integrity}")
+
+            cursor = await conn.execute(
+                "SELECT COUNT(*), MAX(id), MAX(ts) FROM ranking"
+            )
+            row_count, max_id, max_ts = await cursor.fetchone()
+            await cursor.close()
+            await conn.commit()
+    except Exception as exc:
+        wal_path = path + "-wal"
+        shm_path = path + "-shm"
+        return ArchiveResult(
+            success=False,
+            db_path=path,
+            journal_mode=journal_mode,
+            wal_exists=os.path.exists(wal_path) and os.path.getsize(wal_path) > 0,
+            shm_exists=os.path.exists(shm_path),
+            integrity=integrity,
+            row_count=int(row_count or 0),
+            max_id=max_id,
+            max_ts=max_ts,
+            error=get_exc_desc(exc),
+        )
 
     wal_path = path + "-wal"
     shm_path = path + "-shm"
-    if os.path.exists(wal_path) or os.path.exists(shm_path):
-        logger.warning("警告：WAL文件仍然存在，可能有其他进程（如读取端）占用了数据库！")
-    else:
-        logger.info(f"数据库 {path} 归档完成。")
+    wal_exists = os.path.exists(wal_path) and os.path.getsize(wal_path) > 0
+    shm_exists = os.path.exists(shm_path)
+    if wal_exists or shm_exists:
+        return ArchiveResult(
+            success=False,
+            db_path=path,
+            journal_mode=journal_mode,
+            wal_exists=wal_exists,
+            shm_exists=shm_exists,
+            integrity=integrity,
+            row_count=int(row_count or 0),
+            max_id=max_id,
+            max_ts=max_ts,
+            error="checkpoint后仍残留非空WAL或SHM，可能有其他进程占用",
+        )
+
+    logger.info(f"数据库 {path} 安全归档检查完成。")
+    return ArchiveResult(
+        success=True,
+        db_path=path,
+        journal_mode=journal_mode,
+        wal_exists=False,
+        shm_exists=False,
+        integrity=integrity,
+        row_count=int(row_count or 0),
+        max_id=max_id,
+        max_ts=max_ts,
+    )
 
 
 @dataclass
@@ -215,6 +327,80 @@ async def query_latest_ranking(region: str, event_id: int, ranks: List[int] = No
         rows = await cursor.fetchall()
         await cursor.close()
         return [Ranking.from_row(row) for row in rows]
+
+
+async def query_ranking_observation_times(
+    region: str,
+    event_id: int,
+    ranks: List[int],
+) -> Dict[int, datetime]:
+    """读取各档最后一次被接口成功观测到的时间；旧库无记录时返回空字典。"""
+
+    conn = await get_conn(region, event_id, create=False)
+    if not conn or not ranks:
+        return {}
+    placeholders = ", ".join("?" for _ in ranks)
+    cursor = await conn.execute(
+        f"""
+        SELECT rank, observed_ts
+        FROM ranking_observation
+        WHERE rank IN ({placeholders})
+        """,
+        ranks,
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return {
+        int(rank): datetime.fromtimestamp(float(observed_ts))
+        for rank, observed_ts in rows
+    }
+
+
+# ================================ 结榜确认样本 ================================ #
+
+def _final_cutoff_sample_from_row(row) -> FinalCutoffSample:
+    """把榜线数据库中的确认采样行转换为共享结构。"""
+
+    interval_seconds, slot, observed_ts, complete, scores_json = row
+    return FinalCutoffSample(
+        interval_seconds=int(interval_seconds),
+        slot=int(slot),
+        observed_at_ms=int(float(observed_ts) * 1000),
+        complete=bool(complete),
+        scores={
+            int(rank): int(score)
+            for rank, score in json.loads(scores_json).items()
+        },
+    )
+
+
+async def query_stable_final_cutoff_sample(
+    region: str,
+    event_id: int,
+    interval_seconds: int,
+    required_count: int,
+) -> Optional[FinalCutoffSample]:
+    """返回最近连续 N 个检查槽中已经确认一致的最后一份完整快照。"""
+
+    conn = await get_conn(region, event_id, create=False)
+    if not conn:
+        return None
+    cursor = await conn.execute(
+        """
+        SELECT interval_seconds, slot, observed_ts, complete, scores_json
+        FROM final_cutoff_sample
+        WHERE interval_seconds = ?
+        ORDER BY slot DESC
+        LIMIT ?
+        """,
+        (int(interval_seconds), int(required_count)),
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return get_stable_final_cutoff_sample(
+        (_final_cutoff_sample_from_row(row) for row in rows),
+        int(required_count),
+    )
 
 
 async def query_first_ranking_after(

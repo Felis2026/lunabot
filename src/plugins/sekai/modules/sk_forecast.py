@@ -192,13 +192,44 @@ async def get_snowy_forecast_data(region: str, event_id: int, chapter_id: int | 
         event_id=event_id,
     )
 
-    # 新接口先校验活动列表，避免上游尚未切到当前活动时误读旧数据。
-    events_resp = await download_json(cfg['events_url'].format(region=region))
-    if not isinstance(events_resp, list) or not any(int(event.get('event_id', 0)) == event_id for event in events_resp):
-        raise GetForecastException("最新活动预测未更新")
+    # ================================ Moesekai配置兼容 ================================ #
+    # latest_url 是新接口的唯一必需地址；events_url 只是可选的提前可用性检查。
+    # 旧版 url 返回结构与新接口不同，不能静默套用，否则容易把旧活动误当成当前预测。
+    latest_url = str(cfg.get('latest_url') or '').strip()
+    if not latest_url:
+        legacy_hint = "；检测到已废弃的 url 字段" if cfg.get('url') else ""
+        raise GetForecastException(
+            f"Moesekai未配置 latest_url{legacy_hint}，请更新预测配置"
+        )
 
-    resp = await download_json(cfg['latest_url'].format(region=region, event_id=event_id))
-    if int(resp.get('event_id', 0)) != data.event_id:
+    configured_ranks = {
+        int(rank)
+        for rank in (cfg.get('ranks') or [])
+    }
+    if not configured_ranks:
+        raise GetForecastException("Moesekai未配置预测档位 ranks")
+
+    events_url = str(cfg.get('events_url') or '').strip()
+    if events_url:
+        events_resp = await download_json(events_url.format(region=region))
+        event_is_available = (
+            isinstance(events_resp, list)
+            and any(
+                isinstance(item, dict)
+                and str(item.get('event_id', '')) == str(event_id)
+                for item in events_resp
+            )
+        )
+        if not event_is_available:
+            raise GetForecastException("最新活动预测未更新")
+
+    resp = await download_json(
+        latest_url.format(region=region, event_id=event_id)
+    )
+    if (
+        not isinstance(resp, dict)
+        or str(resp.get('event_id', '')) != str(data.event_id)
+    ):
         raise GetForecastException("最新活动预测未更新")
 
     updated_at = resp.get('updated_at')
@@ -206,9 +237,11 @@ async def get_snowy_forecast_data(region: str, event_id: int, chapter_id: int | 
         raise GetForecastException("最新活动预测缺少更新时间")
     data.forecast_ts = int(datetime.fromisoformat(updated_at.replace('Z', '+00:00')).timestamp())
 
-    for item in resp.get('items', []):
+    for item in resp.get('items') or []:
+        if not isinstance(item, dict) or item.get('rank') is None:
+            continue
         rank = int(item['rank'])
-        if rank not in cfg['ranks']:
+        if rank not in configured_ranks:
             continue
 
         # 新接口在高档位可能只返回实时分数而不给预测值，这里显式跳过空预测。

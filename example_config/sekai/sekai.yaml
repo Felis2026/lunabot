@@ -209,7 +209,12 @@ sk:
 
   plot_point_num_limit: 5000
 
-  record_time_after_event_end_minutes: 0
+  # 普通历史只记录到结榜后 10 分钟；后续校验样本不会写入常规榜线曲线。
+  record_time_after_event_end_minutes: 10
+  final_cutoff:
+    # 结榜后每 30 分钟单独校验一次；连续三次完整分数一致才固化。
+    sample_interval_minutes: 30
+    stable_sample_count: 3
   update_ranking_log_interval: 30
   csb_judge_stop_threshold_minutes: 5
   
@@ -234,7 +239,8 @@ sk:
       sample_interval_minutes: 10
       start_after_hours: 1
       end_before_hours: 4
-      ranks: [100, 500, 1000, 5000, 10000]
+      # 与 Moesekai 使用相同的常用预测档位，历史训练 CSV 也必须覆盖这一整组。
+      ranks: [50, 100, 200, 300, 400, 500, 1000, 2000, 3000, 4000, 5000, 10000]
 
     33kit:
       name: "33Kit预测"
@@ -247,15 +253,17 @@ sk:
       url: https://sekai-data.3-3.dev/predict.json
 
     snowy:
-      name: "SnowyBot预测"
+      name: "Moesekai预测"
       enabled: true
       regions: ['jp', 'cn']
       support_wl: false
       show_history: true
       update_interval_minutes: 10
       error_retry_minutes: 10
-      url: https://sekaibangdan.exmeaning.com/api/public/v1/{region}data/{event_id}
-      ranks: [10, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000, 10000, 50000, 100000]
+      # events_url 可选，用于在请求预测前确认活动已经被上游收录。
+      events_url: https://rk.exmeaning.com/public/events?region={region}
+      latest_url: https://rk.exmeaning.com/public/event/{event_id}/latest?region={region}
+      ranks: [50, 100, 200, 300, 400, 500, 1000, 2000, 3000, 4000, 5000, 10000]
 
     sekarun:
       name: "SekaRun预测"

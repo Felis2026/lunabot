@@ -1,17 +1,37 @@
 from .utils import *
 from .master import MasterDataManager
 from .gameapi import get_gameapi_config, request_gameapi, close_session
-from .sql import insert_rankings, Ranking, close_conn
+from .sql import (
+    Ranking,
+    close_conn,
+    has_final_cutoff_sample,
+    insert_rankings,
+    query_latest_final_cutoff_sample,
+    query_stable_final_cutoff_sample,
+    reserve_final_cutoff_sample,
+)
+from .final_cutoff import (
+    get_expected_final_cutoff_ranks,
+    get_final_cutoff_sample_slot,
+)
 from tenacity import retry, wait_fixed, stop_after_attempt
 
 
 set_log_level('INFO')
 
-ALL_SERVER_REGIONS = ['cn']
+ALL_SERVER_REGIONS = ['cn', 'jp']
 
-RECORD_TIME_AFTER_EVENT_END_CFG = config.item('sk.record_time_after_event_end_minutes')
 RECORD_INTERVAL_CFG = config.item('sk.record_interval_seconds')
 HIGH_RES_RECORD_INTERVAL_CFG = config.item('sk.high_res_record.interval_seconds')
+RECORD_TIME_AFTER_EVENT_END_CFG = config.item(
+    'sk.record_time_after_event_end_minutes'
+)
+FINAL_CUTOFF_SAMPLE_INTERVAL_CFG = config.item(
+    'sk.final_cutoff.sample_interval_minutes'
+)
+FINAL_CUTOFF_STABLE_SAMPLE_COUNT_CFG = config.item(
+    'sk.final_cutoff.stable_sample_count'
+)
 
 mds = MasterDataManager('data/sekai/assets/masterdata')
 
@@ -19,6 +39,39 @@ latest_rankings_cache: dict[str, dict[int, dict[int, Ranking]]] = {}
 
 
 # ================================ 处理逻辑 ================================ #
+
+@dataclass(frozen=True)
+class RankingUpdatePlan:
+    """一次榜单更新计划；结榜确认轮次必须强制使用完整榜线响应。"""
+
+    event_id: int
+    is_high_res: bool
+    final_cutoff_sample_slot: Optional[int] = None
+
+
+def get_final_cutoff_sample_interval_seconds() -> int:
+    """读取结榜确认间隔；旧配置缺少字段时固定回退到 30 分钟。"""
+
+    minutes = int(FINAL_CUTOFF_SAMPLE_INTERVAL_CFG.get(30, False))
+    return max(60, minutes * 60)
+
+
+def get_final_cutoff_stable_sample_count() -> int:
+    """读取连续一致次数；至少需要一次完整快照。"""
+
+    return max(1, int(FINAL_CUTOFF_STABLE_SAMPLE_COUNT_CFG.get(3, False)))
+
+
+def get_regular_record_end_time(event: dict) -> datetime:
+    """常规榜线在结榜后继续记录一小段时间，默认延迟 10 分钟截止。"""
+
+    end_time = datetime.fromtimestamp(event['aggregateAt'] / 1000 + 1)
+    delay_minutes = max(
+        0,
+        int(RECORD_TIME_AFTER_EVENT_END_CFG.get(10, False)),
+    )
+    return end_time + timedelta(minutes=delay_minutes)
+
 
 def get_wl_chapter_cid(region: str, wl_id: int) -> Optional[int]:
     """获取wl_id对应的角色cid，wl_id对应普通活动则返回None"""
@@ -118,6 +171,11 @@ def get_wl_events(region: str, event_id: int) -> list[dict]:
         wl_event['id'] = chapter['chapterNo'] * 1000 + event['id']
         wl_event['startAt'] = chapter['chapterStartAt']
         wl_event['aggregateAt'] = chapter['aggregateAt']
+        # 单章节 finale 也需要保留类型与实际结束时间，供终线和归档流程识别。
+        wl_event['chapterNo'] = chapter['chapterNo']
+        wl_event['chapterEndAt'] = chapter.get('chapterEndAt')
+        wl_event['worldBloomChapterType'] = chapter.get('worldBloomChapterType', 'game_character')
+        wl_event['isSupplemental'] = chapter.get('isSupplemental', False)
         wl_event['wl_cid'] = chapter.get('gameCharacterId', None)
         wl_events.append(wl_event)
     return sorted(wl_events, key=lambda x: x['startAt'])
@@ -194,7 +252,13 @@ class EventTracker:
             return (None, datetime.now().timestamp() - t)
         
 
-    async def update_rankings(self, eid: int, data: dict, is_high_res: bool) -> tuple[int, int, float]:
+    async def update_rankings(
+        self,
+        eid: int,
+        data: dict,
+        is_high_res: bool,
+        final_cutoff_sample_slot: Optional[int] = None,
+    ) -> tuple[int, int, float]:
         """
         更新总榜或WL单榜，返回 (活动id, 插入数量, 耗时)
         """
@@ -202,6 +266,30 @@ class EventTracker:
         region = self.region
         try:
             top100, borders = parse_rankings(region, eid, data)
+
+            # 30 分钟确认轮次只写独立样本表，不得继续追加普通榜线、
+            # 更新常规观测时间或污染结榜后 10 分钟截止的历史曲线。
+            if final_cutoff_sample_slot is not None:
+                await insert_rankings(
+                    region,
+                    eid,
+                    [],
+                    observed_rankings=[*top100, *borders],
+                    update_observation_times=False,
+                    final_cutoff_sample_slot=final_cutoff_sample_slot,
+                    final_cutoff_sample_interval_seconds=(
+                        get_final_cutoff_sample_interval_seconds()
+                    ),
+                    final_cutoff_expected_ranks=get_expected_final_cutoff_ranks(
+                        region,
+                        board="chapter" if eid >= 1000 else "overall",
+                    ),
+                )
+                return (
+                    eid,
+                    0,
+                    datetime.now().timestamp() - t,
+                )
 
             # 高精度记录模式：只记录必要的榜线
             if is_high_res:
@@ -231,15 +319,83 @@ class EventTracker:
                 for item in borders:
                     latest_rankings_cache[region][eid][item.rank] = item
 
-            # 插入数据库
-            if rankings_to_insert:
-                await insert_rankings(region, eid, rankings_to_insert)
+            # 分数沿用原有 top100/border 追加策略；每轮成功响应另行更新轻量
+            # 观测时间，供结榜固化区分“分数稳定”和“接口长期未返回该档位”。
+            await insert_rankings(
+                region,
+                eid,
+                rankings_to_insert,
+                observed_rankings=[*top100, *borders],
+            )
 
             return (eid, len(rankings_to_insert), datetime.now().timestamp() - t)
 
         except Exception as e:
             self.error(f"插入 {eid} 榜线数据失败: {get_exc_desc(e)}")
             return (eid, 0, datetime.now().timestamp() - t)
+
+
+    async def build_update_plan(
+        self,
+        tracked_event: dict,
+        requested_high_res: bool,
+        now: datetime,
+    ) -> Optional[RankingUpdatePlan]:
+        """
+        为总榜或章节榜生成本轮更新计划。
+
+        活动中及结榜后 10 分钟沿用原采集精度；之后只在固定 30 分钟槽
+        首次到达时校验完整榜线，三个连续槽稳定后立即停止后续请求。
+        """
+
+        start_time = datetime.fromtimestamp(tracked_event['startAt'] / 1000)
+        event_id = int(tracked_event['id'])
+        if now < start_time:
+            return None
+        if now <= get_regular_record_end_time(tracked_event):
+            return RankingUpdatePlan(
+                event_id=event_id,
+                is_high_res=requested_high_res,
+            )
+        interval_seconds = get_final_cutoff_sample_interval_seconds()
+        observed_at_ms = int(now.timestamp() * 1000)
+        slot = get_final_cutoff_sample_slot(
+            int(tracked_event['aggregateAt']),
+            observed_at_ms,
+            interval_seconds,
+        )
+        if slot is None:
+            return None
+        if await query_stable_final_cutoff_sample(
+            self.region,
+            event_id,
+            interval_seconds,
+            get_final_cutoff_stable_sample_count(),
+        ):
+            return None
+        latest_sample = await query_latest_final_cutoff_sample(
+            self.region,
+            event_id,
+            interval_seconds,
+        )
+        if (
+            latest_sample
+            and observed_at_ms
+            < latest_sample.observed_at_ms + interval_seconds * 1000
+        ):
+            return None
+        if await has_final_cutoff_sample(
+            self.region,
+            event_id,
+            interval_seconds,
+            slot,
+        ):
+            return None
+        return RankingUpdatePlan(
+            event_id=event_id,
+            is_high_res=False,
+            final_cutoff_sample_slot=slot,
+        )
 
 
     async def update_region_ranking_task(self, is_high_res: bool) -> dict:
@@ -256,10 +412,6 @@ class EventTracker:
                 self.info(f"当前无进行中或已结束活动，跳过榜线更新")
                 await close_conn(region)
                 return ret
-            if datetime.now() > datetime.fromtimestamp(event['aggregateAt'] / 1000 + RECORD_TIME_AFTER_EVENT_END_CFG.get() * 60):
-                self.info(f"当前活动 {event['id']} 已过榜线记录时间，跳过榜线更新")
-                await close_conn(region)
-                return ret
         except Exception as e:
             self.warning(f"检查当前活动时失败: {get_exc_desc(e)}")
 
@@ -270,26 +422,57 @@ class EventTracker:
                 latest_rankings_cache[region].pop(key)
                 self.info(f"清除非当前活动 {key} 的榜线缓存数据")
 
+        now = datetime.now()
+        plans = []
+        if plan := await self.build_update_plan(event, is_high_res, now):
+            plans.append(plan)
+        for wl_event in get_wl_events(region, event_id):
+            if plan := await self.build_update_plan(wl_event, is_high_res, now):
+                plans.append(plan)
+
+        # 结榜后的非检查槽不请求上游；下一次基础循环只做本地槽位判断。
+        if not plans:
+            return ret
+
+        interval_seconds = get_final_cutoff_sample_interval_seconds()
+        reserved_plans = []
+        for plan in plans:
+            if plan.final_cutoff_sample_slot is None:
+                reserved_plans.append(plan)
+                continue
+            try:
+                await reserve_final_cutoff_sample(
+                    region,
+                    plan.event_id,
+                    interval_seconds,
+                    plan.final_cutoff_sample_slot,
+                    now,
+                )
+                reserved_plans.append(plan)
+            except Exception as exc:
+                self.error(
+                    f"占用结榜确认槽失败 event={plan.event_id} "
+                    f"slot={plan.final_cutoff_sample_slot}: {get_exc_desc(exc)}"
+                )
+        plans = reserved_plans
+        if not plans:
+            return ret
+
         data, request_time = await self.request_rankings(event_id, url)
         ret['request_time'] = request_time
 
         if not data:
             return ret
 
-        tasks = []
-        # 总榜
-        tasks.append(self.update_rankings(event_id, data, is_high_res))
-        # WL单榜
-        wl_events = get_wl_events(region, event_id)
-        if wl_events and len(wl_events) > 1:
-            for wl_event in wl_events:
-                if datetime.now() > datetime.fromtimestamp(wl_event['aggregateAt'] / 1000 + RECORD_TIME_AFTER_EVENT_END_CFG.get() * 60):
-                    continue
-                tasks.append(self.update_rankings(wl_event['id'], data, is_high_res))
-
-        if not tasks: 
-            return ret
-        
+        tasks = [
+            self.update_rankings(
+                plan.event_id,
+                data,
+                plan.is_high_res,
+                plan.final_cutoff_sample_slot,
+            )
+            for plan in plans
+        ]
         for event_id, insert_num, cost_time in  await asyncio.gather(*tasks):
             ret['inserts'].append({
                 'event_id': event_id,

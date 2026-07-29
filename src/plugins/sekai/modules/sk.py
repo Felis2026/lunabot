@@ -14,9 +14,11 @@ from .event import (
     get_wl_events,
 )
 from .sk_sql import (
+    ArchiveResult,
     Ranking, 
     query_ranking, 
     query_latest_ranking, 
+    query_stable_final_cutoff_sample,
     query_first_ranking_after,
     query_update_time,
     archive_database,
@@ -26,7 +28,27 @@ from .sk_forecast import (
     save_rankings_to_csv,
     get_local_forecast_history_csv_path,
 )
+from src.services.event_tracker.final_cutoff import (
+    FINAL_CUTOFF_SUPPORTED_RANKS,
+    FinalCutoffItem,
+    FinalCutoffSnapshot,
+    get_expected_final_cutoff_ranks,
+    is_final_cutoff_ready_for_archive,
+    load_final_cutoff_snapshot,
+    save_final_cutoff_snapshot,
+    should_replace_final_cutoff_snapshot,
+)
+from .wl_args import (
+    extract_wl_chapter_selector,
+    extract_wl_role_selector,
+    extract_wl_turn_selector,
+    normalize_wl_args,
+    remove_matched_text,
+    remove_standalone_wl,
+)
 import zipfile
+import sqlite3
+import tempfile
 from matplotlib import pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.colors as mcolors
@@ -132,14 +154,7 @@ SKL_QUERY_RANKS = [
     *range(10000, 50001, 10000),
     *range(100000, 500001, 100000),
 ]
-ALL_RANKS = [
-    *range(1, 100),
-    *range(100, 501, 100),
-    *range(1000, 5001, 1000),
-    1500, 2500,
-    *range(10000, 50001, 10000),
-    *range(100000, 500001, 100000),
-]
+ALL_RANKS = list(FINAL_CUTOFF_SUPPORTED_RANKS)
 
 latest_rankings_cache: Dict[str, Dict[int, List[Ranking]]] = {}
 latest_rankings_mtime: Dict[str, Dict[int, datetime]] = {}
@@ -189,66 +204,91 @@ def get_event_id_and_name_text(region: str, event_id: int, event_name: str) -> s
         event_id = event_id % 1000
         return f"【{region.upper()}-{event_id}-第{chapter_id}章单榜】{event_name}"
 
+# 组合指令前缀和正文参数，避免旧的字符串直接拼接产生 "2wl" 一类倒序参数
+def get_wl_handler_args(ctx: SekaiHandlerContext) -> str:
+    return normalize_wl_args(f"{ctx.prefix_arg} {ctx.get_args().strip()}")
+
+
 # 从参数获取带有wl_id的wl_event，返回 (wl_event, args)，未指定章节则默认查询当前章节
 async def extract_wl_event(ctx: SekaiHandlerContext, args: str) -> Tuple[dict, str]:
-    if 'wl' not in args:
-        return None, args
-    else:
-        event = await get_current_event(ctx, fallback="prev")
-        chapters = await ctx.md.world_blooms.find_by('eventId', event['id'], mode='all')
-        assert_and_reply(chapters, f"当期活动{ctx.region.upper()}-{event['id']}并不是WorldLink活动")
+    args = normalize_wl_args(args)
 
-        # 通过"wl序号"查询章节
-        def query_by_seq() -> Tuple[Optional[int], Optional[str]]:
-            for i in range(len(chapters)):
-                carg = f"wl{i+1}"
-                if carg in args:
-                    chapter_id = i + 1
-                    return chapter_id, carg
-            return None, None
-        # 通过"wl角色昵称"查询章节
-        def query_by_nickname() -> Tuple[Optional[int], Optional[str]]:
-            for nickname, cid in get_character_nickname_data().nickname_ids:
-                for carg in (f"wl{nickname}", f"-c {nickname}", f"{nickname}"):
-                    if carg in args:
-                        chapter = find_by(chapters, "gameCharacterId", cid)
-                        assert_and_reply(chapter, f"当期活动{ctx.region.upper()}-{event['id']}并没有角色{nickname}的章节")
-                        chapter_id = chapter['chapterNo']
-                        return chapter_id, carg
-            return None, None
-        # 查询当前章节
-        def query_current() -> Tuple[Optional[int], Optional[str]]:
-            now = datetime.now()
-            chapters.sort(key=lambda x: x['chapterNo'], reverse=True)
-            for chapter in chapters:
-                start = datetime.fromtimestamp(chapter['chapterStartAt'] / 1000)
-                if start <= now:
-                    chapter_id = chapter['chapterNo']
-                    return chapter_id, "wl"
-            return None, None
-        
-        chapter_id, carg = query_by_seq()
-        if not chapter_id:
-            chapter_id, carg = query_by_nickname()
-        if not chapter_id:
-            chapter_id, carg = query_current()
-        assert_and_reply(chapter_id, f"""
+    # wl1/wl2 从现在起只表示第几次 WL 活动；实时榜线指令没有历史活动选择能力，
+    # 因此应明确引导到新章节语法或 /历史榜线，不能继续悄悄解释为章节号。
+    if turn_selector := extract_wl_turn_selector(args):
+        raise ReplyException(
+            f"`{turn_selector.matched_text}` 现在表示第{turn_selector.turn}次WL活动，不再表示章节。\n"
+            f"查询当期第{turn_selector.turn}章请使用“章节{turn_selector.turn}”；"
+            "查询往期请使用“/历史榜线 活动ID 章节N”"
+        )
+
+    nickname_pairs = list(get_character_nickname_data().nickname_ids)
+    nicknames = [nickname for nickname, _ in nickname_pairs]
+    for nickname in nicknames:
+        if f"wl{nickname}" in args.lower():
+            raise ReplyException(f"`wl{nickname}` 已改为 `角色{nickname}`")
+
+    chapter_id, chapter_arg = extract_wl_chapter_selector(args)
+    has_current_wl, args_without_wl = remove_standalone_wl(args)
+    role_nickname, role_arg = extract_wl_role_selector(
+        args_without_wl,
+        nicknames,
+        allow_bare=has_current_wl,
+    )
+    assert_and_reply(
+        not (chapter_id and role_nickname),
+        "不能同时指定章节号和角色章节",
+    )
+
+    if not has_current_wl and chapter_id is None and role_nickname is None:
+        return None, args
+
+    event = await get_current_event(ctx, fallback="prev")
+    assert_and_reply(event, "未找到当前或上一期活动")
+    chapters = await ctx.md.world_blooms.find_by('eventId', event['id'], mode='all')
+    assert_and_reply(chapters, f"当期活动{ctx.region.upper()}-{event['id']}并不是WorldLink活动")
+
+    if chapter_id is not None:
+        chapter = find_by(chapters, "chapterNo", chapter_id)
+        assert_and_reply(chapter, f"当期活动{ctx.region.upper()}-{event['id']}并没有章节{chapter_id}")
+        selector_desc = f"章节{chapter_id}"
+    elif role_nickname is not None:
+        cid = find_by_predicate(nickname_pairs, lambda item: item[0] == role_nickname)[1]
+        chapter = find_by(chapters, "gameCharacterId", cid)
+        assert_and_reply(chapter, f"当期活动{ctx.region.upper()}-{event['id']}并没有角色{role_nickname}的章节")
+        selector_desc = f"角色{role_nickname}"
+    else:
+        now = datetime.now()
+        available_chapters = [
+            chapter for chapter in chapters
+            if datetime.fromtimestamp(chapter['chapterStartAt'] / 1000) <= now
+        ]
+        available_chapters.sort(key=lambda item: item['chapterNo'], reverse=True)
+        assert_and_reply(available_chapters, """
 查询WL活动榜线需要指定章节，可用参数格式:
 1. wl: 查询当前章节
-2. wl2: 查询第二章
-3. wlmiku: 查询miku章节
+2. 章节2: 查询第二章
+3. 角色miku: 查询miku章节
 """.strip())
+        chapter = available_chapters[0]
+        selector_desc = "当前章节"
 
-        chapter = find_by(chapters, "chapterNo", chapter_id)
-        event = event.copy()
-        event['id'] = chapter_id * 1000 + event['id']
-        event['startAt'] = chapter['chapterStartAt']
-        event['aggregateAt'] = chapter['aggregateAt']
-        event['wl_cid'] = chapter.get('gameCharacterId', None)
-        args = args.replace(carg, "").replace("wl", "")
+    base_event_id = event['id']
+    event = event.copy()
+    event['id'] = chapter['chapterNo'] * 1000 + base_event_id
+    event['startAt'] = chapter['chapterStartAt']
+    event['aggregateAt'] = chapter['aggregateAt']
+    event['chapterNo'] = chapter['chapterNo']
+    event['chapterEndAt'] = chapter.get('chapterEndAt')
+    event['worldBloomChapterType'] = chapter.get('worldBloomChapterType', 'game_character')
+    event['isSupplemental'] = chapter.get('isSupplemental', False)
+    event['wl_cid'] = chapter.get('gameCharacterId', None)
 
-        logger.info(f"查询WL活动章节: chapter_arg={carg} wl_id={event['id']}")
-        return event, args
+    remaining_args = args_without_wl
+    remaining_args = remove_matched_text(remaining_args, chapter_arg)
+    remaining_args = remove_matched_text(remaining_args, role_arg)
+    logger.info(f"查询WL活动章节: selector={selector_desc} wl_id={event['id']}")
+    return event, remaining_args
 
 # 绘制昼夜变化背景
 def draw_daynight_bg(ax, start_time: datetime, end_time: datetime):
@@ -405,6 +445,7 @@ def get_board_score_str(score: int, width: int = None, precise: bool = True) -> 
         ret = ret.rjust(width)
     return ret
 
+
 # ================================ 榜线数字列对齐 ================================ #
 
 # 数字区按典型最大值居中，区内右对齐，使各行末尾的 w 落在同一竖线上。
@@ -467,6 +508,49 @@ def get_rank_from_text(s: str) -> int:
     except:
         raise ReplyException(f"无法解析的排名\"{s}\"")
 
+
+# ================================ JP结榜参考 ================================ #
+
+async def get_jp_final_reference_snapshot(
+    ctx: SekaiHandlerContext,
+    event: dict,
+) -> Optional[FinalCutoffSnapshot]:
+    """
+    为 CN 预测表读取同编号活动的 JP 最终线。
+
+    JP 最终线是可选展示数据，文件损坏或跨服活动身份不一致时不能拖垮
+    `/skp` 主功能；活动资源名和类型都一致才允许展示，避免错配同 ID 活动。
+    """
+
+    if ctx.region != "cn":
+        return None
+
+    event_id = int(event["id"])
+    try:
+        snapshot = load_final_cutoff_snapshot("jp", event_id)
+        if snapshot is None:
+            return None
+
+        jp_ctx = SekaiHandlerContext.from_region("jp")
+        jp_event = await jp_ctx.md.events.find_by_id(event_id)
+        if not jp_event:
+            logger.warning(f"跳过 CN-{event_id} 的JP结榜参考：JP MasterData中没有同ID活动")
+            return None
+
+        same_asset = jp_event.get("assetbundleName") == event.get("assetbundleName")
+        same_type = jp_event.get("eventType") == event.get("eventType")
+        if not same_asset or not same_type:
+            logger.warning(
+                f"跳过 CN-{event_id} 的JP结榜参考：跨服活动身份不一致 "
+                f"asset={same_asset} type={same_type}"
+            )
+            return None
+        return snapshot
+    except Exception as exc:
+        logger.warning(f"读取 CN-{event_id} 的JP结榜参考失败: {get_exc_desc(exc)}")
+        return None
+
+
 # 合成榜线预测图片
 async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
     event = await get_current_event(ctx, fallback="prev")
@@ -498,6 +582,13 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
     ranks = sorted(ranks)
 
     latest_rankings = await get_latest_ranking(ctx, event_id, ranks)
+    jp_final_snapshot = await get_jp_final_reference_snapshot(ctx, event)
+    jp_final_scores = {
+        cutoff.rank: cutoff.score
+        for cutoff in (jp_final_snapshot.cutoffs if jp_final_snapshot else [])
+    }
+    # 完全没有可用 JP 归档时隐藏整列；已有归档但个别档位缺失时才显示“-”。
+    show_jp_final_reference = bool(jp_final_scores)
 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_item_bg(roundrect_bg()):
@@ -525,7 +616,8 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                     ImageBox(banner_img, size=(140, None))
 
             gh, gw = 30, 180
-            with Grid(col_count=len(sources)+2).set_content_align('c').set_sep(hsep=8, vsep=5).set_padding(16):
+            column_count = len(sources) + 2 + int(show_jp_final_reference)
+            with Grid(col_count=column_count).set_content_align('c').set_sep(hsep=8, vsep=5).set_padding(16):
                 bg1 = FillBg((255, 255, 255, 200))
                 bg2 = FillBg((255, 255, 255, 100))
                 title_style = TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK)
@@ -535,6 +627,8 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                 TextBox("当前榜线", title_style).set_bg(bg1).set_size((gw, gh)).set_content_align('c')
                 for source in sources.keys():
                     TextBox(sources[source]['name'], title_style).set_bg(bg1).set_size((gw, gh)).set_content_align('c')
+                if show_jp_final_reference:
+                    TextBox("JP结榜参考", title_style).set_bg(bg1).set_size((gw, gh)).set_content_align('c')
 
                 bg = bg1
                 for i, rank in enumerate(ranks):
@@ -559,6 +653,14 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                             forecast_final, item_style, bg, gw, gh, SKP_SCORE_ALIGNMENT_REFERENCE
                         )
 
+                    if show_jp_final_reference:
+                        jp_final_text = "-"
+                        if rank in jp_final_scores:
+                            jp_final_text = get_board_score_str(jp_final_scores[rank])
+                        add_aligned_board_number_cell(
+                            jp_final_text, item_style, bg, gw, gh, SKP_SCORE_ALIGNMENT_REFERENCE
+                        )
+
                 OUTDATE_COLOR = (200, 0, 0)
                 FROZEN_COLOR = (0, 100, 200)
 
@@ -580,6 +682,8 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                             forcast_time_text = forcast_time_text.removesuffix("⚠️") + "❄️"
                         style = style.replace(color=FROZEN_COLOR)
                     TextBox(forcast_time_text, style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('c').set_padding((0, 0))
+                if show_jp_final_reference:
+                    TextBox("-", item_style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('c').set_padding((0, 0))
 
                 bg = bg2 if bg == bg1 else bg1
                 TextBox("获取时间", title_style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('c')
@@ -595,12 +699,61 @@ async def compose_skp_image(ctx: SekaiHandlerContext) -> Image.Image:
                         if update_time_text != '-': update_time_text += "❄️"
                         style = style.replace(color=FROZEN_COLOR)
                     TextBox(update_time_text, style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('c').set_padding((0, 0))
+                if show_jp_final_reference:
+                    jp_final_time_text = "-"
+                    if jp_final_snapshot:
+                        jp_final_time_text = datetime.fromtimestamp(
+                            jp_final_snapshot.finalized_at_ms / 1000
+                        ).strftime("%Y-%m-%d")
+                    TextBox(jp_final_time_text, item_style, overflow='clip').set_bg(bg).set_size((gw, gh)).set_content_align('c').set_padding((0, 0))
 
     add_watermark(canvas)
     return await canvas.get_img()
 
-# 合成整体榜线图片
-async def compose_skl_image(ctx: SekaiHandlerContext, event: dict = None, full: bool = False) -> Image.Image:
+# ================================ 历史榜线视图提示 ================================ #
+
+def get_history_cutoff_query_command(
+    ctx: SekaiHandlerContext,
+    snapshot: FinalCutoffSnapshot,
+    *,
+    full: bool,
+) -> str:
+    """生成不会受用户默认区服影响的历史榜线切换指令。"""
+
+    command = f"/{ctx.region}历史榜线 {snapshot.event_id}"
+    if snapshot.board.get("kind") == "chapter":
+        if snapshot.board.get("chapter_type") == "finale":
+            command += " 终章"
+        else:
+            command += f" 章节{snapshot.board.get('chapter_no')}"
+    if full:
+        command += " full"
+    return command
+
+
+def get_history_cutoff_view_tip(
+    ctx: SekaiHandlerContext,
+    snapshot: FinalCutoffSnapshot,
+    *,
+    full: bool,
+) -> str:
+    """用两行短提示给出常用版与完整版之间的切换指令。"""
+
+    if full:
+        compact_command = get_history_cutoff_query_command(ctx, snapshot, full=False)
+        return f"历史榜线•查看常用版请输入\n{compact_command}"
+
+    full_command = get_history_cutoff_query_command(ctx, snapshot, full=True)
+    return f"历史榜线•查看完整版请输入\n{full_command}"
+
+
+# 合成整体榜线图片；传入 final_snapshot 时复用同一套版式展示历史最终线
+async def compose_skl_image(
+    ctx: SekaiHandlerContext,
+    event: dict = None,
+    full: bool = False,
+    final_snapshot: FinalCutoffSnapshot = None,
+) -> Image.Image:
     if not event:
         event = await get_current_event(ctx, fallback="prev")
     assert_and_reply(event, "未找到当前活动")
@@ -612,7 +765,21 @@ async def compose_skl_image(ctx: SekaiHandlerContext, event: dict = None, full: 
     wl_cid = await get_wl_chapter_cid(ctx, eid)
 
     query_ranks = ALL_RANKS if full else SKL_QUERY_RANKS
-    ranks = await get_latest_ranking(ctx, eid, query_ranks)
+    if final_snapshot:
+        finalized_time = datetime.fromtimestamp(final_snapshot.finalized_at_ms / 1000)
+        ranks = [
+            Ranking(
+                uid="",
+                name="",
+                score=cutoff.score,
+                rank=cutoff.rank,
+                time=finalized_time,
+            )
+            for cutoff in final_snapshot.cutoffs
+            if cutoff.rank in query_ranks
+        ]
+    else:
+        ranks = await get_latest_ranking(ctx, eid, query_ranks)
     ranks = sorted(ranks, key=lambda x: x.rank)
     
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
@@ -622,12 +789,23 @@ async def compose_skl_image(ctx: SekaiHandlerContext, event: dict = None, full: 
                     TextBox(get_event_id_and_name_text(ctx.region, eid, truncate(title, 16)), TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK))
                     TextBox(f"{event_start.strftime('%Y-%m-%d %H:%M')} ~ {event_end.strftime('%Y-%m-%d %H:%M')}", 
                             TextStyle(font=DEFAULT_FONT, size=18, color=BLACK))
-                    time_to_end = event_end - datetime.now()
-                    if time_to_end.total_seconds() <= 0:
-                        time_to_end = "活动已结束"
+                    if final_snapshot:
+                        time_to_end = get_history_cutoff_view_tip(
+                            ctx,
+                            final_snapshot,
+                            full=full,
+                        )
                     else:
-                        time_to_end = f"距离活动结束还有{get_readable_timedelta(time_to_end)}"
-                    TextBox(time_to_end, TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK))
+                        time_to_end = event_end - datetime.now()
+                        if time_to_end.total_seconds() <= 0:
+                            time_to_end = "活动已结束"
+                        else:
+                            time_to_end = f"距离活动结束还有{get_readable_timedelta(time_to_end)}"
+                    TextBox(
+                        time_to_end,
+                        TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK),
+                        use_real_line_count=final_snapshot is not None,
+                    )
                 with Frame().set_content_align('r'):
                     if banner_img:
                         ImageBox(banner_img, size=(140, None))
@@ -640,24 +818,28 @@ async def compose_skl_image(ctx: SekaiHandlerContext, event: dict = None, full: 
                 bg2 = FillBg((255, 255, 255, 100))
                 title_style = TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK)
                 item_style  = TextStyle(font=DEFAULT_FONT,      size=20, color=BLACK)
+                rank_column_width = 150 if final_snapshot else 140
+                score_column_width = 300 if final_snapshot else 180
                 with VSplit().set_content_align('c').set_item_align('c').set_sep(8).set_padding(8):
                     with HSplit().set_content_align('c').set_item_align('c').set_sep(5).set_padding(0):
-                        TextBox("排名", title_style).set_bg(bg1).set_size((140, gh)).set_content_align('c')
+                        TextBox("排名", title_style).set_bg(bg1).set_size((rank_column_width, gh)).set_content_align('c')
                         # TextBox("名称", title_style).set_bg(bg1).set_size((160, gh)).set_content_align('c')
-                        TextBox("分数", title_style).set_bg(bg1).set_size((180, gh)).set_content_align('c')
-                        TextBox("RT",  title_style).set_bg(bg1).set_size((180, gh)).set_content_align('c')
+                        TextBox("分数", title_style).set_bg(bg1).set_size((score_column_width, gh)).set_content_align('c')
+                        if not final_snapshot:
+                            TextBox("RT", title_style).set_bg(bg1).set_size((180, gh)).set_content_align('c')
                     for i, rank in enumerate(ranks):
                         with HSplit().set_content_align('c').set_item_align('c').set_sep(5).set_padding(0):
                             bg = bg2 if i % 2 == 0 else bg1
                             r = get_board_rank_str(rank.rank)
                             score = get_board_score_str(rank.score)
-                            rt = get_readable_datetime(rank.time, show_original_time=False, use_en_unit=False)
-                            TextBox(r, item_style, overflow='clip').set_bg(bg).set_size((140, gh)).set_content_align('c').set_padding((0, 0))
+                            TextBox(r,          item_style, overflow='clip').set_bg(bg).set_size((rank_column_width, gh)).set_content_align('c').set_padding((0, 0))
                             # TextBox(rank.name,  item_style,                ).set_bg(bg).set_size((160, gh)).set_content_align('l').set_padding((8,  0))
                             add_aligned_board_number_cell(
-                                score, item_style, bg, 180, gh, SKL_SCORE_ALIGNMENT_REFERENCE
+                                score, item_style, bg, score_column_width, gh, SKL_SCORE_ALIGNMENT_REFERENCE
                             )
-                            TextBox(rt, item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('c').set_padding((0, 0))
+                            if not final_snapshot:
+                                rt = get_readable_datetime(rank.time, show_original_time=False, use_en_unit=False)
+                                TextBox(rt, item_style, overflow='clip').set_bg(bg).set_size((180, gh)).set_content_align('c').set_padding((0, 0))
             else:
                 TextBox("暂无榜线数据", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=BLACK)).set_padding(32)
     
@@ -1629,7 +1811,7 @@ pjsk_skp = SekaiCmdHandler([
 pjsk_skp.check_cdrate(cd).check_wblist(gbl)
 @pjsk_skp.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
     assert_and_reply(not wl_event, "榜线预测不支持WL单榜")
 
@@ -1647,7 +1829,7 @@ pjsk_skl = SekaiCmdHandler([
 pjsk_skl.check_cdrate(cd).check_wblist(gbl)
 @pjsk_skl.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     full = False
@@ -1674,6 +1856,134 @@ async def _(ctx: SekaiHandlerContext):
     ))
 
 
+# ================================ 历史最终榜线 ================================ #
+
+# 查询历史最终线；总榜与 WL 章节榜共用同一套快照结构和展示入口。
+pjsk_sk_history = SekaiCmdHandler([
+    "/pjsk sk history", "/pjsk board history",
+    "/历史榜线", "/历史分数线", "/skh",
+])
+pjsk_sk_history.check_cdrate(cd).check_wblist(gbl)
+@pjsk_sk_history.handle()
+async def _(ctx: SekaiHandlerContext):
+    args = normalize_wl_args(ctx.get_args())
+
+    if turn_selector := extract_wl_turn_selector(args):
+        raise ReplyException(
+            f"`{turn_selector.matched_text}` 表示第{turn_selector.turn}次WL活动，"
+            "但历史榜线需要先确定具体活动ID。\n"
+            "请改用“/历史榜线 活动ID 总榜”或“/历史榜线 活动ID 章节N”"
+        )
+
+    full_match = re.search(r"(?i)(?<![a-z])(?:full|all)(?![a-z])|全部", args)
+    full = full_match is not None
+    if full_match:
+        args = remove_matched_text(args, full_match.group(0))
+
+    overall_match = re.search(r"总榜|overall", args, re.IGNORECASE)
+    if overall_match:
+        args = remove_matched_text(args, overall_match.group(0))
+
+    finale_match = re.search(r"终章|finale", args, re.IGNORECASE)
+    if finale_match:
+        args = remove_matched_text(args, finale_match.group(0))
+
+    chapter_no, chapter_arg = extract_wl_chapter_selector(args)
+    if chapter_arg:
+        args = remove_matched_text(args, chapter_arg)
+
+    nickname_pairs = list(get_character_nickname_data().nickname_ids)
+    role_nickname, role_arg = extract_wl_role_selector(
+        args,
+        [nickname for nickname, _ in nickname_pairs],
+        allow_bare=False,
+    )
+    if role_arg:
+        args = remove_matched_text(args, role_arg)
+
+    selector_count = sum([
+        overall_match is not None,
+        finale_match is not None,
+        chapter_no is not None,
+        role_nickname is not None,
+    ])
+    assert_and_reply(selector_count <= 1, "总榜、章节、角色章节和终章只能选择一种")
+    assert_and_reply(args, """
+历史榜线需要指定活动，例如：
+1. /jp历史榜线 170
+2. /jp历史榜线 170 full
+3. /jp历史榜线 170 章节2
+""".strip())
+
+    try:
+        event = await parse_search_single_event_args(ctx, args)
+    except Exception:
+        raise ReplyException(
+            "活动参数错误，可使用活动ID、倒数序号或箱活简称；"
+            f"例如：{ctx.original_trigger_cmd} 170"
+        )
+
+    base_event_id = event["id"]
+    selected_event = event
+    selected_chapter_no = None
+    if finale_match or chapter_no is not None or role_nickname is not None:
+        wl_events = await get_wl_events(ctx, base_event_id)
+        assert_and_reply(wl_events, f"活动{ctx.region.upper()}-{base_event_id}不是World Link活动")
+
+        if finale_match:
+            selected_event = find_by_predicate(
+                wl_events,
+                lambda item: item.get("worldBloomChapterType") == "finale",
+            )
+            selector_text = "终章"
+        elif chapter_no is not None:
+            selected_event = find_by(wl_events, "chapterNo", chapter_no)
+            selector_text = f"章节{chapter_no}"
+        else:
+            role_cid = find_by_predicate(
+                nickname_pairs,
+                lambda item: item[0] == role_nickname,
+            )[1]
+            selected_event = find_by(wl_events, "wl_cid", role_cid)
+            selector_text = f"角色{role_nickname}"
+
+        assert_and_reply(
+            selected_event,
+            f"活动{ctx.region.upper()}-{base_event_id}没有{selector_text}",
+        )
+        selected_chapter_no = selected_event["chapterNo"]
+
+    try:
+        snapshot = load_final_cutoff_snapshot(
+            ctx.region,
+            base_event_id,
+            selected_chapter_no,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        logger.exception(
+            f"读取历史榜线失败 region={ctx.region} event_id={base_event_id} "
+            f"chapter_no={selected_chapter_no}"
+        )
+        raise ReplyException(f"历史榜线归档损坏或格式不兼容：{exc}")
+
+    board_text = "总榜" if selected_chapter_no is None else f"章节{selected_chapter_no}"
+    assert_and_reply(
+        snapshot,
+        f"暂未归档 {ctx.region.upper()}-{base_event_id} 的{board_text}最终线。"
+        " 该榜单可能尚未结榜、旧数据缺失，或原始数据未通过完整性校验。",
+    )
+
+    return await ctx.asend_msg(await get_image_cq(
+        await compose_skl_image(
+            ctx,
+            selected_event,
+            full=full,
+            final_snapshot=snapshot,
+        ),
+        low_quality=True,
+    ))
+
+
 # 查询时速
 pjsk_sks = SekaiCmdHandler([
     "/pjsk sk speed", "/pjsk board speed",
@@ -1682,7 +1992,7 @@ pjsk_sks = SekaiCmdHandler([
 pjsk_sks.check_cdrate(cd).check_wblist(gbl)
 @pjsk_sks.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     period = timedelta(minutes=60)
@@ -1703,7 +2013,7 @@ pjsk_skds = SekaiCmdHandler([
 pjsk_skds.check_cdrate(cd).check_wblist(gbl)
 @pjsk_skds.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     period = timedelta(days=1)
@@ -1724,7 +2034,7 @@ pjsk_sk = SekaiCmdHandler([
 pjsk_sk.check_cdrate(cd).check_wblist(gbl)
 @pjsk_sk.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     qtype, qval = await parse_sk_query_params(ctx, args)
@@ -1741,7 +2051,7 @@ pjsk_cf = SekaiCmdHandler([
 pjsk_cf.check_cdrate(cd).check_wblist(gbl)
 @pjsk_cf.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     qtype, qval = await parse_sk_query_params(ctx, args)
@@ -1758,7 +2068,7 @@ pjsk_csb = SekaiCmdHandler([
 pjsk_csb.check_cdrate(cd).check_wblist(gbl)
 @pjsk_csb.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     qtype, qval = await parse_sk_query_params(ctx, args)
@@ -1775,7 +2085,7 @@ pjsk_ptr = SekaiCmdHandler([
 pjsk_ptr.check_cdrate(cd).check_wblist(gbl)
 @pjsk_ptr.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     qtype, qval = await parse_sk_query_params(ctx, args)
@@ -1793,7 +2103,7 @@ pjsk_rtr = SekaiCmdHandler([
 pjsk_rtr.check_cdrate(cd).check_wblist(gbl)
 @pjsk_rtr.handle()
 async def _(ctx: SekaiHandlerContext):
-    args = ctx.get_args().strip() + ctx.prefix_arg
+    args = get_wl_handler_args(ctx)
     wl_event, args = await extract_wl_event(ctx, args)
 
     rank = get_rank_from_text(args)
@@ -1827,6 +2137,259 @@ SK_COMPRESS_THRESHOLD_CFG = config.item('sk.backup.threshold_days')
 SK_PYBD_UPLOAD_ENABLED_CFG = config.item('sk.backup.pybd_upload')
 SK_PYBD_UPLOAD_REMOTE_DIR_CFG = config.item('sk.backup.pybd_remote_dir')
 SK_PYBD_VERBOSE_CFG = config.item('sk.backup.pybd_verbose')
+SK_FINAL_CUTOFF_SAMPLE_INTERVAL_CFG = config.item(
+    'sk.final_cutoff.sample_interval_minutes'
+)
+SK_FINAL_CUTOFF_STABLE_SAMPLE_COUNT_CFG = config.item(
+    'sk.final_cutoff.stable_sample_count'
+)
+
+
+# ================================ 最终榜线固化 ================================ #
+
+def get_final_cutoff_sample_interval_seconds() -> int:
+    """读取结榜确认间隔；旧配置缺少字段时回退到 30 分钟。"""
+
+    return max(
+        60,
+        int(SK_FINAL_CUTOFF_SAMPLE_INTERVAL_CFG.get(30, False)) * 60,
+    )
+
+
+def get_final_cutoff_stable_sample_count() -> int:
+    """读取连续一致次数；旧配置缺少字段时回退到三次。"""
+
+    return max(
+        1,
+        int(SK_FINAL_CUTOFF_STABLE_SAMPLE_COUNT_CFG.get(3, False)),
+    )
+
+
+async def finalize_cutoff_snapshot(
+    ctx: SekaiHandlerContext,
+    base_event: dict,
+    tracked_event: dict,
+) -> Optional[FinalCutoffSnapshot]:
+    """
+    从本地榜线库固化总榜或 WL 章节的最终快照。
+
+    只有结榜后固定间隔采集的三份完整快照连续一致时才写入 complete。
+    已有 complete 快照保持冻结，未确认期间原始 SQLite 必须继续保留。
+    """
+
+    tracking_id = tracked_event["id"]
+    chapter_no = tracked_event.get("chapterNo")
+    existing_snapshot = load_final_cutoff_snapshot(
+        ctx.region,
+        base_event["id"],
+        chapter_no,
+    )
+    if existing_snapshot and existing_snapshot.status == "complete":
+        return None
+
+    if chapter_no is None:
+        board = {"kind": "overall"}
+    else:
+        board = {
+            "kind": "chapter",
+            "chapter_no": chapter_no,
+            "game_character_id": tracked_event.get("wl_cid"),
+            "chapter_type": tracked_event.get("worldBloomChapterType", "game_character"),
+            "is_supplemental": tracked_event.get("isSupplemental", False),
+        }
+
+    expected_ranks = get_expected_final_cutoff_ranks(
+        ctx.region,
+        ALL_RANKS,
+        board=board,
+    )
+    interval_seconds = get_final_cutoff_sample_interval_seconds()
+    stable_sample_count = get_final_cutoff_stable_sample_count()
+    stable_sample = await query_stable_final_cutoff_sample(
+        ctx.region,
+        tracking_id,
+        interval_seconds,
+        stable_sample_count,
+    )
+    if stable_sample is None:
+        return None
+
+    score_by_rank = stable_sample.scores
+    missing_ranks = sorted(set(expected_ranks) - set(score_by_rank))
+    if missing_ranks:
+        # 数据库记录被人工修改或版本不兼容时宁可不固化，也不能降级绕过门禁。
+        logger.warning(
+            f"拒绝固化最终榜线：{ctx.region}_{tracking_id} 已确认样本"
+            f"仍缺少 {len(missing_ranks)} 个档位"
+        )
+        return None
+
+    snapshot = FinalCutoffSnapshot(
+        schema_version=1,
+        region=ctx.region,
+        event_id=base_event["id"],
+        event_name=base_event.get("name", ""),
+        event_type=base_event.get("eventType", ""),
+        board=board,
+        legacy_tracking_id=tracking_id,
+        start_at_ms=int(tracked_event["startAt"]),
+        aggregate_at_ms=int(tracked_event["aggregateAt"]),
+        finalized_at_ms=stable_sample.observed_at_ms,
+        source={
+            "kind": "local_event_tracker",
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "last_record_at_ms": stable_sample.observed_at_ms,
+            "expected_rank_count": len(expected_ranks),
+            "confirmation": "consecutive_identical_complete_samples",
+            "sample_interval_seconds": interval_seconds,
+            "stable_sample_count": stable_sample_count,
+            "first_sample_slot": stable_sample.slot - stable_sample_count + 1,
+            "last_sample_slot": stable_sample.slot,
+        },
+        status="complete",
+        missing_ranks=[],
+        cutoffs=[
+            FinalCutoffItem(rank=rank, score=score_by_rank[rank])
+            for rank in sorted(score_by_rank)
+            if rank in ALL_RANKS
+        ],
+    )
+    if not should_replace_final_cutoff_snapshot(existing_snapshot, snapshot):
+        logger.info(
+            f"保持现有最终榜线 {ctx.region}_{tracking_id}: "
+            f"existing={len(existing_snapshot.cutoffs) if existing_snapshot else 0}档 "
+            f"candidate={len(snapshot.cutoffs)}档"
+        )
+        return None
+
+    save_final_cutoff_snapshot(snapshot)
+    logger.info(
+        f"已固化或升级最终榜线 {ctx.region}_{tracking_id}: "
+        f"{len(snapshot.cutoffs)}档 status={snapshot.status}"
+    )
+    return snapshot
+
+
+async def resolve_tracked_ranking_event(
+    ctx: SekaiHandlerContext,
+    db_file: str,
+) -> tuple[int, int, dict, dict]:
+    """从榜线数据库文件名解析基础活动及对应总榜/章节榜信息。"""
+
+    tracking_id = int(Path(db_file).stem.split('_')[0])
+    chapter_no = tracking_id // 1000
+    event_id = tracking_id % 1000
+    event = await ctx.md.events.find_by_id(event_id)
+    assert event, f"未找到活动 {event_id}"
+    if chapter_no:
+        tracked_event = find_by(
+            await get_wl_events(ctx, event_id),
+            "id",
+            tracking_id,
+        )
+        assert tracked_event, f"未找到WL章节榜 {tracking_id}"
+    else:
+        tracked_event = event
+    return tracking_id, chapter_no, event, tracked_event
+
+
+@repeat_with_interval(300, '确认最终榜线', logger)
+async def finalize_pending_cutoff_snapshots():
+    """
+    每 5 分钟扫描本地确认样本并固化已稳定榜线。
+
+    这里只读取 SQLite，不会请求任何上游；独立于 6 小时备份周期，确保第三个
+    30 分钟样本落盘后能及时生成最终快照。
+    """
+
+    for region in ALL_SERVER_REGIONS:
+        ctx = SekaiHandlerContext.from_region(region)
+        db_pattern = SEKAI_DATA_DIR + f"/db/sk_{region}/*_ranking.db"
+        for db_file in glob.glob(db_pattern):
+            try:
+                tracking_id = int(Path(db_file).stem.split('_')[0])
+                if not await query_stable_final_cutoff_sample(
+                    ctx.region,
+                    tracking_id,
+                    get_final_cutoff_sample_interval_seconds(),
+                    get_final_cutoff_stable_sample_count(),
+                ):
+                    continue
+                _, _, event, tracked_event = await resolve_tracked_ranking_event(
+                    ctx,
+                    db_file,
+                )
+                await finalize_cutoff_snapshot(ctx, event, tracked_event)
+            except Exception as exc:
+                logger.warning(
+                    f"确认最终榜线失败 {db_file}: {get_exc_desc(exc)}"
+                )
+
+
+def create_verified_ranking_zip(
+    db_path: str,
+    zip_path: str,
+    archive_result: ArchiveResult,
+) -> None:
+    """
+    生成并复检榜线 ZIP，全部通过后再原子发布。
+
+    临时 ZIP 不得覆盖正式文件；复检会重新解压数据库并比较完整性、行数、
+    最大 ID 和最大时间，防止压缩成功但内容截断。
+    """
+
+    tmp_zip_path = zip_path + ".tmp"
+    if os.path.exists(tmp_zip_path):
+        os.remove(tmp_zip_path)
+
+    try:
+        with zipfile.ZipFile(
+            tmp_zip_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            archive.write(db_path, arcname=Path(db_path).name)
+
+        with zipfile.ZipFile(tmp_zip_path, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                raise RuntimeError(f"ZIP CRC校验失败: {bad_member}")
+            with tempfile.TemporaryDirectory(prefix="sekai-ranking-archive-") as temp_dir:
+                member_name = Path(db_path).name
+                archive.extract(member_name, temp_dir)
+                extracted_path = os.path.join(temp_dir, member_name)
+                connection = sqlite3.connect(
+                    f"file:{Path(extracted_path).as_posix()}?mode=ro&immutable=1",
+                    uri=True,
+                )
+                try:
+                    integrity = connection.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()[0]
+                    stats = connection.execute(
+                        "SELECT COUNT(*), MAX(id), MAX(ts) FROM ranking"
+                    ).fetchone()
+                finally:
+                    connection.close()
+
+        if str(integrity).lower() != "ok":
+            raise RuntimeError(f"ZIP内数据库integrity_check失败: {integrity}")
+        expected_stats = (
+            archive_result.row_count,
+            archive_result.max_id,
+            archive_result.max_ts,
+        )
+        if tuple(stats) != expected_stats:
+            raise RuntimeError(
+                f"ZIP内数据库统计不一致: expected={expected_stats} actual={stats}"
+            )
+        os.replace(tmp_zip_path, zip_path)
+    except Exception:
+        if os.path.exists(tmp_zip_path):
+            os.remove(tmp_zip_path)
+        raise
+
 
 @repeat_with_interval(SK_COMPRESS_INTERVAL_CFG, '备份榜线数据', logger)
 async def compress_ranking_data():
@@ -1841,33 +2404,77 @@ async def compress_ranking_data():
                 continue
 
             try:
-                event_id = int(Path(db_file).stem.split('_')[0])
-                wl_cid = event_id // 1000
-                event_id = event_id % 1000
-                event = await ctx.md.events.find_by_id(event_id)
-                assert event, f"未找到活动 {event_id}"
-                end_time = datetime.fromtimestamp(event['aggregateAt'] / 1000)
+                (
+                    tracking_id,
+                    chapter_no,
+                    event,
+                    tracked_event,
+                ) = await resolve_tracked_ranking_event(ctx, db_file)
+                event_id = int(event["id"])
+                end_time = datetime.fromtimestamp(tracked_event['aggregateAt'] / 1000 + 1)
 
-                # 保存已完成的榜线数据供本地预测
-                if datetime.now() > end_time and not wl_cid:
-                    csv_path = get_local_forecast_history_csv_path(ctx.region, event_id)
+                # 三次稳定门禁通过后，才允许生成训练历史或进入不可逆归档。
+                await finalize_cutoff_snapshot(ctx, event, tracked_event)
+                final_snapshot = load_final_cutoff_snapshot(
+                    ctx.region,
+                    event_id,
+                    chapter_no or None,
+                )
+                if not is_final_cutoff_ready_for_archive(final_snapshot):
+                    status = (
+                        final_snapshot.status
+                        if final_snapshot
+                        else "missing"
+                    )
+                    logger.warning(
+                        f"跳过归档 {ctx.region}_{tracking_id}："
+                        f"最终榜线状态为 {status}"
+                    )
+                    continue
+
+                if not chapter_no:
+                    csv_path = get_local_forecast_history_csv_path(
+                        ctx.region,
+                        event_id,
+                    )
                     if not os.path.exists(csv_path):
-                        await save_rankings_to_csv(ctx.region, event_id, csv_path)
+                        await save_rankings_to_csv(
+                            ctx.region,
+                            event_id,
+                            csv_path,
+                        )
 
                 # 压缩
                 if datetime.now() - end_time > timedelta(days=SK_COMPRESS_THRESHOLD_CFG.get()):
-                    # 归档数据库
-                    try:
-                        await archive_database(ctx.region, event_id)
-                    except Exception as e:
-                        logger.warning(f"尝试归档榜线数据库 {db_file} 失败: {get_exc_desc(e)}")
+                    archive_result = await archive_database(ctx.region, tracking_id)
+                    if not archive_result.success:
+                        logger.warning(
+                            f"跳过压缩榜线数据库 {db_file}: {archive_result.error}"
+                        )
+                        continue
 
-                    def do_zip():
-                        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-                            zf.write(db_file, arcname=Path(db_file).name)
-                    await run_in_pool(do_zip)
+                    try:
+                        await run_in_pool(
+                            create_verified_ranking_zip,
+                            db_file,
+                            zip_path,
+                            archive_result,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"榜线ZIP生成或复检失败 {db_file}: {get_exc_desc(exc)}"
+                        )
+                        continue
+
+                    # 正式 ZIP 已发布且复检通过，才允许清理源数据库及空辅助文件。
                     os.remove(db_file)
-                    logger.info(f"已压缩榜线数据库 {db_file}")
+                    for auxiliary_path in (db_file + "-wal", db_file + "-shm"):
+                        if os.path.exists(auxiliary_path):
+                            os.remove(auxiliary_path)
+                    logger.info(
+                        f"已安全压缩榜线数据库 {db_file}: "
+                        f"rows={archive_result.row_count}"
+                    )
                 
             except Exception as e:
                 logger.warning(f"尝试检查压缩 {db_file} 失败: {get_exc_desc(e)}")
