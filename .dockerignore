@@ -1,10 +1,28 @@
-# 忽略 data 文件夹 (因为它太大了，而且我们是用 volumes 映射进去的，不需要打包进镜像)
+# ================================ 运行时数据与密钥 ================================ #
+# 这些目录由 Compose 从宿主机挂载，绝不能通过 COPY . . 烤进公开镜像。
 data/
-# 忽略 napcat (QQ端)
+config/
+logs/
+cache/
+fonts/
 napcat/
-# 忽略 git 历史
+haruki/
+onebotfilter/
+src/private/
+
+.env
+.env.*
+docker-compose.yml
+file_db.json
+
+# ================================ 开发与版本控制文件 ================================ #
 .git/
-# 忽略缓存
+.github/
+.vscode/
+docs/
+tests/
 __pycache__/
-*.pyc
+*.py[cod]
+*.url
+start_v*.sh
 venv/

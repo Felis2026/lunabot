@@ -1,0 +1,5 @@
+# Linux 容器直接执行 Shell 脚本；CRLF 会把 shebang 解释器误解析为 /bin/bash\r。
+*.sh text eol=lf
+
+# Docker 构建入口统一使用 LF，避免 Windows 检出后将换行符带入构建上下文。
+Dockerfile text eol=lf

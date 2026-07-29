@@ -39,6 +39,11 @@ Note: This project is for reference and learning purposes only, and is **not** a
 
 - Find and place the missing data yourself
 
+- Configure a Chinese font in `config/global.yaml`. For Docker deployments,
+  place the font under the host `./fonts` directory and set `font.path` to its
+  mounted path under `/root/.fonts`. The repository does not distribute font
+  files.
+
 
 #### 3. Run the Bot
 
@@ -47,5 +52,17 @@ Note: This project is for reference and learning purposes only, and is **not** a
 - Send a message `@yourbot /enable` to enable the bot in the group.
 
 - (Optional) Start the Sekai Deck Recommendation Service: [README.md](./src/services/deck_recommender/README.md)
+
+For Docker builds, the default `DECKREC_NATIVE_REF=master` resolves the latest
+StarMoe deck recommender commit available during an uncached build. Use the
+following command when intentionally refreshing that native dependency:
+
+```bash
+docker compose build --pull --no-cache lunabot
+```
+
+Set `DECKREC_NATIVE_REF` in `.env` to a full commit when a reproducible rebuild
+is required. The exact commit, license, and corresponding source are preserved
+inside the resulting image; see [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
 

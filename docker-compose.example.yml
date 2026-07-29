@@ -3,7 +3,13 @@
   lunabot:
     env_file:
       - .env
-    build: .
+    build:
+      context: .
+      args:
+        # 默认使用官方镜像；网络受限时可在 .env 换成可信镜像代理。
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.13-bookworm}
+        # 默认构建 StarMoe master；需要复现旧镜像时可在 .env 指定完整 commit。
+        DECKREC_NATIVE_REF: ${DECKREC_NATIVE_REF:-master}
     container_name: lunabot_container
     restart: always
     volumes:
@@ -13,6 +19,14 @@
       - ./fonts:/root/.fonts
     environment:
       - TZ=Asia/Shanghai
+      # Preview 与正式组卡使用不同进程和数据目录，但共同运行在本容器中。
+      # Bot 配置中的 cn_jp_preview.enabled 也必须同时开启。
+      - DECKREC_PREVIEW_LOCAL_ENABLED=${DECKREC_PREVIEW_LOCAL_ENABLED:-0}
+      # 可选：临时覆盖原生组卡 wheel 时同时配置以下三项。wheel 应放在持久挂载目录，
+      # build id 必须能区分同版本号的不同构建，SHA-256 用于阻止误装或文件损坏。
+      # - DECKREC_NATIVE_OVERRIDE_WHEEL=/app/data/sekai/deckrec/native-overrides/<build-id>/<wheel>.whl
+      # - DECKREC_NATIVE_OVERRIDE_SHA256=<64位sha256>
+      # - DECKREC_NATIVE_BUILD_ID=<build-id>
     depends_on:
       - napcat
     # 对外暴露 OneBot 反向 WS 监听端口（可用于调试）

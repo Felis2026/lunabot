@@ -75,6 +75,10 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+
+# Local-only tests and documentation
+/tests/
+/docs/
 doc/_build/
 
 # PyBuilder

@@ -36,7 +36,7 @@ requests>=2.32.5,<3
 urllib3>=2.6,<3
 chardet>=5,<6
 scipy
-sekai-deck-recommend-cpp
+sekai-deck-recommend-cpp==0.2.21
 setproctitle
 svgwrite
 tenacity
@@ -86,7 +86,7 @@ onnxruntime
 pjsekai.scores
 pydantic>=2.12,<3
 Pillow>=12.2.0
-playwright
+playwright>=1.49,<2
 pycryptodome
 pyyaml
 sentry-sdk
