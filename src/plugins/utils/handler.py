@@ -2244,6 +2244,7 @@ class CmdHandler:
             disable_help=False,
             help_trigger_condition: Union[str, Callable] = 'exact',
             use_seg_cmd=True,
+            force_whitespace=None,
         ):
         if isinstance(commands, str) or isinstance(commands, SegCmd):
             commands = [commands]
@@ -2266,7 +2267,14 @@ class CmdHandler:
         self.check_group_enabled = check_group_enabled
         handler_kwargs = {}
         if only_to_me: handler_kwargs["rule"] = rule_to_me()
-        self.handler = on_command(self.commands[0], priority=priority, block=block, aliases=set(self.commands[1:]), **handler_kwargs)
+        self.handler = on_command(
+            self.commands[0],
+            priority=priority,
+            block=block,
+            aliases=set(self.commands[1:]),
+            force_whitespace=force_whitespace,
+            **handler_kwargs,
+        )
         self.superuser_check = None
         self.private_group_check = None
         self.wblist_checks = []

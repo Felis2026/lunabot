@@ -727,7 +727,7 @@ async def _(ctx: HandlerContext):
 
 gall_add = CmdHandler([
     '/gall add', '/gall upload', '/上传', '/添加',
-], logger)
+], logger, force_whitespace=True)
 gall_add.check_cdrate(cd).check_wblist(gbl)
 @gall_add.handle()
 async def _(ctx: HandlerContext):
