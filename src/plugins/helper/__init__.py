@@ -26,6 +26,7 @@ HELP_GROUP_SERVICES = [
     "imgtool",
     "imgexp",
     "random",
+    "whateat",
     "math",
     "record",
     "sta",
@@ -41,6 +42,7 @@ HELP_ADMIN_TOGGLE_SERVICES = {
     "random",
     "record",
     "rollpig",
+    "whateat",
 }
 
 HELP_SUPERUSER_TOGGLE_SERVICES = {
@@ -71,6 +73,7 @@ DEFAULT_HELP_SERVICE_ROUTES = {
     "imgtool": "/features/imgtool",
     "imgexp": "/features/imgexp",
     "random": "/features/random",
+    "whateat": "/features/whateat",
     "math": "/features/math",
     "record": "/features/record",
     "sta": "/features/sta",

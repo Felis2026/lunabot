@@ -175,6 +175,7 @@ HELP_STATUS_REGISTRY: dict[str, Resolver] = {
     "random": single_toggle("random"),
     "record": single_toggle("record"),
     "rollpig": resolve_rollpig,
+    "whateat": single_toggle("whateat"),
     "sekai": single_toggle("sekai"),
     "sta": single_toggle("sta"),
     "water": single_toggle("water"),

@@ -18,6 +18,7 @@
 - [烤森绘图服务 (msxray)](./msxray.md)
 - [NekoChat服务 (nekochat)](./nekochat.md)
 - [随机服务 (random)](./random.md)
+- [今天吃什么服务 (whateat)](./whateat.md)
 - [群消息记录服务 (record)](./record.md)
 - [今日烤猪服务 (rollpig)](./rollpig.md)
 - [世界计划服务 (sekai)](./sekai.md)
