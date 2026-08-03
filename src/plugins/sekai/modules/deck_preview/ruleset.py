@@ -740,6 +740,43 @@ def _build_canary_profile(
     }
 
 
+# ================================ Canary固定卡选择 ================================ #
+
+def _select_unique_character_cards(
+    cards: Sequence[Mapping[str, Any]],
+    preferred_card_ids: Sequence[int],
+    *,
+    excluded_character_id: int | None = None,
+    limit: int,
+) -> list[int]:
+    """按优先级选择角色不重复的卡，可排除未来假设卡的角色。"""
+
+    cards_by_id = {
+        card["id"]: card
+        for card in cards
+        if isinstance(card.get("id"), int)
+    }
+    selected: list[int] = []
+    used_character_ids = (
+        {excluded_character_id}
+        if isinstance(excluded_character_id, int)
+        else set()
+    )
+    for card_id in [*preferred_card_ids, *sorted(cards_by_id)]:
+        card = cards_by_id.get(card_id)
+        character_id = card.get("characterId") if card else None
+        if (
+            not isinstance(character_id, int)
+            or character_id in used_character_ids
+        ):
+            continue
+        selected.append(card_id)
+        used_character_ids.add(character_id)
+        if len(selected) == limit:
+            break
+    return selected
+
+
 def run_native_canaries(
     masterdata_dir: Path,
     musicmetas_path: str,
@@ -770,11 +807,12 @@ def run_native_canaries(
     )
     future_ids = set(manifest["future_cards"]["ids"])
     cn_cards = [card for card in cn_cards if card["id"] not in future_ids]
-    cn_card_ids = _ids(cn_cards)
     preferred_fixed = [1, 5, 9, 13, 17]
-    fixed_cards = [card_id for card_id in preferred_fixed if card_id in cn_card_ids]
-    if len(fixed_cards) < 5:
-        fixed_cards = sorted(cn_card_ids)[:5]
+    fixed_cards = _select_unique_character_cards(
+        cn_cards,
+        preferred_fixed,
+        limit=5,
+    )
     if len(fixed_cards) != 5:
         raise RulesetBuildError("原生 canary 找不到五张 CN 基础卡")
 
@@ -859,10 +897,22 @@ def run_native_canaries(
     if manifest["event_ids"] and future_cards_by_id:
         canary_event_id = manifest["event_ids"][0]
         for card_id in sorted(future_cards_by_id)[:: max(len(future_cards_by_id) - 1, 1)]:
+            assumed_card = future_cards_by_id[card_id]
             assumed_userdata = load_userdata(
-                _build_canary_profile(cn_cards, future_cards_by_id[card_id])
+                _build_canary_profile(cn_cards, assumed_card)
             )
-            fixed = [card_id] + fixed_cards[:4]
+            assumed_fixed_cards = _select_unique_character_cards(
+                cn_cards,
+                fixed_cards,
+                excluded_character_id=assumed_card.get("characterId"),
+                limit=4,
+            )
+            if len(assumed_fixed_cards) != 4:
+                raise RulesetBuildError(
+                    "原生 canary 找不到与未来卡角色不重复的四张 CN 基础卡: "
+                    f"card={card_id} character={assumed_card.get('characterId')}"
+                )
+            fixed = [card_id, *assumed_fixed_cards]
             recommend(
                 canary_event_id,
                 None,
