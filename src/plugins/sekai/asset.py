@@ -1306,9 +1306,10 @@ class WebJsonRes:
             seen.add(item)
         return normalized
     
-    async def _download(self):
+    async def _download(self, timeout: float):
         # ================================ 多地址顺序回退 ================================ #
         # 按配置顺序尝试网页 JSON 数据源；主地址故障时自动切换到后续备用地址。
+        # 每个数据源独立使用调用方传入的超时时间，避免主源消耗备用源的可用时间。
         # 这里只负责“本次刷新该用哪个源”，旧数据续用逻辑仍由 _check_before_get 统一处理。
         if not self.urls:
             raise Exception(f"网页Json资源 [{self.name}] 未配置可用的数据源URL")
@@ -1316,7 +1317,10 @@ class WebJsonRes:
         errors: List[str] = []
         for idx, current_url in enumerate(self.urls, start=1):
             try:
-                data = await download_json(current_url)
+                data = await asyncio.wait_for(
+                    download_json(current_url),
+                    timeout,
+                )
                 self.data = data
                 self.hash = get_md5(dumps_json(self.data, indent=False).encode('utf-8'))
                 self.update_time = datetime.now()
@@ -1361,7 +1365,7 @@ class WebJsonRes:
     async def _check_before_get(self, timeout: float, raise_on_no_data: bool):
         if not self.data or not self.update_interval or datetime.now() - self.update_time > self.update_interval:
             try:
-                await asyncio.wait_for(self._download(), timeout)
+                await self._download(timeout)
             except Exception as e:
                 if self.data:
                     logger.warning(f"更新网页Json资源 [{self.name}] 失败: {get_exc_desc(e)}，继续使用旧数据")
