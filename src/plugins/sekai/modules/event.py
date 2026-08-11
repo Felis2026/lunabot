@@ -13,6 +13,12 @@ from .profile import (
     get_detailed_profile_card_filter,
     get_player_avatar_info_by_detailed_profile,
 )
+from .wl_args import (
+    WlTurnSelector,
+    collect_world_bloom_turn_events,
+    extract_wl_turn_selector,
+    remove_matched_text,
+)
 
 QUERY_SINGLE_EVENT_HELP = """
 【查单个活动格式】
@@ -24,10 +30,11 @@ QUERY_SINGLE_EVENT_HELP = """
 QUERY_MULTI_EVENT_HELP = """
 【查多个活动格式】
 1. 活动类型：5v5 普活 wl
-2. 颜色和团：紫 25h
-3. 年份：25年 去年
-4. 活动角色：mnr hrk 可以加多个
-5. 活动ban主：mnr箱
+2. WL轮次：wl1 wl2
+3. 颜色和团：紫 25h
+4. 年份：25年 去年
+5. 活动角色：mnr hrk 可以加多个
+6. 活动ban主：mnr箱
 """.strip()
 
 
@@ -69,6 +76,23 @@ EVENT_TYPE_SHOW_NAMES = {
     "world_bloom": "WorldLink",
 }
 
+WL_TURN_RESERVED_ACTIVITY_ARGS = tuple(
+    name
+    for unit_names in UNIT_NAMES
+    for name in unit_names[1:]
+    if name[:1].isdigit()
+)
+
+
+def extract_activity_wl_turn_selector(text: str) -> Optional[WlTurnSelector]:
+    """解析活动筛选中的 WL 轮次，同时保留 `wl 25h` 等既有组合。"""
+
+    return extract_wl_turn_selector(
+        text,
+        reserved_arguments=WL_TURN_RESERVED_ACTIVITY_ARGS,
+    )
+
+
 @dataclass
 class EventListFilter:
     attr: str = None
@@ -78,6 +102,7 @@ class EventListFilter:
     banner_cid: int = None
     year: int = None
     leak: bool = None
+    event_ids: set[int] = None
 
 
 # ======================= 处理逻辑 ======================= #
@@ -353,6 +378,7 @@ async def compose_event_list_image(ctx: SekaiHandlerContext, filter: EventListFi
             if filter.banner_cid and filter.banner_cid != d.banner_cid: continue
             if filter.year and filter.year != d.start_time.year: continue
             if filter.event_type and filter.event_type != d.etype: continue
+            if filter.event_ids is not None and d.eid not in filter.event_ids: continue
             if filter.unit:
                 if filter.unit == 'blend':
                     if d.unit: continue
@@ -409,7 +435,8 @@ async def compose_event_list_image(ctx: SekaiHandlerContext, filter: EventListFi
         filter.unit, 
         filter.cids, 
         filter.banner_cid, 
-        filter.year
+        filter.year,
+        filter.event_ids,
     ]):
         cache_key = f"{ctx.region}_events"
 
@@ -1123,7 +1150,34 @@ async def _(ctx: SekaiHandlerContext):
 
         filter.year, args = extract_year(args)
         filter.attr, args = extract_card_attr(args)
-        filter.event_type, args = extract_event_type(args)
+
+        # ================================ WL轮次筛选 ================================ #
+        # wlN 必须先于旧的 `wl` 活动类型别名解析；轮次只负责限定活动集合，
+        # 角色、团名、年份等条件继续交给原有筛选器求交集。
+        turn_selector = extract_activity_wl_turn_selector(args)
+        if turn_selector:
+            args = remove_matched_text(args, turn_selector.matched_text)
+            turn_events = collect_world_bloom_turn_events(
+                await ctx.md.events.get(),
+                await ctx.md.world_blooms.get(),
+                turn=turn_selector.turn,
+            )
+            assert_and_reply(
+                turn_events,
+                f"当前区服还没有第{turn_selector.turn}次 WL 活动",
+            )
+            filter.event_ids = {event["id"] for event in turn_events}
+
+        explicit_event_type, args = extract_event_type(args)
+        if turn_selector:
+            assert_and_reply(
+                explicit_event_type in {None, "world_bloom"},
+                f"`{turn_selector.matched_text}` 已限定为 World Link 活动，"
+                "不能再指定其他活动类型",
+            )
+            filter.event_type = "world_bloom"
+        else:
+            filter.event_type = explicit_event_type
         filter.unit, args = extract_unit(args)
 
         if any([x in args for x in ['混活', '混']]):
@@ -1169,6 +1223,10 @@ async def _(ctx: SekaiHandlerContext):
             return await query_multi(args)
         if ctx.trigger_cmd in SINGLE_EVENT_CMDS:
             return await query_single(args)
+
+    # wlN 天然对应一组活动，直接进入列表筛选，避免先走单活动解析产生误导错误。
+    if extract_activity_wl_turn_selector(args):
+        return await query_multi(args)
             
     # 优先查询单个活动
     try:

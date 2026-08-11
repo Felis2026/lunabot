@@ -45,6 +45,7 @@ from .wl_args import (
     normalize_wl_args,
     remove_matched_text,
     remove_standalone_wl,
+    select_world_bloom_turn,
 )
 import zipfile
 import sqlite3
@@ -1868,12 +1869,11 @@ pjsk_sk_history.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     args = normalize_wl_args(ctx.get_args())
 
-    if turn_selector := extract_wl_turn_selector(args):
-        raise ReplyException(
-            f"`{turn_selector.matched_text}` 表示第{turn_selector.turn}次WL活动，"
-            "但历史榜线需要先确定具体活动ID。\n"
-            "请改用“/历史榜线 活动ID 总榜”或“/历史榜线 活动ID 章节N”"
-        )
+    turn_selector = extract_wl_turn_selector(args)
+    # ================================ WL轮次活动定位 ================================ #
+    # 历史榜线必须落到唯一活动；角色既用于定位其第 N 次 WL，也继续选择对应章节。
+    if turn_selector:
+        args = remove_matched_text(args, turn_selector.matched_text)
 
     full_match = re.search(r"(?i)(?<![a-z])(?:full|all)(?![a-z])|全部", args)
     full = full_match is not None
@@ -1896,7 +1896,7 @@ async def _(ctx: SekaiHandlerContext):
     role_nickname, role_arg = extract_wl_role_selector(
         args,
         [nickname for nickname, _ in nickname_pairs],
-        allow_bare=False,
+        allow_bare=True,
     )
     if role_arg:
         args = remove_matched_text(args, role_arg)
@@ -1908,20 +1908,46 @@ async def _(ctx: SekaiHandlerContext):
         role_nickname is not None,
     ])
     assert_and_reply(selector_count <= 1, "总榜、章节、角色章节和终章只能选择一种")
-    assert_and_reply(args, """
+    assert_and_reply(args or turn_selector, """
 历史榜线需要指定活动，例如：
 1. /jp历史榜线 170
 2. /jp历史榜线 170 full
 3. /jp历史榜线 170 章节2
 """.strip())
 
-    try:
-        event = await parse_search_single_event_args(ctx, args)
-    except Exception:
-        raise ReplyException(
-            "活动参数错误，可使用活动ID、倒数序号或箱活简称；"
-            f"例如：{ctx.original_trigger_cmd} 170"
+    if turn_selector:
+        assert_and_reply(
+            not args,
+            "不能同时指定活动ID和第几次 WL；请选择一种活动定位方式",
         )
+        assert_and_reply(
+            role_nickname,
+            f"`{turn_selector.matched_text}` 会对应多个活动，历史榜线还需要指定角色。\n"
+            f"例如：{ctx.original_trigger_cmd} {turn_selector.matched_text} knd",
+        )
+        role_cid = find_by_predicate(
+            nickname_pairs,
+            lambda item: item[0] == role_nickname,
+        )[1]
+        try:
+            event = select_world_bloom_turn(
+                await ctx.md.events.get(),
+                await ctx.md.world_blooms.get(),
+                character_id=role_cid,
+                turn=turn_selector.turn,
+            )
+        except ValueError:
+            raise ReplyException(
+                f"当前区服找不到 {role_nickname} 的第{turn_selector.turn}次 WL 活动"
+            )
+    else:
+        try:
+            event = await parse_search_single_event_args(ctx, args)
+        except ReplyException:
+            raise ReplyException(
+                "活动参数错误，可使用活动ID、倒数序号或箱活简称；"
+                f"例如：{ctx.original_trigger_cmd} 170"
+            )
 
     base_event_id = event["id"]
     selected_event = event

@@ -9,6 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+try:
+    from ..wl_args import select_world_bloom_turn
+except ImportError:
+    # 本模块也会被独立测试入口以 `deck_preview.router` 方式加载。
+    from wl_args import select_world_bloom_turn
+
 
 PREVIEW_KEYWORD_PATTERN = re.compile(r"(?i)(?:预览|预演|preview)")
 
@@ -114,36 +120,6 @@ def choose_world_bloom_chapter(
             raise ValueError(f"该 WL 活动没有角色 {character_id} 的章节")
         return chapter
     return candidates[0]
-
-
-def select_world_bloom_turn(
-    events: Iterable[dict[str, Any]],
-    chapters: Iterable[dict[str, Any]],
-    *,
-    character_id: int,
-    turn: int,
-) -> dict[str, Any]:
-    """按 JP 实际章节动态定位某角色的第 N 次 WL，不维护 VS 固定活动ID。"""
-
-    if turn <= 0:
-        raise ValueError("WL 轮次必须大于 0")
-    event_ids = {
-        chapter.get("eventId")
-        for chapter in chapters
-        if chapter.get("gameCharacterId") == character_id
-    }
-    candidates = sorted(
-        (
-            event
-            for event in events
-            if event.get("id") in event_ids
-            and event.get("eventType") == "world_bloom"
-        ),
-        key=lambda event: (event.get("startAt", 10**18), event.get("id", 10**9)),
-    )
-    if turn > len(candidates):
-        raise ValueError(f"找不到该角色的第{turn}次真实 WL 活动")
-    return candidates[turn - 1]
 
 
 # ================================ 正式切回持久化 ================================ #

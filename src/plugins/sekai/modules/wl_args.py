@@ -1,7 +1,8 @@
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 
 MAX_WL_TURN = 99
@@ -50,13 +51,27 @@ def get_wl_simulation_max_turn() -> int:
     return min(MAX_WL_TURN, max(DEFAULT_WL_SIMULATION_MAX_TURN, value))
 
 
-def extract_wl_turn_selector(text: str) -> Optional[WlTurnSelector]:
+def extract_wl_turn_selector(
+    text: str,
+    *,
+    reserved_arguments: Iterable[str] = (),
+) -> Optional[WlTurnSelector]:
     """
     提取“第几次 WL 活动”。
 
     `wlN` 仅作为第几次 WL 的短写，绝不再解释为章节号。
     `模拟WLN` 明确要求走模拟活动；轮次限制为 1～99，防止异常超长输入。
+    调用方可保留数字开头的既有参数，例如活动筛选中的 `wl 25h`。
     """
+
+    reserved_spans = [
+        match.span()
+        for argument in reserved_arguments
+        for match in re.finditer(
+            rf"(?i)(?<![a-z0-9])wl\s*{re.escape(argument)}(?![a-z0-9])",
+            text,
+        )
+    ]
 
     patterns = (
         (r"(?i)(?:模拟|sim)\s*wl\s*([1-9]\d?)(?!\d)", True, False),
@@ -66,8 +81,12 @@ def extract_wl_turn_selector(text: str) -> Optional[WlTurnSelector]:
         (r"(?i)(?<![a-z0-9])wl\s*([1-9]\d?)(?!\d)", False, True),
     )
     for pattern, force_simulated, legacy in patterns:
-        match = re.search(pattern, text)
-        if match:
+        for match in re.finditer(pattern, text):
+            if any(
+                match.start() < reserved_end and match.end() > reserved_start
+                for reserved_start, reserved_end in reserved_spans
+            ):
+                continue
             return WlTurnSelector(
                 turn=int(match.group(1)),
                 matched_text=match.group(0),
@@ -75,6 +94,87 @@ def extract_wl_turn_selector(text: str) -> Optional[WlTurnSelector]:
                 legacy=legacy,
             )
     return None
+
+
+# ================================ WL轮次索引 ================================ #
+
+def build_world_bloom_turn_index(
+    events: Iterable[dict[str, Any]],
+    chapters: Iterable[dict[str, Any]],
+) -> dict[int, tuple[dict[str, Any], ...]]:
+    """按角色整理真实 WL 活动时间线，作为所有 WL 轮次语义的唯一数据源。"""
+
+    event_by_id = {
+        event.get("id"): event
+        for event in events
+        if event.get("eventType") == "world_bloom"
+        and isinstance(event.get("id"), int)
+    }
+    event_ids_by_character: dict[int, set[int]] = defaultdict(set)
+    for chapter in chapters:
+        character_id = chapter.get("gameCharacterId")
+        event_id = chapter.get("eventId")
+        if (
+            isinstance(character_id, int)
+            and character_id > 0
+            and event_id in event_by_id
+        ):
+            event_ids_by_character[character_id].add(event_id)
+
+    return {
+        character_id: tuple(sorted(
+            (event_by_id[event_id] for event_id in event_ids),
+            key=lambda event: (
+                event.get("startAt", 10**18),
+                event.get("id", 10**9),
+            ),
+        ))
+        for character_id, event_ids in event_ids_by_character.items()
+    }
+
+
+def select_world_bloom_turn(
+    events: Iterable[dict[str, Any]],
+    chapters: Iterable[dict[str, Any]],
+    *,
+    character_id: int,
+    turn: int,
+) -> dict[str, Any]:
+    """按真实章节数据定位某个角色的第 N 次 WL 活动。"""
+
+    if turn <= 0:
+        raise ValueError("WL 轮次必须大于 0")
+    candidates = build_world_bloom_turn_index(events, chapters).get(
+        character_id,
+        (),
+    )
+    if turn > len(candidates):
+        raise ValueError(f"找不到角色 {character_id} 的第{turn}次真实 WL 活动")
+    return candidates[turn - 1]
+
+
+def collect_world_bloom_turn_events(
+    events: Iterable[dict[str, Any]],
+    chapters: Iterable[dict[str, Any]],
+    *,
+    turn: int,
+) -> list[dict[str, Any]]:
+    """汇总所有角色的第 N 次 WL，并按活动去重后返回活动列表。"""
+
+    if turn <= 0:
+        raise ValueError("WL 轮次必须大于 0")
+    selected_by_id: dict[int, dict[str, Any]] = {}
+    for candidates in build_world_bloom_turn_index(events, chapters).values():
+        if turn <= len(candidates):
+            event = candidates[turn - 1]
+            selected_by_id[event["id"]] = event
+    return sorted(
+        selected_by_id.values(),
+        key=lambda event: (
+            event.get("startAt", 10**18),
+            event.get("id", 10**9),
+        ),
+    )
 
 
 # ================================ WL 章节选择 ================================ #

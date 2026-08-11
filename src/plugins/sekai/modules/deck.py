@@ -58,7 +58,6 @@ from .deck_preview.router import (
     extract_explicit_event_id,
     extract_preview_keyword,
     format_preview_result_title,
-    select_world_bloom_turn,
 )
 from .deck_preview.scheduler import preview_manager
 from .wl_args import (
@@ -68,6 +67,7 @@ from .wl_args import (
     get_wl_simulation_max_turn,
     normalize_wl_args,
     remove_matched_text,
+    select_world_bloom_turn,
 )
 from sekai_deck_recommend_cpp import (
     DeckRecommendOptions, 
