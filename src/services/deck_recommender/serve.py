@@ -19,6 +19,7 @@ from worker import *
 from config import *
 from masterdata_spec import (
     get_native_package_build_id,
+    get_optional_deck_masterdata_filenames,
     get_preview_expected_filenames,
     get_preview_manifest_fingerprint_input,
 )
@@ -58,10 +59,15 @@ def _canonical_json_bytes(data: Any) -> bytes:
 
 
 def _native_package_version() -> str:
-    try:
-        return importlib.metadata.version("sekai-deck-recommend-cpp")
-    except importlib.metadata.PackageNotFoundError:
-        return "missing"
+    for distribution in (
+        "haruki-sekai-deck-recommend-cpp",
+        "sekai-deck-recommend-cpp",
+    ):
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "missing"
 
 
 def _safe_segment_name(name: str) -> bool:
@@ -292,11 +298,14 @@ def _validate_v2_masterdata(
         raise HTTPException(status_code=400, detail="manifest.files 格式错误")
     expected_files = set(file_hashes)
     if INSTANCE_ROLE == "preview":
-        shared_files = set(get_preview_expected_filenames())
-        if expected_files != shared_files:
+        required_files = set(get_preview_expected_filenames())
+        allowed_files = required_files | set(
+            get_optional_deck_masterdata_filenames()
+        )
+        if not required_files <= expected_files <= allowed_files:
             raise HTTPException(
                 status_code=409,
-                detail="manifest 文件集合与 preview 共享规格不一致",
+                detail="manifest 文件集合不满足 preview MasterData 规格",
             )
     if set(masterdata) != expected_files:
         raise HTTPException(

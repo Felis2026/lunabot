@@ -91,6 +91,21 @@ WL_LIMITED_DECK_MASTERDATA_SPECS: tuple[DeckMasterDataSpec, ...] = (
     ),
 )
 
+# 终章表由 JP/CN 主动获取；逐音符表保留已有缓存才同步的策略。
+# 旧区服可能尚未发布可选表，缺失不能阻止其他组卡；Preview 只携带两区共有表。
+HARUKI_OPTIONAL_DECK_MASTERDATA_SPECS: tuple[DeckMasterDataSpec, ...] = (
+    DeckMasterDataSpec("ingame_combos", "ingameCombos.json", "exact_score"),
+    DeckMasterDataSpec("ingame_notes", "ingameNotes.json", "exact_score"),
+    DeckMasterDataSpec("event_card_bonus_limits", "eventCardBonusLimits.json", "finale"),
+    DeckMasterDataSpec("event_honor_bonuses", "eventHonorBonuses.json", "finale"),
+    DeckMasterDataSpec(
+        "event_mysekai_fixture_game_character_performance_bonus_limits",
+        "eventMysekaiFixtureGameCharacterPerformanceBonusLimits.json",
+        "finale",
+    ),
+    DeckMasterDataSpec("event_skill_score_up_limits", "eventSkillScoreUpLimits.json", "finale"),
+)
+
 
 def get_deck_masterdata_specs(
     *,
@@ -115,6 +130,18 @@ def get_spec_filenames(specs: Iterable[DeckMasterDataSpec]) -> tuple[str, ...]:
     """提取规格中的稳定文件名序列，供同步协议和测试共同使用。"""
 
     return tuple(spec.filename for spec in specs)
+
+
+def get_optional_deck_masterdata_specs() -> tuple[DeckMasterDataSpec, ...]:
+    """返回可随 Haruki 内核同步、但不构成启动前置条件的文件规格。"""
+
+    return HARUKI_OPTIONAL_DECK_MASTERDATA_SPECS
+
+
+def get_optional_deck_masterdata_filenames() -> tuple[str, ...]:
+    """返回服务端允许接收的 Haruki 可选 MasterData 文件名。"""
+
+    return get_spec_filenames(get_optional_deck_masterdata_specs())
 
 
 def get_preview_expected_filenames() -> tuple[str, ...]:

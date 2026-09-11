@@ -24,6 +24,7 @@ if str(MODULES_DIR) not in sys.path:
 
 from src.services.deck_recommender.masterdata_spec import (
     get_deck_masterdata_specs,
+    get_optional_deck_masterdata_filenames,
     get_spec_filenames,
 )
 from deck_preview.protocol import publish_result
@@ -374,7 +375,24 @@ def main() -> int:
             include_mysekai=bool(request["include_mysekai"]),
             include_wl_limited_bonus=bool(request["include_wl_limited_bonus"]),
         )
-        expected_filenames = get_spec_filenames(specs)
+        required_filenames = get_spec_filenames(specs)
+        required_set = set(required_filenames)
+        allowed_set = required_set | set(
+            get_optional_deck_masterdata_filenames()
+        )
+        cn_filenames = set(request["cn_paths"])
+        jp_filenames = set(request["jp_paths"])
+        if (
+            cn_filenames != jp_filenames
+            or not required_set <= cn_filenames <= allowed_set
+        ):
+            raise ValueError("CN/JP 文件集合不满足共享 MasterData 规格")
+        optional_filenames = tuple(
+            name
+            for name in get_optional_deck_masterdata_filenames()
+            if name in cn_filenames
+        )
+        expected_filenames = required_filenames + optional_filenames
         _verify_request_source_fingerprints(request)
         official_canary = _run_official_canaries(
             request,

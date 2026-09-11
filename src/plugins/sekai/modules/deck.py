@@ -37,6 +37,7 @@ from .mysekai import MYSEKAI_REGIONS
 from src.services.deck_recommender.masterdata_spec import (
     get_deck_masterdata_specs,
     get_native_package_build_id,
+    get_optional_deck_masterdata_specs,
     get_preview_expected_filenames,
     validate_resolved_paths,
 )
@@ -3423,6 +3424,43 @@ DECKREC_DATA_UPDATE_INTERVAL_CFG = config.item('deck.data_update_interval_second
 
 # ================================ 组卡服务MasterData同步 ================================ #
 
+async def get_optional_deckrec_masterdata_path_map(
+    ctx: SekaiHandlerContext,
+) -> dict[str, str]:
+    """主动更新 JP/CN 终章表，其他可选表按已有缓存同步。"""
+
+    path_map: dict[str, str] = {}
+    for spec in get_optional_deck_masterdata_specs():
+        wrapper = getattr(ctx.md, spec.attribute)
+        cache_path = wrapper.mgr.get_cache_path(ctx.region)
+        proactive = spec.capability == "finale" and ctx.region in {"jp", "cn"}
+        if not proactive and not os.path.isfile(cache_path):
+            continue
+        try:
+            path_map[spec.filename] = await wrapper.get_path()
+        except Exception as exc:
+            # ================================ 终章缓存回退 ================================ #
+            # 刚补齐的缓存可能尚无版本登记；远端失败时仍可提供合法的同区原始表。
+            # 空数组是上游有效内容，不能用真假值判断是否可以使用。
+            if proactive and os.path.isfile(cache_path):
+                try:
+                    cached = await aload_json(cache_path)
+                    if isinstance(cached, list):
+                        path_map[spec.filename] = cache_path
+                        logger.warning(
+                            f"{ctx.region} 终章数据 {spec.filename} 更新失败，使用本地缓存: "
+                            f"{get_exc_desc(exc)}"
+                        )
+                        continue
+                except Exception:
+                    pass
+            # 可选数据失败不能拖垮其他组卡功能。
+            logger.warning(
+                f"跳过 {ctx.region} 可选组卡数据 {spec.filename}: "
+                f"{get_exc_desc(exc)}"
+            )
+    return path_map
+
 async def get_deckrec_masterdata_paths(ctx: SekaiHandlerContext) -> List[str]:
     """
     获取组卡服务依赖的 MasterData 文件路径。
@@ -3439,7 +3477,8 @@ async def get_deckrec_masterdata_paths(ctx: SekaiHandlerContext) -> List[str]:
     ]
     paths = await asyncio.gather(*masterdata_tasks)
     validate_resolved_paths(specs, paths)
-    return paths
+    optional_paths = await get_optional_deckrec_masterdata_path_map(ctx)
+    return paths + list(optional_paths.values())
 
 
 async def get_deckrec_masterdata_path_map(
@@ -3447,6 +3486,7 @@ async def get_deckrec_masterdata_path_map(
     *,
     include_mysekai: bool,
     include_wl_limited_bonus: bool,
+    include_optional: bool = False,
 ) -> dict[str, str]:
     """按共享规格返回文件名到来源路径的映射，供 preview builder 冻结快照。"""
 
@@ -3463,7 +3503,9 @@ async def get_deckrec_masterdata_path_map(
         spec.filename: path
         for spec, path in zip(specs, paths)
     }
-    assert set(path_map) == set(get_preview_expected_filenames())
+    if include_optional:
+        path_map.update(await get_optional_deckrec_masterdata_path_map(ctx))
+    assert set(get_preview_expected_filenames()) <= set(path_map)
     return path_map
 
 
@@ -3687,13 +3729,25 @@ async def provide_preview_builder_source() -> dict:
             cn_ctx,
             include_mysekai=True,
             include_wl_limited_bonus=True,
+            include_optional=True,
         ),
         get_deckrec_masterdata_path_map(
             jp_ctx,
             include_mysekai=True,
             include_wl_limited_bonus=True,
+            include_optional=True,
         ),
     )
+    # Preview 必须让 CN/JP 使用同一文件集合；单边缺失的可选文件直接忽略。
+    shared_filenames = set(cn_paths) & set(jp_paths)
+    cn_paths = {
+        name: path for name, path in cn_paths.items()
+        if name in shared_filenames
+    }
+    jp_paths = {
+        name: path for name, path in jp_paths.items()
+        if name in shared_filenames
+    }
     current_cn_fingerprint = calc_deckrec_masterdata_fingerprint(
         list(cn_paths.values())
     )

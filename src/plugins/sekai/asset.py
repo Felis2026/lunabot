@@ -675,7 +675,13 @@ class RegionMasterDataCollection:
         self.world_bloom_different_attribute_bonuses                        = RegionMasterDataWrapper(region, "worldBloomDifferentAttributeBonuses")
         self.world_bloom_support_deck_bonuses                               = RegionMasterDataWrapper(region, "worldBloomSupportDeckBonuses")
         self.world_bloom_support_deck_unit_event_limited_bonuses            = RegionMasterDataWrapper(region, "worldBloomSupportDeckUnitEventLimitedBonuses")
+        self.ingame_combos                                                  = RegionMasterDataWrapper(region, "ingameCombos")
+        self.ingame_notes                                                   = RegionMasterDataWrapper(region, "ingameNotes")
+        # 终章表需显式注册并由组卡同步调用，单靠上游版本更新不会自动下载新表。
+        self.event_card_bonus_limits                                        = RegionMasterDataWrapper(region, "eventCardBonusLimits")
         self.event_honor_bonuses                                             = RegionMasterDataWrapper(region, "eventHonorBonuses")
+        self.event_mysekai_fixture_game_character_performance_bonus_limits   = RegionMasterDataWrapper(region, "eventMysekaiFixtureGameCharacterPerformanceBonusLimits")
+        self.event_skill_score_up_limits                                    = RegionMasterDataWrapper(region, "eventSkillScoreUpLimits")
         self.card_mysekai_canvas_bonuses                                    = RegionMasterDataWrapper(region, "cardMysekaiCanvasBonuses")
         self.mysekai_fixture_game_character_groups                          = RegionMasterDataWrapper(region, "mysekaiFixtureGameCharacterGroups")
         self.mysekai_fixture_game_character_group_performance_bonuses       = RegionMasterDataWrapper(region, "mysekaiFixtureGameCharacterGroupPerformanceBonuses")

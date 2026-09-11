@@ -42,6 +42,20 @@ python src/plugins/sekai/modules/deck_preview/router.py reset 184 --confirm
 Setting `deck.cn_jp_preview.enabled: false` bypasses Preview routing and sticky
 activation records without deleting them.
 
+## Optional Finale MasterData
+
+The Bot actively refreshes `eventCardBonusLimits`, `eventHonorBonuses`,
+`eventMysekaiFixtureGameCharacterPerformanceBonusLimits`, and
+`eventSkillScoreUpLimits` from each JP/CN region's own configured source.
+They join official synchronization and its file fingerprint. Valid empty
+arrays are retained; a failed refresh can use a valid local JSON array.
+Other regions do not proactively request these optional tables.
+
+Preview carries only optional files available in both regions and preserves
+the CN contents for these tables. This does not enable finale previews.
+`eventTotalPowerLimits` is not consumed by the current native kernel; its WL3
+336000 cap is implemented in native code.
+
 ## Manual run
 
 1. Install the repository requirements.
