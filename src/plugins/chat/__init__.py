@@ -41,6 +41,18 @@ CLEANCHAT_TRIGGER_WORDS = ["cleanchat", "clean_chat", "cleanmode", "clean_mode"]
 IMAGE_RESPONSE_TRIGGER_WORDS = ['生成图片', '图片生成', 'imagen', 'Imagen', 'IMAGEN']
 
 
+def load_chat_system_prompt(need_tools: bool, bot_name: str, current_date: str) -> str:
+    """加载统一人格，并在工具模式下追加工具协议。"""
+
+    prompt_parts = [Path(SYSTEM_PROMPT_PATH).read_text(encoding="utf-8").strip()]
+    if need_tools:
+        prompt_parts.append(Path(SYSTEM_PROMPT_TOOLS_PATH).read_text(encoding="utf-8").strip())
+    return "\n\n".join(prompt_parts).format(
+        bot_name=bot_name,
+        current_date=current_date,
+    )
+
+
 # 使用工具 返回需要添加到回复的额外信息
 async def use_tool(ctx: HandlerContext, session: ChatSession, type: str, data: Any) -> str:
     if type == "python":
@@ -358,13 +370,12 @@ async def _(ctx: HandlerContext):
             need_tools = any([word and word in query_text for word in tools_trigger_words])
             logger.info(f"使用工具: {need_tools}")
 
-            # 系统prompt
-            system_prompt_path = SYSTEM_PROMPT_TOOLS_PATH if need_tools else SYSTEM_PROMPT_PATH
-            with open(system_prompt_path, "r", encoding="utf-8") as f:
-                system_prompt = f.read().format(
-                    bot_name=bot_name,
-                    current_date=datetime.now().strftime("%Y-%m-%d")
-                )
+            # 普通聊天和工具聊天共用同一份人格，工具模式只追加协议说明。
+            system_prompt = load_chat_system_prompt(
+                need_tools=need_tools,
+                bot_name=bot_name,
+                current_date=datetime.now().strftime("%Y-%m-%d"),
+            )
 
         # 是否生成图片
         enable_image_response = False
