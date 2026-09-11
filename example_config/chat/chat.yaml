@@ -1,5 +1,6 @@
 session_len_limit: 40             # 会话长度限制
 output_reasoning_content: false   # 是否输出推理内容
+output_call_info: false           # 是否在回复末尾输出模型、耗时和 token 信息
 
 chat_cd: 10
 tts_cd: 30

@@ -516,20 +516,20 @@ async def _(ctx: HandlerContext):
     if reasoning and reasoning.strip():
         if config.get('output_reasoning_content'):
             reasoning_text = f"【思考】\n{reasoning}\n【回答】\n"
-        else:
-            reasoning_text = f"(已思考{len(reasoning)}字)\n"
     
-    # 添加额外信息
-    additional_info = f"{resp_model.get_full_name()} | {total_seconds:.1f}s, {total_ptokens}+{total_ctokens} tokens"
-    if rest_quota > 0:
-        price_unit = resp_model.get_price_unit()
-        if total_cost == 0.0:
-            additional_info += f" | 0/{rest_quota:.2f}{price_unit}"
-        elif total_cost >= 0.0001:
-            additional_info += f" | {total_cost:.4f}/{rest_quota:.2f}{price_unit}"
-        else:
-            additional_info += f" | <0.0001/{rest_quota:.2f}{price_unit}"
-    additional_info = f"\n({additional_info})"
+    # 模型调用信息仅供调试，默认不混入用户可见回复。
+    additional_info = ""
+    if config.get('output_call_info'):
+        additional_info = f"{resp_model.get_full_name()} | {total_seconds:.1f}s, {total_ptokens}+{total_ctokens} tokens"
+        if rest_quota > 0:
+            price_unit = resp_model.get_price_unit()
+            if total_cost == 0.0:
+                additional_info += f" | 0/{rest_quota:.2f}{price_unit}"
+            elif total_cost >= 0.0001:
+                additional_info += f" | {total_cost:.4f}/{rest_quota:.2f}{price_unit}"
+            else:
+                additional_info += f" | <0.0001/{rest_quota:.2f}{price_unit}"
+        additional_info = f"\n({additional_info})"
     final_text = tools_additional_info + reasoning_text + res_text + additional_info
 
     # 进行回复
