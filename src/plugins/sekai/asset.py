@@ -987,6 +987,27 @@ class RegionRipAssetManger:
 
         return candidates
 
+    def get_local_asset_cache_path(
+        self,
+        path: str,
+        cache_expire_secs=None,
+    ) -> Optional[str]:
+        """仅查找本地区服缓存，不触发任何远程下载。"""
+        for cache_rel_path in self._iter_local_cache_paths(path):
+            cache_path = pjoin(self.cache_dir, cache_rel_path)
+            try:
+                if not os.path.exists(cache_path):
+                    continue
+                if cache_expire_secs is not None:
+                    cache_age = datetime.now().timestamp() - os.path.getmtime(cache_path)
+                    if cache_age >= cache_expire_secs:
+                        continue
+                return cache_path
+            except OSError:
+                # 缓存可能在检查期间被更新器替换，按未命中继续尝试其他路径。
+                continue
+        return None
+
     @classmethod
     def get(cls, region: str) -> "RegionRipAssetManger":
         if region not in cls._all_mgrs:
@@ -1093,17 +1114,10 @@ class RegionRipAssetManger:
         - `cache_expire_secs`: 缓存过期时间
         - `timeout`: 超时时间
         """
-        cache_path = pjoin(self.cache_dir, path)
         # 首先尝试从缓存加载
-        for cache_rel_path in self._iter_local_cache_paths(path):
-            cache_path = pjoin(self.cache_dir, cache_rel_path)
-            try:
-                assert os.path.exists(cache_path)
-                if cache_expire_secs is not None:
-                    assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
-                return cache_path
-            except:
-                pass
+        cache_path = self.get_local_asset_cache_path(path, cache_expire_secs)
+        if cache_path:
+            return cache_path
         cache_path = pjoin(self.cache_dir, path)
         
         # 尝试从网络下载

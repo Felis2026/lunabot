@@ -763,6 +763,20 @@ async def random_crop_image(image: Image.Image, options: ImageRandomCropOptions)
         ret = Image.merge("RGB", (ret[channels[0]], ret[channels[1]], ret[channels[2]]))
     return ret
 
+def get_music_audio_cache_path(ctx: SekaiHandlerContext, path: str) -> Optional[str]:
+    """按当前区服查找听歌识曲音频，并为日服缺失资源回退国服缓存。"""
+    local_path = ctx.rip.get_local_asset_cache_path(path)
+    if local_path or ctx.region != "jp":
+        return local_path
+
+    # JP 与 CN 已发布歌曲通常共用音频资源名；这里只复用现有 CN 文件，
+    # 不会触发 CN 下载，避免 JP 上游异常时再增加一次网络等待。
+    cn_path = RegionRipAssetManger.get("cn").get_local_asset_cache_path(path)
+    if cn_path:
+        logger.info(f"日服听歌识曲音频未命中本地缓存，回退国服资源: {path}")
+    return cn_path
+
+
 # 随机歌曲，返回（歌曲数据，封面缩略图cq码，资源类型）
 @retry(stop=stop_after_attempt(3), reraise=True)
 async def random_music(ctx: SekaiHandlerContext, res_type: str) -> Tuple[Dict, Image.Image, Any]:
@@ -779,7 +793,10 @@ async def random_music(ctx: SekaiHandlerContext, res_type: str) -> Tuple[Dict, I
         # 随机一个版本音频
         vocals = await ctx.md.music_vocals.find_by('musicId', music['id'], mode='all')
         vocal_assetname = random.choice(vocals)['assetbundleName']
-        audio_path = await ctx.rip.get_asset_cache_path(f"music/long/{vocal_assetname}/{vocal_assetname}.mp3")
+        audio_asset_path = f"music/long/{vocal_assetname}/{vocal_assetname}.mp3"
+        audio_path = get_music_audio_cache_path(ctx, audio_asset_path)
+        if not audio_path:
+            audio_path = await ctx.rip.get_asset_cache_path(audio_asset_path)
         return music, cover_thumb_cq, audio_path
 
 # 发送猜曲提示
