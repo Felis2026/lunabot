@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -27,6 +28,7 @@ from .router import OfficialActivationStore
 
 
 SourceProvider = Callable[[], Awaitable[dict[str, Any]]]
+FAILED_SOURCE_RETRY_SECONDS = 900
 
 
 def _lower_posix_process_priority() -> None:
@@ -85,6 +87,8 @@ class PreviewManager:
         self._source_provider: SourceProvider | None = None
         self._configuration_error = ""
         self._last_source_signature = ""
+        self._failed_source_signature = ""
+        self._failed_source_retry_at = 0.0
         self._output_root = Path(
             "data/sekai/deckrec/rulesets/cn_jp_preview_v1"
         )
@@ -254,6 +258,22 @@ class PreviewManager:
             )
         }
 
+    def episode_optional_future_card_ids(self) -> set[int]:
+        """返回已校验为合法无剧情的未来卡，供单次 Suite 注入使用。"""
+
+        if not bool(_config_get(
+            "deck.cn_jp_preview.future_card_catalog.enabled",
+            True,
+        )):
+            return set()
+        return {
+            int(card_id)
+            for card_id in self._state.manifest.get("future_cards", {}).get(
+                "episode_optional_ids",
+                [],
+            )
+        }
+
     def ready_servers(self) -> list[dict[str, Any]]:
         return [dict(server) for server in self._state.ready_servers]
 
@@ -315,6 +335,14 @@ class PreviewManager:
                 )
                 source = await self._source_provider()
                 source_signature = str(source.get("refresh_fingerprint") or "")
+
+                # 同一份来源已经被 builder 确认失败时，只保留上一可用版本并
+                # 等待来源变化或退避到期，避免每 30 秒重复读取和校验大文件。
+                if source_signature != self._failed_source_signature:
+                    self._failed_source_signature = ""
+                    self._failed_source_retry_at = 0.0
+                elif time.monotonic() < self._failed_source_retry_at:
+                    return
 
                 servers = [
                     dict(server)
@@ -404,6 +432,10 @@ class PreviewManager:
                     )
                 preview_error = result.get("preview_error")
                 if preview_error:
+                    self._failed_source_signature = source_signature
+                    self._failed_source_retry_at = (
+                        time.monotonic() + FAILED_SOURCE_RETRY_SECONDS
+                    )
                     raise RuntimeError(
                         "preview builder 失败: "
                         + str(preview_error.get("error", "内部错误"))
@@ -418,6 +450,8 @@ class PreviewManager:
                     int(result["sync_metadata"]["musicmetas_update_ts"]),
                 )
                 if ready_servers is not None:
+                    self._failed_source_signature = ""
+                    self._failed_source_retry_at = 0.0
                     self._state.manifest = result["sync_metadata"]["manifest"]
                     self._state.ready_servers = ready_servers
                     self._state.message = ""
@@ -450,6 +484,8 @@ class PreviewManager:
                     manifest=result["sync_metadata"]["manifest"],
                     ready_servers=ready_servers,
                 )
+                self._failed_source_signature = ""
+                self._failed_source_retry_at = 0.0
                 self._last_source_signature = source_signature
                 logger.info(
                     "CN+JP预演组卡已就绪: "

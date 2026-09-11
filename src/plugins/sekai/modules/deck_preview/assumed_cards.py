@@ -93,6 +93,7 @@ def inject_explicit_assumed_cards(
     fixed_card_ids: Iterable[int],
     cn_catalog_card_ids: set[int] | None = None,
     future_card_ids: set[int],
+    episode_optional_future_card_ids: set[int] | None = None,
     jp_cards_by_id: Mapping[int, Mapping[str, Any]],
     jp_episodes_by_card_id: Mapping[int, Sequence[Mapping[str, Any]]],
     max_assumed_cards: int,
@@ -119,6 +120,7 @@ def inject_explicit_assumed_cards(
         raise PreviewCardError("max_assumed_cards 不能小于 0")
     config_overrides = card_config_overrides or {}
     cn_catalog_ids = cn_catalog_card_ids or set()
+    episode_optional_ids = episode_optional_future_card_ids or set()
     assumed_ids: list[int] = []
     explicit_cn_catalog_ids: list[int] = []
 
@@ -140,8 +142,10 @@ def inject_explicit_assumed_cards(
             )
         card = jp_cards_by_id.get(card_id)
         episodes = jp_episodes_by_card_id.get(card_id, ())
-        if card is None or not episodes:
+        if card is None:
             raise PreviewCardError(f"未来卡 {card_id} 的 JP 资料闭包不完整")
+        if not episodes and card_id not in episode_optional_ids:
+            raise PreviewCardError(f"未来卡 {card_id} 的 JP 剧情资料不完整")
         pending_cards.append((card_id, card, episodes))
 
     if len(pending_cards) > max_assumed_cards:

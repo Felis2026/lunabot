@@ -23,9 +23,10 @@ from .protocol import PREVIEW_DATA_SCOPE, PREVIEW_NATIVE_REGION
 
 
 MANIFEST_SCHEMA_VERSION = 1
-BUILDER_VERSION = 2
+BUILDER_VERSION = 3
 SUPPORTED_EVENT_TYPES = frozenset({"marathon", "world_bloom"})
 JP_GLOBAL_OVERRIDE_FILE = "worldBloomSupportDeckBonuses.json"
+EPISODE_OPTIONAL_CARD_SUPPLY_TYPES = frozenset({"collaboration_limited"})
 
 
 class RulesetBuildError(RuntimeError):
@@ -382,7 +383,20 @@ def _candidate_events(
 def _validate_future_cards(
     cn: Mapping[str, list[dict[str, Any]]],
     jp: Mapping[str, list[dict[str, Any]]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    episode_optional_card_supply_ids: Iterable[int] = (),
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    set[int],
+    dict[str, str],
+]:
+    """
+    校验并筛选可用于预演的 JP 未实装卡。
+
+    联动限定卡允许官方不提供卡牌剧情；其他无剧情卡按上游分批发布处理，
+    只从未来卡目录排除，不能阻塞其余活动和卡牌发布。
+    """
+
     cn_card_ids = _ids(cn["cards.json"])
     future_cards = [card for card in jp["cards.json"] if card.get("id") not in cn_card_ids]
     future_card_ids = _ids(future_cards)
@@ -427,9 +441,38 @@ def _validate_future_cards(
     for episode in future_episodes:
         episodes_by_card.setdefault(episode["cardId"], []).append(episode)
     missing = sorted(card_id for card_id in future_card_ids if not episodes_by_card.get(card_id))
-    if missing:
-        raise RulesetBuildError(f"未来卡缺少剧情闭包: {missing[:10]}")
-    return future_cards, future_episodes
+    optional_supply_ids = {
+        int(supply_id)
+        for supply_id in episode_optional_card_supply_ids
+    }
+    cards_by_id = {card["id"]: card for card in future_cards}
+    episode_optional_ids = {
+        card_id
+        for card_id in missing
+        if cards_by_id[card_id].get("cardSupplyId") in optional_supply_ids
+    }
+    incomplete_ids = set(missing) - episode_optional_ids
+    excluded_cards = {
+        str(card_id): "missing_card_episodes"
+        for card_id in sorted(incomplete_ids)
+    }
+    if incomplete_ids:
+        future_cards = [
+            card
+            for card in future_cards
+            if card["id"] not in incomplete_ids
+        ]
+        future_episodes = [
+            episode
+            for episode in future_episodes
+            if episode.get("cardId") not in incomplete_ids
+        ]
+    return (
+        future_cards,
+        future_episodes,
+        episode_optional_ids,
+        excluded_cards,
+    )
 
 
 def _validate_event_rules(
@@ -525,6 +568,7 @@ def build_ruleset_contents(
     *,
     allowed_event_types: Iterable[str] = SUPPORTED_EVENT_TYPES,
     event_allowlist: Iterable[int] = (),
+    episode_optional_card_supply_ids: Iterable[int] = (),
 ) -> tuple[dict[str, bytes], dict[str, Any]]:
     """从冻结的 CN/JP 来源生成完整 preview 文件集和未签名 manifest。"""
 
@@ -553,7 +597,16 @@ def build_ruleset_contents(
         allowed_types,
         {int(value) for value in event_allowlist},
     )
-    future_cards, future_episodes = _validate_future_cards(cn, jp)
+    (
+        future_cards,
+        future_episodes,
+        episode_optional_ids,
+        excluded_cards,
+    ) = _validate_future_cards(
+        cn,
+        jp,
+        episode_optional_card_supply_ids,
+    )
     all_card_ids = _ids(cn["cards.json"]) | _ids(future_cards)
 
     accepted: list[dict[str, Any]] = []
@@ -684,13 +737,15 @@ def build_ruleset_contents(
             "ids": future_card_ids,
             "count": len(future_card_ids),
             "sha256": _sha256_bytes(_canonical_json_bytes(future_card_ids)),
+            "episode_optional_ids": sorted(episode_optional_ids),
+            "excluded": excluded_cards,
         },
         "excluded_events": excluded,
         "files": file_hashes,
         "source_files": dict(sorted(snapshot.hashes.items())),
         "builder_version": BUILDER_VERSION,
         "native_package_version": _native_package_version(),
-        # 上游与 StarMoe fork 当前都报告 0.2.21，必须额外区分实际二进制。
+        # 不同原生发行包可能报告相同版本号，必须额外区分实际构建。
         "native_package_build_id": get_native_package_build_id(),
     }
     return outputs, unsigned_manifest
@@ -884,7 +939,7 @@ def run_native_canaries(
             )
         event_count += 1
 
-    # 同时探测目录首尾两张未来卡，覆盖“当期卡”和“非当期未来卡”两类假设。
+    # 同时探测目录首尾卡和一张合法无剧情卡，覆盖常规与剧情可选两类假设。
     future_cards_by_id = {
         card["id"]: card
         for card in _load_json_list(
@@ -896,7 +951,15 @@ def run_native_canaries(
     assumed_count = 0
     if manifest["event_ids"] and future_cards_by_id:
         canary_event_id = manifest["event_ids"][0]
-        for card_id in sorted(future_cards_by_id)[:: max(len(future_cards_by_id) - 1, 1)]:
+        sorted_future_ids = sorted(future_cards_by_id)
+        probe_card_ids = [sorted_future_ids[0], sorted_future_ids[-1]]
+        optional_ids = sorted(
+            set(manifest["future_cards"].get("episode_optional_ids", []))
+            & set(future_cards_by_id)
+        )
+        if optional_ids:
+            probe_card_ids.append(optional_ids[0])
+        for card_id in dict.fromkeys(probe_card_ids):
             assumed_card = future_cards_by_id[card_id]
             assumed_userdata = load_userdata(
                 _build_canary_profile(cn_cards, assumed_card)
@@ -1060,6 +1123,7 @@ def _load_reusable_result(
     jp_masterdata_version: str,
     allowed_event_types: Sequence[str],
     event_allowlist: Sequence[int],
+    episode_optional_card_supply_ids: Sequence[int],
 ) -> RulesetBuildResult | None:
     pointer_path = root / "current.json"
     if not pointer_path.is_file():
@@ -1089,6 +1153,9 @@ def _load_reusable_result(
         if manifest.get("build_policy") != {
             "allowed_event_types": list(allowed_event_types),
             "event_allowlist": list(event_allowlist),
+            "episode_optional_card_supply_ids": list(
+                episode_optional_card_supply_ids
+            ),
         }:
             return None
         masterdata_dir = version_dir / "masterdata"
@@ -1119,6 +1186,7 @@ def build_and_publish_ruleset(
     musicmetas_path: str,
     allowed_event_types: Iterable[str] = SUPPORTED_EVENT_TYPES,
     event_allowlist: Iterable[int] = (),
+    episode_optional_card_supply_ids: Iterable[int] = (),
     run_canaries: bool = True,
 ) -> RulesetBuildResult:
     """构建、复核并原子发布一份可路由的 preview 规则集。"""
@@ -1147,6 +1215,10 @@ def build_and_publish_ruleset(
 
         normalized_allowed_types = tuple(sorted(set(allowed_event_types)))
         normalized_allowlist = tuple(sorted({int(value) for value in event_allowlist}))
+        normalized_optional_supply_ids = tuple(sorted({
+            int(value)
+            for value in episode_optional_card_supply_ids
+        }))
         snapshot = freeze_sources(source_paths)
         if reusable := _load_reusable_result(
             root,
@@ -1155,6 +1227,7 @@ def build_and_publish_ruleset(
             jp_masterdata_version=str(jp_masterdata_version),
             allowed_event_types=normalized_allowed_types,
             event_allowlist=normalized_allowlist,
+            episode_optional_card_supply_ids=normalized_optional_supply_ids,
         ):
             return reusable
 
@@ -1163,12 +1236,16 @@ def build_and_publish_ruleset(
             expected,
             allowed_event_types=normalized_allowed_types,
             event_allowlist=normalized_allowlist,
+            episode_optional_card_supply_ids=normalized_optional_supply_ids,
         )
         manifest["cn_masterdata_version"] = str(cn_masterdata_version)
         manifest["jp_masterdata_version"] = str(jp_masterdata_version)
         manifest["build_policy"] = {
             "allowed_event_types": list(normalized_allowed_types),
             "event_allowlist": list(normalized_allowlist),
+            "episode_optional_card_supply_ids": list(
+                normalized_optional_supply_ids
+            ),
         }
 
         fingerprint_input = get_preview_manifest_fingerprint_input(manifest)

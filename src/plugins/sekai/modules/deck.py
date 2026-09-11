@@ -48,6 +48,7 @@ from .deck_preview.assumed_cards import (
     validate_preview_result_cards,
 )
 from .deck_preview.ruleset import (
+    EPISODE_OPTIONAL_CARD_SUPPLY_TYPES,
     validate_event_card_closure,
     validate_world_bloom_support_tables,
 )
@@ -956,6 +957,9 @@ async def extract_preview_target_event(
         world_bloom_character_id=wl_cid,
         scope_fingerprint=state.scope_fingerprint,
         future_card_ids=frozenset(preview_manager.future_card_ids()),
+        episode_optional_future_card_ids=frozenset(
+            preview_manager.episode_optional_future_card_ids()
+        ),
     )
     return args, resolution, True
 
@@ -2387,6 +2391,9 @@ async def compose_deck_recommend_image(
                     if isinstance(card.get("id"), int)
                 },
                 future_card_ids=set(preview_resolution.future_card_ids),
+                episode_optional_future_card_ids=set(
+                    preview_resolution.episode_optional_future_card_ids
+                ),
                 jp_cards_by_id=jp_cards_by_id,
                 jp_episodes_by_card_id=jp_episodes_by_card_id,
                 max_assumed_cards=max_assumed_cards,
@@ -3750,6 +3757,16 @@ async def provide_preview_builder_source() -> dict:
     except Exception:
         builder_owner = True
 
+    # cardSupplies 是预览校验策略输入，不加入原生组卡的 31 份同步文件。
+    # 使用官方供给类型而不是写死 supply ID，避免不同版本的编号变化。
+    jp_card_supplies = await jp_ctx.md.card_supplies.get()
+    episode_optional_card_supply_ids = sorted({
+        int(item["id"])
+        for item in jp_card_supplies
+        if isinstance(item.get("id"), int)
+        and item.get("cardSupplyType") in EPISODE_OPTIONAL_CARD_SUPPLY_TYPES
+    })
+
     output_root = "data/sekai/deckrec/rulesets/cn_jp_preview_v1"
     builder_request = {
         "cn_paths": cn_paths,
@@ -3767,6 +3784,9 @@ async def provide_preview_builder_source() -> dict:
         # 玩家入口，不能用来裁剪底层 MasterData；否则两场活动的稀疏规则集会冷加载失败。
         "event_allowlist": [],
         "route_event_allowlist": event_allowlist,
+        "episode_optional_card_supply_ids": (
+            episode_optional_card_supply_ids
+        ),
         "run_canaries": True,
     }
 
@@ -3826,6 +3846,9 @@ async def provide_preview_builder_source() -> dict:
                 "route_event_allowlist": sorted(
                     int(value)
                     for value in event_allowlist
+                ),
+                "episode_optional_card_supply_ids": (
+                    episode_optional_card_supply_ids
                 ),
                 "official_activation_candidates": activation_candidates,
                 # 正式节点与 CN 数据都就绪后，原生 canary 若遇到瞬时失败，

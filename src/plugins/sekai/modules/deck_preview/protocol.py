@@ -47,6 +47,7 @@ class PreviewEventResolution:
     is_preview: bool = True
     scope_fingerprint: str = ""
     future_card_ids: frozenset[int] = frozenset()
+    episode_optional_future_card_ids: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -94,6 +95,13 @@ def build_request_identity(request: Mapping[str, Any]) -> dict[str, Any]:
             for value in request.get(
                 "route_event_allowlist",
                 request.get("event_allowlist", []),
+            )
+        }),
+        "episode_optional_card_supply_ids": sorted({
+            int(value)
+            for value in request.get(
+                "episode_optional_card_supply_ids",
+                [],
             )
         }),
         "official_candidate_ids": sorted({

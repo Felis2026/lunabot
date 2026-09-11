@@ -394,6 +394,10 @@ def main() -> int:
                     ["marathon", "world_bloom"],
                 ),
                 event_allowlist=request.get("event_allowlist", []),
+                episode_optional_card_supply_ids=request.get(
+                    "episode_optional_card_supply_ids",
+                    [],
+                ),
                 run_canaries=bool(request.get("run_canaries", True)),
             )
         except Exception as exc:
