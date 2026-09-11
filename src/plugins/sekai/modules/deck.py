@@ -284,6 +284,51 @@ FINAL_CHAPTER_HONOR_UNIT_NAME_MAP = {
 }
 
 
+async def normalize_final_chapter_max_profile_honors(
+    ctx: SekaiHandlerContext,
+    profile: dict,
+) -> None:
+    """将顶配档案中互斥的终章排名称号收敛为每个角色一枚。"""
+
+    bonus_rows = await ctx.md.event_honor_bonuses.find_by(
+        "eventId",
+        180,
+        mode="all",
+    )
+    if not bonus_rows:
+        return
+
+    # 同一角色的 TOP100～TOP1000 来自同一章节排名，玩家实际只能获得其中一枚。
+    # 顶配档案仍保留其他可累积称号，只对这组互斥的终章加成称号去重。
+    eligible_honor_ids: set[int] = set()
+    selected_by_character: dict[int, tuple[float, int]] = {}
+    for row in bonus_rows:
+        character_id = row.get("leaderGameCharacterId")
+        honor_id = row.get("honorId")
+        bonus_rate = row.get("bonusRate")
+        if (
+            not isinstance(character_id, int)
+            or not isinstance(honor_id, int)
+            or not isinstance(bonus_rate, (int, float))
+        ):
+            continue
+        eligible_honor_ids.add(honor_id)
+        candidate = (float(bonus_rate), -honor_id)
+        if candidate > selected_by_character.get(character_id, (-1.0, 0)):
+            selected_by_character[character_id] = candidate
+
+    selected_honor_ids = {
+        -candidate[1]
+        for candidate in selected_by_character.values()
+    }
+    profile["userHonors"] = [
+        user_honor
+        for user_honor in profile.get("userHonors", [])
+        if user_honor.get("honorId") not in eligible_honor_ids
+        or user_honor.get("honorId") in selected_honor_ids
+    ]
+
+
 async def get_final_chapter_target_cid(
     ctx: SekaiHandlerContext,
     options: DeckRecommendOptions,
@@ -397,6 +442,23 @@ async def apply_final_chapter_badge_simulation(
     通过临时注入一枚 WL2 高阶 honor，模拟终章牌子加成。
     """
     if not enabled or target_cid is None:
+        return
+
+    # 玩家已持有该角色任意一枚有效终章称号时，不能再注入另一档互斥排名称号。
+    user_honor_ids = {
+        item.get("honorId")
+        for item in profile.get("userHonors", [])
+    }
+    final_chapter_honor_rows = await ctx.md.event_honor_bonuses.find_by(
+        "eventId",
+        180,
+        mode="all",
+    )
+    if any(
+        row.get("leaderGameCharacterId") == target_cid
+        and row.get("honorId") in user_honor_ids
+        for row in final_chapter_honor_rows
+    ):
         return
 
     chapter_no = await get_final_chapter_wl2_chapter_no(ctx, target_cid)
@@ -2341,6 +2403,9 @@ async def compose_deck_recommend_image(
     # ================================ 终章目标与牌子模拟 ================================ #
     # 终章的支援和额外加成都跟队长角色绑定，因此要先把目标角色固化，再决定后续裁卡池策略。
     final_chapter_target_cid = await apply_final_chapter_target_character(ctx, options, use_current_deck)
+
+    if options.event_id == 180 and (use_max_profile or use_sub_max_profile):
+        await normalize_final_chapter_max_profile_honors(ctx, profile)
 
     assert_and_reply(
         not additional.get('final_chapter_badge_sim', False) or options.event_id == 180,
