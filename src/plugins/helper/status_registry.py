@@ -155,6 +155,21 @@ def resolve_rollpig(ctx: HelpStatusContext) -> Optional[HelpStatusResult]:
     return HelpStatusResult(main_enabled=main_enabled)
 
 
+def resolve_waifu(ctx: HelpStatusContext) -> Optional[HelpStatusResult]:
+    """同时显示今日老婆主服务与缘分周刊的群级状态。"""
+    main_enabled = ctx.get_toggle("waifu")
+    if main_enabled is None:
+        return None
+    if not main_enabled:
+        return HelpStatusResult(main_enabled=False)
+
+    weekly_enabled = ctx.get_toggle("waifu_weekly")
+    items = []
+    if weekly_enabled is not None:
+        items.append(StatusItem("周刊", weekly_enabled))
+    return HelpStatusResult(main_enabled=True, items=items)
+
+
 # ================================ 帮助页状态注册表 ================================ #
 
 # 这里只维护“帮助页如何读状态”的规则，避免把映射逻辑散落到 helper 主流程里。
@@ -175,6 +190,7 @@ HELP_STATUS_REGISTRY: dict[str, Resolver] = {
     "random": single_toggle("random"),
     "record": single_toggle("record"),
     "rollpig": resolve_rollpig,
+    "waifu": resolve_waifu,
     "whateat": single_toggle("whateat"),
     "sekai": single_toggle("sekai"),
     "sta": single_toggle("sta"),

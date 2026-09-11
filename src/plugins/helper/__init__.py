@@ -27,6 +27,7 @@ HELP_GROUP_SERVICES = [
     "imgexp",
     "random",
     "whateat",
+    "waifu",
     "math",
     "record",
     "sta",
@@ -43,6 +44,7 @@ HELP_ADMIN_TOGGLE_SERVICES = {
     "record",
     "rollpig",
     "whateat",
+    "waifu",
 }
 
 HELP_SUPERUSER_TOGGLE_SERVICES = {
@@ -74,6 +76,7 @@ DEFAULT_HELP_SERVICE_ROUTES = {
     "imgexp": "/features/imgexp",
     "random": "/features/random",
     "whateat": "/features/whateat",
+    "waifu": "/features/waifu",
     "math": "/features/math",
     "record": "/features/record",
     "sta": "/features/sta",
