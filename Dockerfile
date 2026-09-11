@@ -14,7 +14,7 @@ deb https://mirrors.cloud.tencent.com/debian/ bookworm-backports main non-free n
 
 ENV PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
     PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
-    DECKREC_NATIVE_METADATA_DIR=/usr/local/share/sekai-deck-recommend-cpp
+    DECKREC_NATIVE_METADATA_DIR=/usr/local/share/haruki-sekai-deck-recommend-cpp
 
 # === 3. 系统依赖 ===
 RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
@@ -60,15 +60,15 @@ RUN python -m pip install \
     --trusted-host mirrors.cloud.tencent.com \
     -r requirements.txt
 
-# ================================ StarMoe原生组卡 ================================ #
-# 默认在每次无缓存构建时解析 StarMoe master 的最新提交；也可通过 build arg
-# 指定分支、标签或完整 commit。镜像记录实际 commit，并携带 LGPL 原文与对应源码。
-ARG DECKREC_NATIVE_REPOSITORY=https://github.com/StarMoe-org/sekai-deck-recommend-cpp.git
-ARG DECKREC_NATIVE_REF=master
+# ================================ Haruki原生组卡 ================================ #
+# 固定到已验证的 Haruki 提交，避免重新构建时因上游 master 漂移
+# 得到未经验证的规则；仍可通过 build arg 显式指定其他提交。
+ARG DECKREC_NATIVE_REPOSITORY=https://github.com/Team-Haruki/sekai-deck-recommend-cpp.git
+ARG DECKREC_NATIVE_REF=46c3d60d7b712bcf382af9acfa71180571b95490
 RUN set -eux; \
     mkdir -p /tmp/deckrec-native/source \
         "${DECKREC_NATIVE_METADATA_DIR}" \
-        /usr/local/share/licenses/sekai-deck-recommend-cpp; \
+        /usr/local/share/licenses/haruki-sekai-deck-recommend-cpp; \
     git -C /tmp/deckrec-native/source init; \
     git -C /tmp/deckrec-native/source remote add origin "${DECKREC_NATIVE_REPOSITORY}"; \
     git -C /tmp/deckrec-native/source fetch --depth 1 origin "${DECKREC_NATIVE_REF}"; \
@@ -79,9 +79,9 @@ RUN set -eux; \
     printf '%s\n' "${resolved_commit}" > "${DECKREC_NATIVE_METADATA_DIR}/commit"; \
     printf '%s\n' "${DECKREC_NATIVE_REPOSITORY}" > "${DECKREC_NATIVE_METADATA_DIR}/source-url"; \
     printf '%s\n' "${DECKREC_NATIVE_REF}" > "${DECKREC_NATIVE_METADATA_DIR}/source-ref"; \
-    printf 'starmoe-%s\n' "${short_commit}" > "${DECKREC_NATIVE_METADATA_DIR}/build-id"; \
+    printf 'haruki-%s\n' "${short_commit}" > "${DECKREC_NATIVE_METADATA_DIR}/build-id"; \
     cp /tmp/deckrec-native/source/LICENSE \
-        /usr/local/share/licenses/sekai-deck-recommend-cpp/LICENSE; \
+        /usr/local/share/licenses/haruki-sekai-deck-recommend-cpp/LICENSE; \
     tar --exclude-vcs --exclude='./build' -czf \
         "${DECKREC_NATIVE_METADATA_DIR}/source.tar.gz" \
         -C /tmp/deckrec-native/source .; \
@@ -98,7 +98,7 @@ RUN set -eux; \
         --no-deps \
         --force-reinstall \
         "${wheel_path}"; \
-    python -c 'from sekai_deck_recommend_cpp import SekaiDeckRecommend; assert hasattr(SekaiDeckRecommend, "get_world_bloom_support_cards"), "StarMoe原生包缺少WL3能力"'; \
+    python -c 'from sekai_deck_recommend_cpp import SekaiDeckRecommend; assert hasattr(SekaiDeckRecommend, "get_world_bloom_support_cards"), "Haruki原生包缺少WL3能力"'; \
     rm -rf /tmp/deckrec-native
 
 FROM runtime-base AS runtime

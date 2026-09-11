@@ -1,8 +1,8 @@
 # Sekai Deck Recommend Service for LunaBot
 
-The service requires Python 3.10 or later and
-`sekai-deck-recommend-cpp`. The repository Dockerfile builds the StarMoe
-variant during image creation and verifies its WL3 capability.
+The service requires Python 3.10 or later and the
+`sekai_deck_recommend_cpp` extension. The repository Dockerfile builds the
+Team Haruki distribution during image creation and verifies its WL3 capability.
 
 ## Docker
 
@@ -20,9 +20,9 @@ data directory `data/sekai/deckrec-preview`; use the
 `DECKREC_PREVIEW_DATA_DIR` variables only when those defaults conflict with
 the deployment.
 
-The Docker build defaults to the latest commit on the configured StarMoe
-branch during an uncached build. Set `DECKREC_NATIVE_REF` to a full commit for
-a reproducible build. See the repository
+The Docker build defaults to the validated Team Haruki commit configured in
+`docker-compose.example.yml`. Set `DECKREC_NATIVE_REF` to another full commit
+when intentionally testing an upgrade. See the repository
 [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md) for source and
 license details.
 

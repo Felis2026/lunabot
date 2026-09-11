@@ -235,10 +235,15 @@ def _safe_remove_tree(path: Path, allowed_parent: Path) -> None:
 
 
 def _native_package_version() -> str:
-    try:
-        return importlib.metadata.version("sekai-deck-recommend-cpp")
-    except importlib.metadata.PackageNotFoundError:
-        return "missing"
+    for distribution in (
+        "haruki-sekai-deck-recommend-cpp",
+        "sekai-deck-recommend-cpp",
+    ):
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "missing"
 
 
 def freeze_sources(paths: Mapping[str, str]) -> FrozenSourceSnapshot:

@@ -55,6 +55,12 @@ prepare_deckrec_native_override() {
     install_stamp="/tmp/sekai-deckrec-${build_id}-${expected_sha256}.ready"
     if [ ! -f "$install_stamp" ] || ! deckrec_native_supports_wl3; then
         echo "正在离线加载临时原生组卡包（${build_id}）..."
+        # 两个发行包会写入同一个 Python 模块目录，覆盖前必须同时清理，
+        # 否则旧发行包的卸载记录可能在后续维护中误删新内核文件。
+        python -m pip uninstall --yes \
+            sekai-deck-recommend-cpp \
+            haruki-sekai-deck-recommend-cpp \
+            >/dev/null 2>&1 || true
         python -m pip install \
             --disable-pip-version-check \
             --no-cache-dir \

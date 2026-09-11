@@ -53,15 +53,15 @@ Note: This project is for reference and learning purposes only, and is **not** a
 
 - (Optional) Start the Sekai Deck Recommendation Service: [README.md](./src/services/deck_recommender/README.md)
 
-For Docker builds, the default `DECKREC_NATIVE_REF=master` resolves the latest
-StarMoe deck recommender commit available during an uncached build. Use the
-following command when intentionally refreshing that native dependency:
+For Docker builds, `DECKREC_NATIVE_REF` defaults to the validated Team Haruki
+deck recommender commit configured in `docker-compose.example.yml`. Use the
+following command when intentionally rebuilding that native dependency:
 
 ```bash
 docker compose build --pull --no-cache lunabot
 ```
 
-Set `DECKREC_NATIVE_REF` in `.env` to a full commit when a reproducible rebuild
+Set `DECKREC_NATIVE_REF` in `.env` to another full commit when a reproducible rebuild
 is required. The exact commit, license, and corresponding source are preserved
 inside the resulting image; see [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 

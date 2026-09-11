@@ -84,10 +84,10 @@ start_optional_service() {
 trap cleanup EXIT INT TERM
 
 # ================================ 原生组卡包准备 ================================ #
-# 标准镜像会把 StarMoe 的实际 commit 写入元数据；仅在没有临时 wheel 覆盖时
+# 标准镜像会把原生组卡包的实际 commit 写入元数据；仅在没有临时 wheel 覆盖时
 # 读取该构建身份。这样 emergency override 仍必须显式提供自己的 build id。
 load_builtin_deckrec_metadata() {
-    local metadata_dir="${DECKREC_NATIVE_METADATA_DIR:-/usr/local/share/sekai-deck-recommend-cpp}"
+    local metadata_dir="${DECKREC_NATIVE_METADATA_DIR:-/usr/local/share/haruki-sekai-deck-recommend-cpp}"
     local build_id_file="${metadata_dir}/build-id"
     local commit_file="${metadata_dir}/commit"
     local builtin_build_id=""
@@ -100,7 +100,7 @@ load_builtin_deckrec_metadata() {
     fi
 
     IFS= read -r builtin_build_id < "$build_id_file"
-    if [[ ! "$builtin_build_id" =~ ^starmoe-[0-9a-f]{7,40}$ ]]; then
+    if [[ ! "$builtin_build_id" =~ ^(starmoe|haruki)-[0-9a-f]{7,40}$ ]]; then
         echo "错误：镜像内置原生组卡 build id 格式无效：${builtin_build_id}" >&2
         return 1
     fi
