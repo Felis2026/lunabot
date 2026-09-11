@@ -54,10 +54,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 # === 5. Python 依赖 ===
-COPY requirements.txt .
+COPY requirements.txt constraints.txt ./
 RUN python -m pip install \
     --no-cache-dir \
     --trusted-host mirrors.cloud.tencent.com \
+    --constraint constraints.txt \
     -r requirements.txt
 
 # ================================ Haruki原生组卡 ================================ #
