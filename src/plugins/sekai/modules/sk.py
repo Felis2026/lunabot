@@ -205,9 +205,10 @@ def get_event_id_and_name_text(region: str, event_id: int, event_name: str) -> s
         event_id = event_id % 1000
         return f"【{region.upper()}-{event_id}-第{chapter_id}章单榜】{event_name}"
 
-# 组合指令前缀和正文参数，避免旧的字符串直接拼接产生 "2wl" 一类倒序参数
+# WL 命令前缀是命令语法，不能与用户正文拼接后再按 wlN 解析。
+# 否则 `/wlcf15-20` 会变成 `wl 15-20`，并被误认为第 15 次 WL。
 def get_wl_handler_args(ctx: SekaiHandlerContext) -> str:
-    return normalize_wl_args(f"{ctx.prefix_arg} {ctx.get_args().strip()}")
+    return normalize_wl_args(ctx.get_args())
 
 
 # 从参数获取带有wl_id的wl_event，返回 (wl_event, args)，未指定章节则默认查询当前章节
@@ -230,7 +231,8 @@ async def extract_wl_event(ctx: SekaiHandlerContext, args: str) -> Tuple[dict, s
             raise ReplyException(f"`wl{nickname}` 已改为 `角色{nickname}`")
 
     chapter_id, chapter_arg = extract_wl_chapter_selector(args)
-    has_current_wl, args_without_wl = remove_standalone_wl(args)
+    has_inline_current_wl, args_without_wl = remove_standalone_wl(args)
+    has_current_wl = ctx.prefix_arg == "wl" or has_inline_current_wl
     role_nickname, role_arg = extract_wl_role_selector(
         args_without_wl,
         nicknames,
