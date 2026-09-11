@@ -1,0 +1,14 @@
+qps_limit: 5
+quota_sync_interval_sec: 60*60*6
+price_unit: "￥"
+
+# 按实际部署填写 OpenAI 兼容接口地址；容器访问宿主机时可使用 host.docker.internal。
+api_key: "YOUR_ANTIGRAVITY_API_KEY"
+base_url: "http://host.docker.internal:8045/v1"
+
+models:
+  - name: "gemini-3.6-flash-high"
+    model_id: "gemini-3.6-flash-high"
+    is_multimodal: true
+    input_pricing: 0
+    output_pricing: 0
