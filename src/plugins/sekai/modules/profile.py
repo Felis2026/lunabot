@@ -641,7 +641,11 @@ async def get_card_full_thumbnail(
     cid = card['id']
 
     if not pcard:
-        after_training = after_training and has_after_training(card)
+        # 初始即完成特训的卡牌没有 normal 素材，所有公共卡面统一使用特训图。
+        if only_has_after_training(card):
+            after_training = True
+        else:
+            after_training = after_training and has_after_training(card)
         rare_image_type = "after_training" if after_training else "normal"
     else:
         after_training = pcard['defaultImage'] == "special_training"
