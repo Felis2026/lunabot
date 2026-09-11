@@ -1,4 +1,4 @@
-from ..record.sql import query_recent_msg
+from ..record.sql import query_msg_by_id, query_recent_msg
 from ..record import before_record_hook
 from ..utils import *
 from ..utils.rpc import *
@@ -110,6 +110,136 @@ async def handle_get_group_msg(cid: str, group_id: int, limit: int):
         ret.append(msg)
     return ret
 
+
+@rpc_method(RPC_SERVICE, 'get_group_msg_by_id')
+async def handle_get_group_msg_by_id(cid: str, group_id: int, msg_id: int):
+    """为 Autochat 定向识图返回被引用的原始消息。"""
+
+    msg = await query_msg_by_id(group_id, msg_id)
+    if not msg:
+        return None
+    if isinstance(msg['time'], datetime):
+        msg['time'] = int(msg['time'].timestamp())
+    return msg
+
+
+MAX_REFRESH_IMAGE_BYTES = 15 * 1024 * 1024
+
+
+async def _image_ref_to_data_url(bot: Bot, file_ref: str) -> str:
+    """Download a OneBot image reference and normalize it for the LLM."""
+
+    file_ref = str(file_ref)
+    if file_ref.startswith('http'):
+        data_url = await download_image_to_b64(file_ref)
+    else:
+        image_path = str(await download_bot_file(bot, 'image', file_ref))
+        if image_path.startswith('http'):
+            data_url = await download_image_to_b64(image_path)
+        else:
+            if image_path.startswith('file://'):
+                image_path = image_path[7:]
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(image_path)
+            if os.path.getsize(image_path) > MAX_REFRESH_IMAGE_BYTES:
+                raise ValueError("图片过大，拒绝刷新")
+            image = open_image(image_path)
+            try:
+                data_url = get_image_b64(image)
+            finally:
+                image.close()
+    if len(data_url) > MAX_REFRESH_IMAGE_BYTES * 2:
+        raise ValueError("图片编码后过大，拒绝刷新")
+    return data_url
+
+
+@rpc_method(RPC_SERVICE, 'get_group_msg_image')
+async def handle_get_group_msg_image(
+    cid: str,
+    group_id: int,
+    msg_id: int,
+    file_unique: str = "",
+    file_ref: str = "",
+):
+    """Refresh one historical image through OneBot and return safe data URL bytes."""
+
+    bot = await aget_group_bot(group_id, raise_exc=True)
+    requested_unique = str(file_unique or "")
+    requested_file = str(file_ref or "")
+    try:
+        msg_obj = await get_msg_obj_by_bot(bot, msg_id)
+    except Exception as exc:
+        logger.warning(f"获取历史消息 {msg_id} 失败，尝试直接取图: {get_exc_desc(exc)}")
+        msg_obj = None
+
+    # ================================ 精确消息刷新 ================================ #
+
+    if msg_obj is None:
+        direct_refs = []
+        for candidate in (requested_file, requested_unique):
+            if candidate and candidate not in direct_refs:
+                direct_refs.append(candidate)
+        for direct_ref in direct_refs:
+            try:
+                data_url = await _image_ref_to_data_url(bot, direct_ref)
+                return {
+                    'msg_id': int(msg_id),
+                    'file_unique': requested_unique,
+                    'data': data_url,
+                }
+            except Exception as exc:
+                logger.warning(
+                    f"直接刷新群 {group_id} 消息 {msg_id} 的图片失败: "
+                    f"{get_exc_desc(exc)}"
+                )
+        return None
+
+    # ================================ 消息内图片选择 ================================ #
+
+    image_segments = [
+        segment
+        for segment in msg_obj.get('message', [])
+        if segment.get('type') == 'image'
+    ]
+    matching_segments = [
+        segment
+        for segment in image_segments
+        if (
+            requested_unique
+            and str(segment.get('data', {}).get('file_unique') or "") == requested_unique
+        ) or (
+            requested_file
+            and str(segment.get('data', {}).get('file') or "") == requested_file
+        )
+    ]
+    if matching_segments:
+        image_segments = matching_segments
+    elif len(image_segments) > 1 and (requested_unique or requested_file):
+        # Do not silently summarize the wrong image when a multi-image message
+        # has an unstable backend-specific identifier.
+        return None
+
+    for segment in image_segments:
+        data = segment.get('data', {})
+        current_unique = str(data.get('file_unique') or "")
+
+        file_ref = data.get('file') or data.get('url')
+        if not file_ref:
+            continue
+        try:
+            data_url = await _image_ref_to_data_url(bot, file_ref)
+            return {
+                'msg_id': int(msg_obj.get('message_id', msg_id)),
+                'file_unique': current_unique or requested_unique,
+                'data': data_url,
+            }
+        except Exception as exc:
+            logger.warning(
+                f"刷新群 {group_id} 消息 {msg_id} 的图片失败: {get_exc_desc(exc)}"
+            )
+            continue
+    return None
+
 # 请求LLM
 @rpc_method(RPC_SERVICE, 'query_llm')
 async def handle_query_llm(cid: str, model: str | list[str], text: str, images: list[str], options: dict):
@@ -121,7 +251,10 @@ async def handle_query_llm(cid: str, model: str | list[str], text: str, images: 
     imgs = []
     for img in images:
         if img.startswith('http'):
-            img = await download_image_to_b64(img)
+            try:
+                img = await download_image_to_b64(img)
+            except HttpError as exc:
+                raise Exception(f"图片下载失败 HTTP {exc.status_code}") from exc
         imgs.append(img)
 
     session = ChatSession()

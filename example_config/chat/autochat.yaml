@@ -17,6 +17,8 @@ image_caption:
   model: 
     - gg:gemini-2.5-flash-lite
   timeout: 20
+  # 通过 OneBot 刷新历史图片的 RPC 超时；缺少此项时服务默认使用 20 秒。
+  refresh_timeout: 20
   max_tokens: 50
   prompt: |
     该{sub_type}是在QQ群中由群友发送的，请你简短总结这张图片的内容用于视障人士理解图片。

@@ -141,6 +141,22 @@ async def query_recent_msg(group_id: int, limit: int):
     logger.debug(f"获取 {MSG_TABLE_NAME.format(group_id)} 表中的 最近 {limit} 条消息 {len(rows)} 条")
     return [msg_row_to_ret(row) for row in rows]
 
+
+async def query_msg_by_id(group_id: int, msg_id: int):
+    """按 OneBot 消息 ID 精确获取一条群消息。"""
+
+    conn = await get_conn(group_id)
+    query = f'''
+        SELECT * FROM {MSG_TABLE_NAME.format(group_id)}
+        WHERE msg_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    '''
+    cursor = await conn.execute(query, (msg_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return msg_row_to_ret(row) if row else None
+
 # 按时间范围计数
 async def query_msg_count(group_id: int, start_time: datetime, end_time: datetime, user_id: int=None):
     if start_time is None: start_time = datetime.fromtimestamp(0)

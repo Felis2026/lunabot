@@ -45,7 +45,7 @@ import yaml
 from urllib.parse import urlsplit
 from uuid import uuid4
 from dataclasses import dataclass, field, asdict
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 import asyncio
 import base64
 import aiohttp
@@ -101,6 +101,26 @@ class HttpError(Exception):
 
     def __str__(self):
         return f"{self.status_code}: {truncate(self.message, 512)}"
+
+
+def _is_retryable_image_download_error(exc: Exception) -> bool:
+    """Retry transient image failures, but not a permanently expired URL."""
+
+    if not isinstance(exc, HttpError):
+        return True
+    return exc.status_code in {408, 409, 425, 429} or exc.status_code >= 500
+
+
+def _safe_image_url_for_log(image_url: str) -> str:
+    """Keep temporary query credentials out of image download logs."""
+
+    try:
+        parsed = urlsplit(str(image_url))
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except Exception:
+        pass
+    return "[invalid-image-url]"
 
 def get_exc_desc(e: Exception) -> str:
     et = f"{type(e).__name__}" if type(e).__name__ not in ['Exception', 'AssertionError', 'ReplyException'] else ''
@@ -1159,7 +1179,12 @@ def plt_fig_to_image(fig, transparent=True, tight=False) -> Image.Image:
     img.load()
     return img
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), reraise=True)
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(1),
+    retry=retry_if_exception(_is_retryable_image_download_error),
+    reraise=True,
+)
 async def download_image(image_url, force_http=False) -> Image.Image:
     """
     下载图片并返回PIL.Image对象
@@ -1168,8 +1193,9 @@ async def download_image(image_url, force_http=False) -> Image.Image:
         image_url = image_url.replace("https", "http")
     async with get_client_session().get(image_url, verify_ssl=False) as resp:
         if resp.status != 200:
-            utils_logger.error(f"下载图片 {image_url} 失败: {resp.status} {resp.reason}")
-            raise HttpError(resp.status, f"下载图片 {image_url} 失败")
+            safe_url = _safe_image_url_for_log(image_url)
+            utils_logger.error(f"下载图片 {safe_url} 失败: {resp.status} {resp.reason}")
+            raise HttpError(resp.status, f"下载图片失败: HTTP {resp.status}")
         image = await resp.read()
         return Image.open(io.BytesIO(image))
 

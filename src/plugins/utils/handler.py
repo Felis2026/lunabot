@@ -523,12 +523,20 @@ def process_msg_segs(msg: list[dict] | Message, event: MessageEvent | None = Non
             # 为图片消息添加file_unique字段
             if not 'file_unique' in sdata:
                 url: str = sdata.get('url', '')
-                start_idx = url.find('fileid=') + len('fileid=')
-                if start_idx == -1: continue
-                end_idx = url.find('&', start_idx)
-                if end_idx == -1: end_idx = len(url)
-                file_unique = url[start_idx:end_idx]
-                sdata['file_unique'] = file_unique 
+                fileid_marker = 'fileid='
+                marker_idx = url.find(fileid_marker)
+                if marker_idx >= 0:
+                    start_idx = marker_idx + len(fileid_marker)
+                    end_idx = url.find('&', start_idx)
+                    if end_idx == -1:
+                        end_idx = len(url)
+                    file_unique = url[start_idx:end_idx]
+                else:
+                    # Some OneBot implementations omit fileid but still
+                    # provide a stable `file` value; use it before the URL.
+                    file_unique = sdata.get('file') or url
+                if file_unique:
+                    sdata['file_unique'] = file_unique
         elif stype == 'mface':
             # mface转换为图片
             if 'url' in sdata:

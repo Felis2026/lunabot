@@ -1,6 +1,15 @@
 from .utils import *
 from .memory import *
+import asyncio
+import base64
+import hashlib
+import json
+import os
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
 
 
 def debug_mode() -> bool:
@@ -17,6 +26,157 @@ class Message:
     group_id: int
     nickname: str
     msg: list[dict]
+
+
+# ================================ 图片原始内容缓存 ================================ #
+
+DEFAULT_IMAGE_CACHE_ROOT = Path("data/chat/autochat/image_cache")
+DEFAULT_MIME_TYPE = "image/jpeg"
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+# The cache is disposable. Keep a bounded local footprint even in image-heavy
+# groups; caption text remains the durable cache once summarization succeeds.
+MAX_CACHE_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_CACHE_ENTRIES = 2000
+
+
+@dataclass(frozen=True)
+class CachedImage:
+    data: bytes
+    mime_type: str
+
+
+def normalize_mime_type(mime_type: str | None) -> str:
+    """Keep only image MIME types accepted by the multimodal request."""
+
+    mime_type = (mime_type or DEFAULT_MIME_TYPE).split(";", 1)[0].strip().lower()
+    return mime_type if mime_type.startswith("image/") else DEFAULT_MIME_TYPE
+
+
+def data_url_to_image(data_url: str, max_bytes: int = MAX_IMAGE_BYTES) -> CachedImage:
+    """Decode a base64 image data URL and enforce a bounded cache size."""
+
+    if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+        raise ValueError("图片刷新结果不是受支持的 data URL")
+    header, encoded = data_url.split(",", 1)
+    if ";base64" not in header.lower():
+        raise ValueError("图片刷新结果不是 base64 data URL")
+    mime_type = normalize_mime_type(header[5:].split(";", 1)[0])
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("图片刷新结果不是有效的 base64") from exc
+    if not data:
+        raise ValueError("图片刷新结果为空")
+    if len(data) > max_bytes:
+        raise ValueError(f"图片大小超过缓存上限 ({max_bytes} bytes)")
+    return CachedImage(data=data, mime_type=mime_type)
+
+
+def image_to_data_url(image: CachedImage) -> str:
+    """Convert cached bytes back to the format accepted by the LLM client."""
+
+    encoded = base64.b64encode(image.data).decode("ascii")
+    return f"data:{normalize_mime_type(image.mime_type)};base64,{encoded}"
+
+
+class ImageCache:
+    """Store image bytes under a safe digest rather than a user-controlled name."""
+
+    def __init__(self, root: Path | str = DEFAULT_IMAGE_CACHE_ROOT):
+        self.root = Path(root)
+
+    @staticmethod
+    def _digest(identity: str) -> str:
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _paths(self, identity: str) -> tuple[Path, Path]:
+        digest = self._digest(identity)
+        return self.root / f"{digest}.bin", self.root / f"{digest}.json"
+
+    def read(self, identity: str) -> Optional[CachedImage]:
+        """Read a complete cache entry, treating malformed entries as misses."""
+
+        if not identity:
+            return None
+        data_path, meta_path = self._paths(identity)
+        try:
+            if not data_path.is_file():
+                return None
+            if data_path.stat().st_size > MAX_IMAGE_BYTES:
+                return None
+            data = data_path.read_bytes()
+            if not data:
+                return None
+            mime_type = DEFAULT_MIME_TYPE
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                mime_type = normalize_mime_type(meta.get("mime_type"))
+            return CachedImage(data=data, mime_type=mime_type)
+        except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def write(self, identity: str, image: CachedImage) -> None:
+        """Atomically write bytes and metadata so interrupted writes stay misses."""
+
+        if not identity or not image.data or len(image.data) > MAX_IMAGE_BYTES:
+            return
+        data_path, meta_path = self._paths(identity)
+        self.root.mkdir(parents=True, exist_ok=True)
+        data_tmp = data_path.with_name(f"{data_path.name}.{uuid4().hex}.tmp")
+        meta_tmp = meta_path.with_name(f"{meta_path.name}.{uuid4().hex}.tmp")
+        try:
+            data_tmp.write_bytes(image.data)
+            meta_tmp.write_text(
+                json.dumps({"mime_type": normalize_mime_type(image.mime_type)}),
+                encoding="utf-8",
+            )
+            os.replace(data_tmp, data_path)
+            os.replace(meta_tmp, meta_path)
+            self._prune()
+        finally:
+            data_tmp.unlink(missing_ok=True)
+            meta_tmp.unlink(missing_ok=True)
+
+    # ================================ Cache retention ================================ #
+
+    def _prune(self) -> None:
+        """Evict oldest raw images after a successful cache write."""
+
+        try:
+            entries = []
+            total_bytes = 0
+            for data_path in self.root.glob("*.bin"):
+                try:
+                    stat = data_path.stat()
+                except OSError:
+                    continue
+                entries.append((stat.st_mtime, data_path, stat.st_size))
+                total_bytes += stat.st_size
+
+            entries.sort(key=lambda item: item[0])
+            while entries and (
+                len(entries) > MAX_CACHE_ENTRIES
+                or total_bytes > MAX_CACHE_TOTAL_BYTES
+            ):
+                _, data_path, size = entries.pop(0)
+                data_path.unlink(missing_ok=True)
+                data_path.with_suffix(".json").unlink(missing_ok=True)
+                total_bytes -= size
+        except OSError:
+            # A cache cleanup failure must never make image recognition fail.
+            return
+
+    async def read_async(self, identity: str) -> Optional[CachedImage]:
+        """Move filesystem reads off the Autochat event loop."""
+
+        return await asyncio.to_thread(self.read, identity)
+
+    async def write_data_url_async(self, identity: str, data_url: str) -> Optional[CachedImage]:
+        """Decode and cache a refreshed data URL without blocking the loop."""
+
+        image = await asyncio.to_thread(data_url_to_image, data_url)
+        await asyncio.to_thread(self.write, identity, image)
+        return image
 
 rpc_session = RpcSession(
     config.item('rpc.host'), 
@@ -44,6 +204,40 @@ async def rpc_get_group_history_msg(group_id: int, limit: int) -> list[Message]:
         nickname=msg['nickname'],
         msg=msg['msg'],
     ) for msg in msgs]
+
+
+async def rpc_get_group_msg_by_id(group_id: int, msg_id: int) -> Optional[Message]:
+    """读取被引用消息，保证目标不在最近消息窗口时仍可识图。"""
+
+    msg = await rpc_session.call('get_group_msg_by_id', group_id, msg_id)
+    if not msg:
+        return None
+    return Message(
+        msg_id=msg['msg_id'],
+        time=datetime.fromtimestamp(msg['time']),
+        user_id=msg['user_id'],
+        group_id=group_id,
+        nickname=msg['nickname'],
+        msg=msg['msg'],
+    )
+
+
+async def rpc_get_group_msg_image(
+    group_id: int,
+    msg_id: int,
+    file_unique: str = "",
+    file_ref: str = "",
+) -> Optional[dict]:
+    """Ask the host bot for fresh image bytes instead of reusing a stale URL."""
+
+    return await rpc_session.call(
+        'get_group_msg_image',
+        group_id,
+        msg_id,
+        file_unique,
+        file_ref,
+        timeout=config.get('image_caption.refresh_timeout', 20),
+    )
 
 async def rpc_get_new_msgs():
     msgs = await rpc_session.call('get_new_msgs')
@@ -102,16 +296,102 @@ def get_group_memory_system(group_id: int) -> MemorySystem:
 
 
 image_caption_db = get_file_db("data/chat/autochat/image_captions.json")
+image_cache = ImageCache()
 
-async def get_image_caption(data: dict, use_llm: bool) -> str:
+
+def _image_identity(data: dict) -> str:
+    """Return the stable cache key available in an image segment."""
+
+    return str(data.get("file_unique") or data.get("url") or "")
+
+
+def _image_identity_for_log(identity: str) -> str:
+    """Avoid putting a temporary URL query string into service logs."""
+
+    return "[temporary-url]" if identity.startswith("http") else identity
+
+
+def _looks_like_expired_image_error(exc: Exception) -> bool:
+    """Recognize download failures without treating every model error as expiry."""
+
+    desc = get_exc_desc(exc).lower()
+    return (
+        "图片下载失败" in desc
+        or "bad request" in desc
+        or "http 400" in desc
+        or "http 401" in desc
+        or "http 403" in desc
+        or "http 404" in desc
+    )
+
+
+async def _resolve_image_input(
+    data: dict,
+    source_msg: Optional[Message],
+) -> Optional[str]:
+    """Resolve image input in cache -> fresh bot data -> legacy URL order."""
+
+    identity = _image_identity(data)
+    if identity:
+        cached = await image_cache.read_async(identity)
+        if cached:
+            info(f"图片原始内容命中缓存: file_unique={_image_identity_for_log(identity)}")
+            return image_to_data_url(cached)
+
+    if source_msg is not None:
+        try:
+            refreshed = await rpc_get_group_msg_image(
+                source_msg.group_id,
+                source_msg.msg_id,
+                data.get("file_unique", ""),
+                data.get("file", ""),
+            )
+            refreshed_data = refreshed.get("data") if refreshed else None
+            if refreshed_data:
+                refreshed_identity = str(
+                    (refreshed or {}).get("file_unique") or identity
+                )
+                cached = await image_cache.write_data_url_async(
+                    identity or refreshed_identity,
+                    refreshed_data,
+                )
+                if identity and refreshed_identity != identity:
+                    await image_cache.write_data_url_async(
+                        refreshed_identity,
+                        refreshed_data,
+                    )
+                info(f"图片已通过 OneBot 刷新并缓存: msg_id={source_msg.msg_id}")
+                return image_to_data_url(cached)
+        except Exception as exc:
+            warning(
+                f"刷新图片失败: msg_id={source_msg.msg_id} "
+                f"file_unique={_image_identity_for_log(identity)}: {get_exc_desc(exc)}"
+            )
+
+    # A historical database row may still contain a usable URL.  It is the
+    # last network fallback, never the first choice for a known message.
+    url = data.get("url")
+    if isinstance(url, str) and url:
+        return url
+    return None
+
+
+async def get_image_caption(
+    data: dict,
+    use_llm: bool,
+    source_msg: Optional[Message] = None,
+) -> str:
     summary = data.get("summary", '')
-    url = data.get("url", None)
     file_unique = data.get("file_unique", '')
-    sub_type = data.get("sub_type", 0)
+    sub_type = data.get("sub_type", data.get("subType", 0))
     sub_type = "图片" if sub_type == 0 else "表情"
     fallback_caption = f"[{sub_type}]" if not summary else f"[{sub_type}:{summary}]"
+    unavailable_caption = f"[{sub_type}已失效，无法重新读取]"
 
-    info(f"尝试获取图片总结: file_unique={file_unique} subtype={sub_type} url={url} summary={summary}")
+    info(
+        f"尝试获取图片总结: file_unique={_image_identity_for_log(str(file_unique))} "
+        f"subtype={sub_type} has_url={bool(data.get('url'))} summary={summary}"
+    )
     if file_unique:
         cache = image_caption_db.get(file_unique)
         if cache:
@@ -121,10 +401,13 @@ async def get_image_caption(data: dict, use_llm: bool) -> str:
     try:
         if not use_llm:
             return fallback_caption
+        image_input = await _resolve_image_input(data, source_msg)
+        if not image_input:
+            return unavailable_caption
         caption = await rpc_query_llm(
             model=config.get('image_caption.model'),
             prompt=config.get('image_caption.prompt').format(sub_type=sub_type),
-            images=[url],
+            images=[image_input],
             options={ 
                 'timeout': config.get('image_caption.timeout'),
                 'max_tokens': config.get('image_caption.max_tokens'),
@@ -138,7 +421,13 @@ async def get_image_caption(data: dict, use_llm: bool) -> str:
         return f"[{sub_type}:{caption}]"
     
     except Exception as e:
-        warning(f"总结图片 url={url} 失败: {get_exc_desc(e)}")
+        warning(
+            f"总结图片失败: file_unique={_image_identity_for_log(str(file_unique))} "
+            f"source_msg_id={source_msg.msg_id if source_msg else None}: "
+            f"{get_exc_desc(e)}"
+        )
+        if _looks_like_expired_image_error(e):
+            return unavailable_caption
         return fallback_caption
         
 def json_msg_to_readable_text(data: dict):
@@ -160,6 +449,7 @@ async def format_msgs(
     image_caption_prob: float,
     emotion_caption_limit: int,
     emotion_caption_prob: float,
+    forced_image_identity: str = "",
 ) -> str:
     msgs = sorted(msgs, key=lambda m: m.time, reverse=True)
     texts = []
@@ -189,16 +479,30 @@ async def format_msgs(
                 case "json":
                     text += json_msg_to_readable_text(sdata)
                 case "image":
-                    if sdata.get("sub_type", 0) == 0:
+                    image_identity = get_image_identity(sdata)
+                    is_forced = bool(forced_image_identity) and image_identity == forced_image_identity
+                    if sdata.get("sub_type", sdata.get("subType", 0)) == 0:
+                        use_llm = is_forced or (
+                            not forced_image_identity
+                            and captioned_images < image_caption_limit
+                            and random.random() < image_caption_prob
+                        )
                         text += await get_image_caption(
                             sdata,
-                            captioned_images < image_caption_limit and random.random() < image_caption_prob,
+                            use_llm,
+                            source_msg=msg,
                         )
                         captioned_images += 1
                     else:
+                        use_llm = is_forced or (
+                            not forced_image_identity
+                            and captioned_emotions < emotion_caption_limit
+                            and random.random() < emotion_caption_prob
+                        )
                         text += await get_image_caption(
                             sdata,
-                            captioned_emotions < emotion_caption_limit and random.random() < emotion_caption_prob,
+                            use_llm,
+                            source_msg=msg,
                         )
                         captioned_emotions += 1
         texts.append(text.strip())
@@ -210,6 +514,76 @@ def get_plain_text(msg: Message) -> str:
         if seg['type'] == 'text':
             ret += seg['data']['text']
     return ret.strip()
+
+
+# ================================ 定向图片识别 ================================ #
+
+IMAGE_QUERY_PATTERN = re.compile(
+    r"(?:图|图片|照片|截图|表情).{0,8}(?:什么|啥|内容|写了|写的|是谁|哪(?:里|个)|看(?:看|清)|识别|描述)"
+    r"|(?:什么|啥|内容|写了|写的|是谁|看(?:看|清)|识别|描述).{0,8}(?:图|图片|照片|截图|表情)"
+    r"|(?:这|这个|上面)(?:是|有|写着?|画着?)(?:什么|啥|谁)"
+)
+
+
+def get_image_identity(data: dict) -> str:
+    """返回图片稳定标识，优先使用 OneBot 提供的文件唯一值。"""
+
+    return str(data.get("file_unique") or data.get("url") or "")
+
+
+def is_explicit_image_query(msg: Message, self_id: int) -> bool:
+    """仅将明确 @ 当前 Bot 的看图请求升级为必答识图。"""
+
+    is_at_self = any(
+        seg.get("type") == "at" and str(seg.get("data", {}).get("qq")) == str(self_id)
+        for seg in msg.msg
+    )
+    return is_at_self and bool(IMAGE_QUERY_PATTERN.search(get_plain_text(msg)))
+
+
+def get_reply_message_id(msg: Message) -> Optional[int]:
+    for seg in msg.msg:
+        if seg.get("type") == "reply":
+            try:
+                return int(seg.get("data", {}).get("id"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def find_latest_image(msgs: list[Message]) -> tuple[Optional[Message], str]:
+    """从最新消息开始选择第一张可识别图片。"""
+
+    for candidate in sorted(msgs, key=lambda item: item.time, reverse=True):
+        for seg in candidate.msg:
+            if seg.get("type") != "image":
+                continue
+            identity = get_image_identity(seg.get("data", {}))
+            if identity:
+                return candidate, identity
+    return None, ""
+
+
+async def resolve_forced_image(
+    trigger_msg: Message,
+    recent_msgs: list[Message],
+) -> tuple[Optional[Message], str]:
+    """优先解析引用图片；无引用图片时回退到最近一张图。"""
+
+    reply_id = get_reply_message_id(trigger_msg)
+    if reply_id is not None:
+        replied_msg = next((item for item in recent_msgs if item.msg_id == reply_id), None)
+        if replied_msg is None:
+            replied_msg = await rpc_get_group_msg_by_id(trigger_msg.group_id, reply_id)
+        if replied_msg is not None:
+            target, identity = find_latest_image([replied_msg])
+            if identity:
+                return target, identity
+    candidates = [item for item in recent_msgs if item.msg_id != trigger_msg.msg_id]
+    trigger_target, trigger_identity = find_latest_image([trigger_msg])
+    if trigger_identity:
+        return trigger_target, trigger_identity
+    return find_latest_image(candidates)
 
 
 async def generate_summary(text: str) -> str:
@@ -241,6 +615,7 @@ async def chat(msg: Message):
         _self_infos[msg.group_id] = await rpc_get_self_info(msg.group_id)
     self_id = int(_self_infos[msg.group_id]['self_id'])
     self_name = _self_infos[msg.group_id]['nickname']
+    explicit_image_query = is_explicit_image_query(msg, self_id)
 
     if msg.user_id == self_id:  # 自己发的消息不触发
         return
@@ -287,7 +662,7 @@ async def chat(msg: Message):
         status.save()
 
         reply_rate = min(max(status.willingness, 0.0), 1.0)
-        if random.random() > reply_rate:
+        if not explicit_image_query and random.random() > reply_rate:
             info(f"意愿值: {last_willingness:.4f} -> {status.willingness:.4f}")
             return
         
@@ -311,12 +686,23 @@ async def chat(msg: Message):
             recent_msgs.append(msg)
         info(f"获取最近共 {len(recent_msgs)} 条有效聊天记录")
 
+        forced_image_identity = ""
+        if explicit_image_query:
+            forced_msg, forced_image_identity = await resolve_forced_image(msg, recent_msgs)
+            if forced_msg and not any(item.msg_id == forced_msg.msg_id for item in recent_msgs):
+                recent_msgs.append(forced_msg)
+            if forced_image_identity:
+                info(f"明确问图命中目标消息: {forced_msg.msg_id}")
+            else:
+                info("明确问图但最近记录中没有可识别图片")
+
         recent_text = await format_msgs(
             recent_msgs,
             image_caption_limit=config.get('image_caption.image_limit'),
             image_caption_prob=config.get('image_caption.image_prob'),
             emotion_caption_limit=config.get('image_caption.emotion_limit'),
             emotion_caption_prob=config.get('image_caption.emotion_prob'),
+            forced_image_identity=forced_image_identity,
         )
         recent_summary = await generate_summary(recent_text)
         if recent_summary == "":

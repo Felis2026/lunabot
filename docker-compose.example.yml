@@ -17,6 +17,8 @@
       - ./:/app
       # 2) 挂载字体目录，避免图片渲染出现方块字
       - ./fonts:/root/.fonts
+      # 3) 可选：需要刷新历史 QQ 图片时，取消下一行注释并按实际目录调整
+      # - ./napcat/qq:/app/.config/QQ:ro
     environment:
       - TZ=Asia/Shanghai
       # Preview 与正式组卡使用不同进程和数据目录，但共同运行在本容器中。
