@@ -1834,9 +1834,13 @@ def add_omakase_music(music_metas: list[dict]) -> list[dict]:
     return music_metas
 
 # 获取deck的hash
-def get_deck_hash(deck: RecommendDeck) -> str:
-    deck_hash = str(deck.score) + str(deck.total_power) + str(deck.cards[0].card_id)
-    return deck_hash
+def get_deck_hash(deck: RecommendDeck, preserve_order: bool = False) -> tuple:
+    """按实际卡组识别候选；指定技能顺序时保留所有卡位。"""
+    card_ids = tuple(card.card_id for card in deck.cards)
+    if preserve_order:
+        return card_ids
+    # 同分同综合力不代表同一队；平均等模式仅合并队长相同的等价排列。
+    return (card_ids[0], tuple(sorted(card_ids[1:])))
 
 # 打印组卡配置
 def log_options(ctx: SekaiHandlerContext, user_id: int, options: DeckRecommendOptions):
@@ -1969,6 +1973,8 @@ async def do_deck_recommend_batch(
     
     ret = []
     for index in range(len(options_list)):
+        options = options_list[index]
+        preserve_order = options.skill_order_choose_strategy == "specific"
         results = result_dict[index]
         # 结果排序去重
         decks: List[RecommendDeck] = []
@@ -1981,12 +1987,12 @@ async def do_deck_recommend_batch(
             result = DeckRecommendResult.from_dict(resp['result'])
             cost_and_wait_times[alg] = (cost_time, wait_time)
             for deck in result.decks:
-                deck_hash = get_deck_hash(deck)
+                deck_hash = get_deck_hash(deck, preserve_order)
                 if deck_hash not in deck_src_alg:
-                    deck_src_alg[deck_hash] = alg
+                    deck_src_alg[deck_hash] = [alg]
                     decks.append(deck)
-                else:
-                    deck_src_alg[deck_hash] += "+" + alg
+                elif alg not in deck_src_alg[deck_hash]:
+                    deck_src_alg[deck_hash].append(alg)
         def key_func(deck: RecommendDeck):
             if options.live_type == "mysekai":
                 return (deck.mysekai_event_point, deck.total_power)
@@ -2000,7 +2006,7 @@ async def do_deck_recommend_batch(
                 return (-deck.event_bonus_rate, deck.score)
         limit = options.limit if options.target != "bonus" else options.limit * len(options.target_bonus_list)
         decks = sorted(decks, key=key_func, reverse=True)[:limit]
-        src_algs = [deck_src_alg[get_deck_hash(deck)] for deck in decks]
+        src_algs = ["+".join(deck_src_alg[get_deck_hash(deck, preserve_order)]) for deck in decks]
         res = DeckRecommendResult()
         # 加成组卡的队伍按照加成排序
         if options.target == "bonus":
