@@ -312,10 +312,11 @@ def extract_event_type(text: str, default: str = None) -> Tuple[str, str]:
 
 # 获取所有箱活id集合（往期通过书下曲判断，当期书下可能还没上线通过活动加成判断）
 async def get_ban_events_id_set(ctx: SekaiHandlerContext) -> set[int]:
+    events = await ctx.md.events.get_sorted('startAt')
     # 获取已有书下的活动
     ret = set((await ctx.md.event_musics.get_indexed('eventId')).keys())
     # 查找书下未上线的活动进行判断
-    for event in reversed(await ctx.md.events.get_sorted('startAt')):
+    for event in reversed(events):
         event_id = event['id']
         if datetime.fromtimestamp(event['aggregateAt'] / 1000 + 1) < datetime.now():
             break    # 已结束的活动书下肯定已经上线，不重复判断
@@ -332,7 +333,8 @@ async def get_ban_events_id_set(ctx: SekaiHandlerContext) -> set[int]:
             ret.add(event_id)
     # 特判sdl3
     ret.add(74)
-    return ret
+    # 书下曲可能先于活动发布，只保留当前活动表中真实存在的箱活。
+    return ret & {event['id'] for event in events}
 
 # 判断是否是箱活
 async def is_ban_event(ctx: SekaiHandlerContext, event: dict) -> bool:
