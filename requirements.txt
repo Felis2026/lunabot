@@ -63,6 +63,7 @@ click
 colorama
 coloredlogs
 emoji
+fastembed>=0.3,<1.0
 google-genai
 html2text
 loguru
@@ -85,6 +86,7 @@ onnxruntime
 pjsekai.scores
 pydantic>=2.12,<3
 Pillow>=12.2.0
+rapidocr>=3.0,<4.0
 playwright>=1.49,<2
 pycryptodome
 pyyaml
