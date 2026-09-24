@@ -145,6 +145,18 @@ CURRENT_DECK_KEYWORDS = ('当前', '目前')
 
 MUSIC_COMPARE_KEYWORDS = ('歌曲比较', '歌曲排行', '歌曲排名', '歌曲推荐',)
 WAR_PREPARE_KEYWORDS = ('战备', '备战')
+
+# ================================ 活动组卡快捷别名 ================================ #
+# 快捷别名只提供默认模式，后续参数仍统一交给活动组卡解析器处理，
+# 因此可以继续组合活动 ID、歌曲、火耗、目标 PT 和预览等参数。
+EVENT_DECK_ALIAS_MODES = {
+    '/备战组卡': '备战',
+    '/活动备战': '备战',
+    '/活动规划': '备战',
+    '/预览组卡': '预览',
+    '/活动预览': '预览',
+}
+
 MUSIC_COMPARE_DEFAULT_MUSIC_NUM = 8
 MUSIC_COMPARE_CANDIDATE_MUSIC_NUM = 40
 MUSCI_COMPARE_MAX_MUSIC_NUM = 5
@@ -1518,6 +1530,18 @@ def extract_addtional_options(args: str) -> Tuple[dict, str]:
 # 从args中提取活动组卡参数
 async def extract_event_options(ctx: SekaiHandlerContext, args: str) -> Dict:
     args = ctx.get_args().strip().lower()
+
+    alias_mode = EVENT_DECK_ALIAS_MODES.get(
+        str(ctx.trigger_cmd or '').strip().lower()
+    )
+    if alias_mode == '预览':
+        has_preview_keyword = re.search(r'(?i)(?:预览|预演|preview)', args)
+        if not has_preview_keyword:
+            args = f'预览 {args}'.strip()
+    elif alias_mode == '备战':
+        if not any(keyword in args for keyword in WAR_PREPARE_KEYWORDS):
+            args = f'备战 {args}'.strip()
+
     options = DeckRecommendOptions()
 
     preview_requested, args = extract_preview_keyword(args)
@@ -3320,6 +3344,8 @@ pjsk_event_deck = SekaiCmdHandler([
     "/组卡", "/组队", "/配队", 
     "/指定属性组卡", "/指定属性组队", "/指定属性卡组", "/指定属性配队",
     "/模拟组卡", "/模拟配队", "/模拟组队", "/模拟卡组",
+    "/备战组卡", "/活动备战", "/活动规划",
+    "/预览组卡", "/活动预览",
 ])
 pjsk_event_deck.check_cdrate(cd).check_wblist(gbl)
 @pjsk_event_deck.handle()
