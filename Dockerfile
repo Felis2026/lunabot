@@ -62,10 +62,10 @@ RUN python -m pip install \
     -r requirements.txt
 
 # ================================ Haruki原生组卡 ================================ #
-# 固定到已验证的 Haruki 提交，避免重新构建时因上游 master 漂移
-# 得到未经验证的规则；仍可通过 build arg 显式指定其他提交。
+# 固定到明确的 Haruki 提交，避免重新构建时因上游 master 漂移。
+# 需要试用其他提交时，可通过 build arg 显式指定。
 ARG DECKREC_NATIVE_REPOSITORY=https://github.com/Team-Haruki/sekai-deck-recommend-cpp.git
-ARG DECKREC_NATIVE_REF=46c3d60d7b712bcf382af9acfa71180571b95490
+ARG DECKREC_NATIVE_REF=4dd670f53260fe33dddb558e22e98337598a65d8
 RUN set -eux; \
     mkdir -p /tmp/deckrec-native/source \
         "${DECKREC_NATIVE_METADATA_DIR}" \
