@@ -16,9 +16,13 @@ class FDAForecaster:
         
     def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         data = df.copy()
-        data['date'] = pd.to_datetime(data['timestamp'])
+        # CSV 保存 Unix 秒；当前 CN 预测按北京时间提取星期和小时，不依赖宿主机时区。
+        data['date'] = pd.to_datetime(data['timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
         data = data.sort_values('from_start_hour')
         data = data.drop_duplicates(subset=['from_start_hour'], keep='last')
+
+        # 首条采样可能晚于开场，必须在重采样前用已过时长反推真实起点。
+        event_start = data['date'].iloc[0] - pd.Timedelta(hours=data['from_start_hour'].iloc[0])
         
         # 重采样到1小时粒度
         data.index = pd.to_timedelta(data['from_start_hour'], unit='h')
@@ -39,7 +43,7 @@ class FDAForecaster:
             resampled['to_end_hour'] = total_duration - resampled['from_start_hour']
         
         # 补充时间特征
-        start_date = resampled['date'].iloc[0]
+        start_date = event_start
         if pd.notna(start_date):
             resampled['date'] = [start_date + pd.Timedelta(hours=h) for h in resampled['from_start_hour']]
             
