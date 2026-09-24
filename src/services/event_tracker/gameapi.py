@@ -1,7 +1,7 @@
 import os
 
 from .utils import *
-from aiohttp import ClientSession, ClientConnectionError, ClientTimeout
+from aiohttp import ClientSession, ClientConnectionError, ClientResponseError, ClientTimeout
 
 REQUEST_TIMEOUT = 5.0
 
@@ -74,7 +74,11 @@ async def request_gameapi(url: str, method: str = 'GET', data_type: str | None =
                 # 统一摘要化上游错误体，避免 HTML 拦截页把日志打成超长单行。
                 detail = summarize_http_error_detail(detail, resp.content_type)
                 error(f"请求游戏API后端 {url} 失败: {resp.status} {detail}")
-                raise Exception(f"请求游戏API后端失败: {resp.status} {detail}")
+                # 保留状态码，交由调用方判断是否重试；认证和地址错误不应反复请求。
+                raise ClientResponseError(
+                    resp.request_info, resp.history,
+                    status=resp.status, message=detail, headers=resp.headers,
+                )
             
             if data_type is None:
                 return resp
@@ -92,6 +96,6 @@ async def request_gameapi(url: str, method: str = 'GET', data_type: str | None =
                 raise Exception(f"不支持的数据类型: {data_type}")
                 
     except ClientConnectionError as e:
-        raise Exception(f"连接游戏API后端失败")
+        raise ClientConnectionError("连接游戏API后端失败") from e
 
 

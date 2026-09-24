@@ -14,7 +14,8 @@ from .final_cutoff import (
     get_expected_final_cutoff_ranks,
     get_final_cutoff_sample_slot,
 )
-from tenacity import retry, wait_fixed, stop_after_attempt
+from aiohttp import ClientConnectionError, ClientResponseError
+from tenacity import retry, retry_if_exception, wait_fixed, stop_after_attempt
 
 
 set_log_level('INFO')
@@ -198,6 +199,15 @@ def check_region_need_high_res(region: str) -> bool:
 
 # ================================ 榜线更新 ================================ #
 
+def is_retryable_ranking_error(exc: BaseException) -> bool:
+    """只重试临时网络故障和可恢复 HTTP 状态，不重试格式或权限错误。"""
+    if isinstance(exc, (ClientConnectionError, asyncio.TimeoutError)):
+        return True
+    return isinstance(exc, ClientResponseError) and (
+        exc.status in (408, 429) or 500 <= exc.status < 600
+    )
+
+
 class EventTracker:
     def __init__(self, region: str):
         self.region = region
@@ -216,7 +226,15 @@ class EventTracker:
         debug(f"[{self.region.upper()}]", *args, **kwargs)
 
 
-    @retry(wait=wait_fixed(3), stop=stop_after_attempt(3), reraise=True)
+    @retry(
+        retry=retry_if_exception(is_retryable_ranking_error),
+        wait=wait_fixed(3), stop=stop_after_attempt(3), reraise=True,
+    )
+    async def request_ranking_endpoint(self, url: str) -> dict:
+        """单个接口最多请求三次（含首次），成功立即返回，不重取已成功的另一接口。"""
+        return await request_gameapi(url)
+
+
     async def request_rankings(self, eid: int, url: str) -> tuple[dict, float]:
         """
         请求榜线数据，返回 (数据，耗时)
@@ -229,8 +247,8 @@ class EventTracker:
         if split_urls:
             top100_url, border_url = split_urls
             try:
-                top100_data = await request_gameapi(top100_url)
-                border_data = await request_gameapi(border_url)
+                top100_data = await self.request_ranking_endpoint(top100_url)
+                border_data = await self.request_ranking_endpoint(border_url)
                 data = {
                     'top100': top100_data,
                     'border': border_data,
@@ -242,7 +260,7 @@ class EventTracker:
 
         # 兼容旧接口：直接返回 top100 + border
         try:
-            data = await request_gameapi(formatted_url)
+            data = await self.request_ranking_endpoint(formatted_url)
             if isinstance(data, dict) and data.get('top100') and data.get('border'):
                 return (data, datetime.now().timestamp() - t)
             self.error(f"请求榜线数据失败: 非法返回结构 {formatted_url}")
@@ -509,6 +527,12 @@ class EventTracker:
                 else:
                     next_highres_record_time = datetime.max
                 next_time = min(next_record_time, next_highres_record_time)
+
+                # 慢请求或重试跨过下个采集点时等待完整间隔，不连续补发过期轮次。
+                # 每区在同一协程中串行 await，不启动遗留的后台重试任务。
+                if next_time <= now:
+                    interval_cfg = HIGH_RES_RECORD_INTERVAL_CFG if need_high_res else RECORD_INTERVAL_CFG
+                    next_time = now + timedelta(seconds=get_cfg_or_value(interval_cfg))
 
                 log_msg = f"完成{'高精度' if is_high_res else ''}更新"
                 log_msg += f" | {(now - start).total_seconds():.2f}s | next: {next_time.strftime('%H:%M:%S')} | req: {result['request_time']:.2f}s"
