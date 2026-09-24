@@ -1807,7 +1807,10 @@ _deckrec_request_id = 0
 
 # 添加OMAKASE音乐
 def add_omakase_music(music_metas: list[dict]) -> list[dict]:
-    if find_by(music_metas, "id", OMAKASE_MUSIC_ID) is None:
+    """从真实谱面重算一首六难度虚拟曲，返回新列表，不污染共享 MusicMeta。"""
+    # 排除旧虚拟曲，避免重复追加及把历史平均值再次计入平均。
+    music_metas = [item for item in music_metas if item['music_id'] != OMAKASE_MUSIC_ID]
+    if any(item['difficulty'] in OMAKASE_MUSIC_DIFFS for item in music_metas):
         omakase = {
             "music_id": OMAKASE_MUSIC_ID,
             "difficulty": None,
