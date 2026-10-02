@@ -19,6 +19,7 @@ HELP_BASIC_SERVICES = [
 HELP_GROUP_SERVICES = [
     "sekai",
     "gallery-tag",
+    "group_rename",
     "nekochat",
     "rollpig",
     "msxray",
@@ -35,6 +36,7 @@ HELP_GROUP_SERVICES = [
 ]
 
 HELP_ADMIN_TOGGLE_SERVICES = {
+    "group_rename",
     "cron",
     "gallery-tag",
     "imgexp",
@@ -68,6 +70,7 @@ DEFAULT_HELP_SERVICE_ROUTES = {
     "alive": "/features/alive",
     "sekai": "/features",
     "gallery-tag": "/features/gallery-tag",
+    "group_rename": "/features/group-rename",
     "nekochat": "/features/nekochat",
     "rollpig": "/features/rollpig",
     "msxray": "/features/msxray",

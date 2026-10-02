@@ -181,6 +181,7 @@ HELP_STATUS_REGISTRY: dict[str, Resolver] = {
     "cron": single_toggle("cron"),
     "gallery": single_toggle("gallery"),
     "gallery-tag": single_toggle("gallery_tag"),
+    "group_rename": single_toggle("group_rename"),
     "imgexp": single_toggle("imgexp"),
     "imgtool": single_toggle("imgtool"),
     "math": single_toggle("math"),

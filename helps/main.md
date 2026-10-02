@@ -12,6 +12,7 @@
 - [状态检测服务 (alive)](./alive.md)
 - [定时任务服务 (cron)](./cron.md)
 - [标签图库服务 (gallery-tag)](./gallery-tag.md)
+- [改群名服务 (group_rename)](./group_rename.md)
 - [搜图服务 (imgexp)](./imgexp.md)
 - [图片处理服务 (imgtool)](./imgtool.md)
 - [数学计算服务 (math)](./math.md)
