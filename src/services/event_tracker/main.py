@@ -41,6 +41,13 @@ latest_rankings_cache: dict[str, dict[int, dict[int, Ranking]]] = {}
 
 # ================================ 处理逻辑 ================================ #
 
+def get_region_record_interval_seconds(interval_cfg, region: str) -> int:
+    """读取采集间隔，兼容原有统一秒数及按区服指定的秒数。"""
+    interval = get_cfg_or_value(interval_cfg)
+    if isinstance(interval, dict):
+        interval = interval[region]
+    return int(interval)
+
 @dataclass(frozen=True)
 class RankingUpdatePlan:
     """一次榜单更新计划；结榜确认轮次必须强制使用完整榜线响应。"""
@@ -513,6 +520,11 @@ class EventTracker:
                     await asyncio.sleep(0.5)
 
                 need_high_res = check_region_need_high_res(self.region)
+                record_interval = get_region_record_interval_seconds(RECORD_INTERVAL_CFG, self.region)
+                high_res_interval = (
+                    get_region_record_interval_seconds(HIGH_RES_RECORD_INTERVAL_CFG, self.region)
+                    if need_high_res else None
+                )
 
                 start = datetime.now()
                 is_high_res = need_high_res and datetime.now() < next_record_time
@@ -521,9 +533,9 @@ class EventTracker:
 
                 now = datetime.now()
                 if not is_high_res:
-                    next_record_time = start + timedelta(seconds=get_cfg_or_value(RECORD_INTERVAL_CFG))
+                    next_record_time = start + timedelta(seconds=record_interval)
                 if need_high_res:
-                    next_highres_record_time = start + timedelta(seconds=get_cfg_or_value(HIGH_RES_RECORD_INTERVAL_CFG))
+                    next_highres_record_time = start + timedelta(seconds=high_res_interval)
                 else:
                     next_highres_record_time = datetime.max
                 next_time = min(next_record_time, next_highres_record_time)
@@ -531,8 +543,7 @@ class EventTracker:
                 # 慢请求或重试跨过下个采集点时等待完整间隔，不连续补发过期轮次。
                 # 每区在同一协程中串行 await，不启动遗留的后台重试任务。
                 if next_time <= now:
-                    interval_cfg = HIGH_RES_RECORD_INTERVAL_CFG if need_high_res else RECORD_INTERVAL_CFG
-                    next_time = now + timedelta(seconds=get_cfg_or_value(interval_cfg))
+                    next_time = now + timedelta(seconds=high_res_interval if need_high_res else record_interval)
 
                 log_msg = f"完成{'高精度' if is_high_res else ''}更新"
                 log_msg += f" | {(now - start).total_seconds():.2f}s | next: {next_time.strftime('%H:%M:%S')} | req: {result['request_time']:.2f}s"
