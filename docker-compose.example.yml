@@ -9,7 +9,7 @@
         # 默认使用官方镜像；网络受限时可在 .env 换成可信镜像代理。
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.13-bookworm}
         # 默认固定到当前选定的 Haruki 版本；需要升级时可指定其他 commit。
-        DECKREC_NATIVE_REF: ${DECKREC_NATIVE_REF:-4dd670f53260fe33dddb558e22e98337598a65d8}
+        DECKREC_NATIVE_REF: ${DECKREC_NATIVE_REF:-2bccf4656799031ea940bca7c745d447ed61d2a4}
     container_name: lunabot_container
     restart: always
     volumes:

@@ -65,7 +65,7 @@ RUN python -m pip install \
 # 固定到明确的 Haruki 提交，避免重新构建时因上游 master 漂移。
 # 需要试用其他提交时，可通过 build arg 显式指定。
 ARG DECKREC_NATIVE_REPOSITORY=https://github.com/Team-Haruki/sekai-deck-recommend-cpp.git
-ARG DECKREC_NATIVE_REF=4dd670f53260fe33dddb558e22e98337598a65d8
+ARG DECKREC_NATIVE_REF=2bccf4656799031ea940bca7c745d447ed61d2a4
 RUN set -eux; \
     mkdir -p /tmp/deckrec-native/source \
         "${DECKREC_NATIVE_METADATA_DIR}" \

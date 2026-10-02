@@ -1,4 +1,6 @@
 from ...utils import *
+import hashlib
+import json
 from ...llm import translate_text
 from ..common import *
 from ..handler import *
@@ -85,14 +87,6 @@ sekai8823_friendcode_data = WebJsonRes(
     "https://pjsk-static.8823.eu.org/api/fixtures/", 
     update_interval=timedelta(hours=3),
 )
-
-UNIT_GATEID_MAP = {
-    "light_sound": 1,
-    "idol": 2,
-    "street": 3,
-    "theme_park": 4,
-    "school_refusal": 5,
-}
 
 SITE_ID_ORDER = (
     5, 7, 6, 8,
@@ -1034,12 +1028,16 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
             with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_padding(16).set_bg(roundrect_bg()):
                 # 到访角色列表
                 with HSplit().set_bg(roundrect_bg()).set_content_align('c').set_item_align('c').set_padding(16).set_sep(16):
-                    gate_icon = ctx.static_imgs.get(f'mysekai/gate_icon/gate_{gate_id}.png')
+                    gate_specs = build_mysekai_gate_specs(
+                        await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+                    )
+                    gate = gate_specs.get(gate_id, {'id': gate_id})
+                    gate_icon = await get_mysekai_gate_icon(ctx, gate)
                     with Frame().set_size((64, 64)).set_margin((16, 0)).set_content_align('rb'):
                         ImageBox(gate_icon, size=(64, 64), use_alphablend=True, shadow=True).set_offset((0, -4))
                         TextBox(
                             f"Lv.{gate_level}", 
-                            TextStyle(DEFAULT_FONT, 16, UNIT_COLORS[gate_id-1], use_shadow=True, shadow_color=ADAPTIVE_SHADOW),
+                            TextStyle(DEFAULT_FONT, 16, get_mysekai_gate_color(gate), use_shadow=True, shadow_color=ADAPTIVE_SHADOW),
                         ).set_content_align('c').set_offset((4, 2))
 
                     for cid in visit_cids:
@@ -1579,7 +1577,17 @@ async def compose_mysekai_fixture_detail_image(ctx: SekaiHandlerContext, fids: L
 
 # 合成mysekai门升级材料图片
 async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int, spec_gate_id: int = None) -> Image.Image:
-    GATE_MAX_LV = 40
+    # ================================ 本区服大门定义与材料 ================================ #
+    gate_specs = build_mysekai_gate_specs(
+        await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+    )
+    gate_materials = build_mysekai_gate_materials(
+        gate_specs, await ctx.md.mysekai_gate_material_groups.get(),
+    )
+    if spec_gate_id is not None:
+        gate = gate_specs.get(spec_gate_id)
+        assert_and_reply(gate is not None, "查询的大门不存在")
+        assert_and_reply(gate['max_level'] > 0, "查询的大门没有升级等级，无需升级材料")
 
     profile = None
     if qid:
@@ -1595,22 +1603,7 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
         lv_materials = profile.get('userMysekaiMaterials', [])
         user_materials = {item['mysekaiMaterialId']: item['quantity'] for item in lv_materials}
 
-    # 获取每级升级材料
-    gate_materials = {}
-    for item in await ctx.md.mysekai_gate_material_groups.get():
-        gid = item['groupId'] // 1000
-        level = item['groupId'] % 1000
-        mid = item['mysekaiMaterialId']
-        quantity = item['quantity']
-        if gid not in gate_materials:
-            gate_materials[gid] = [[] for _ in range(GATE_MAX_LV)]
-        gate_materials[gid][level - 1].append({
-            'mid': mid,
-            'quantity': quantity,
-            'color': (50, 50, 50),
-            'sum_quantity': None,
-        })
-
+    # ================================ 当前等级与查询目标 ================================ #
     # 获取指定lv
     spec_lvs = {}
     if profile:
@@ -1624,26 +1617,31 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
         if not spec_gate_id:
             # 如果没有指定门，则使用最大等级的门
             for gid, lv in spec_lvs.items():
-                if lv > spec_lvs.get(spec_gate_id, 0) and lv != GATE_MAX_LV:
+                max_level = gate_specs.get(gid, {}).get('max_level', 0)
+                if lv > spec_lvs.get(spec_gate_id, 0) and lv < max_level:
                     spec_gate_id = gid
             if not spec_gate_id:
-                raise ReplyException("你的所有门已经满级")
+                raise ReplyException("你的所有可升级大门已经满级")
 
     # 根据指定lv截断
     for gid, lv_materials in gate_materials.items():
         spec_lv = spec_lvs.get(gid, 0)
-        gate_materials[gid] = lv_materials[spec_lv:]
+        gate_materials[gid] = {level: items for level, items in lv_materials.items() if level > spec_lv}
 
     # 指定门
-    if spec_gate_id:
+    if spec_gate_id is not None:
         gate_materials = {spec_gate_id: gate_materials[spec_gate_id]}
-        if spec_lvs.get(spec_gate_id, 0) == GATE_MAX_LV:
+        if spec_lvs.get(spec_gate_id, 0) >= gate_specs[spec_gate_id]['max_level']:
             raise ReplyException("查询的门已经满级")
 
-    # 统计总和
+    # ================================ 材料完整性与累计消耗 ================================ #
+    # 表部分更新时不能把缺材料的等级当作免费，也不能误报满级。
+    for gid, lv_materials in gate_materials.items():
+        if any(not items for items in lv_materials.values()):
+            raise ReplyException(f"{gate_specs[gid]['name']}的升级材料尚未完整更新，请稍后重试")
     for gid, lv_materials in gate_materials.items():
         sum_materials = {}
-        for items in lv_materials:
+        for items in lv_materials.values():
             for item in items:
                 mid = item['mid']
                 quantity = item['quantity']
@@ -1658,7 +1656,7 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     # 计算玩家材料和需要的材料文本
     if profile:
         for gid, lv_materials in gate_materials.items():
-            for items in lv_materials:
+            for items in lv_materials.values():
                 for item in items:
                     mid = item['mid']
                     sum_quantity = item['sum_quantity']
@@ -1683,16 +1681,16 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
 
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_bg(roundrect_bg()).set_padding(8):
                 for gid, lv_materials in gate_materials.items():
-                    gate_icon = ctx.static_imgs.get(f'mysekai/gate_icon/gate_{gid}.png')
+                    gate_icon = await get_mysekai_gate_icon(ctx, gate_specs[gid])
                     with VSplit().set_content_align('c').set_item_align('c').set_sep(8).set_item_bg(roundrect_bg()).set_padding(8):
                         spec_lv = spec_lvs.get(gid, 0)
                         with HSplit().set_content_align('c').set_item_align('c').set_omit_parent_bg(True):
                             ImageBox(gate_icon, size=(None, 40))
                             if spec_lv:
-                                color = lerp_color(UNIT_COLORS[gid - 1], BLACK, 0.2)
+                                color = lerp_color(get_mysekai_gate_color(gate_specs[gid]), BLACK, 0.2)
                                 TextBox(f"Lv.{spec_lv}", TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=color, use_shadow=True, shadow_color=ADAPTIVE_SHADOW))
                         lv_color = (50, 50, 50) if not profile else green_color
-                        for level, items in enumerate(lv_materials, spec_lv + 1):
+                        for level, items in lv_materials.items():
                             for item in items:
                                 if any(i['color'] == red_color for i in items):
                                     lv_color = red_color
@@ -1714,7 +1712,9 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     # 缓存full查询
     cache_key = None
     if profile is None and spec_gate_id is None:
-        cache_key = f"{ctx.region}_pjsk_msg"
+        # 固定查询图的缓存必须区分表更新，否则升到70级后仍可能返回旧40级图片。
+        content = json.dumps(gate_materials, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        cache_key = f"{ctx.region}_pjsk_msg_{hashlib.sha256(content).hexdigest()[:16]}"
     return await canvas.get_img(cache_key=cache_key)
 
 # 合成mysekai唱片列表
@@ -2323,11 +2323,15 @@ async def _(ctx: SekaiHandlerContext):
         qid = None
         args = args.replace('all', '').strip()
     
-    try: 
-        unit, args = extract_unit(args)
-        gate_id = UNIT_GATEID_MAP[unit]
-    except: 
-        gate_id = None
+    gate_specs = build_mysekai_gate_specs(
+        await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+    )
+    unit = extract_unit(args)[0]
+    gate_id = next((gid for gid, gate in gate_specs.items() if gate.get('unit') == unit), None) if unit else None
+    # 保留原有团名用法；编号或完整门名也按本区服表解析，不把6号门映射成VS门。
+    if gate_id is None and args:
+        gate_id = next((gid for gid, gate in gate_specs.items() if args in (str(gid), gate.get('name'))), None)
+        assert_and_reply(gate_id is not None, "大门参数错误，请使用团名、大门编号或完整门名")
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_mysekai_door_upgrade_image(ctx, qid, gate_id),

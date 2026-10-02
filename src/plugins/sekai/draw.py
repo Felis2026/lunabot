@@ -46,6 +46,22 @@ def get_unit_icon(unit: str, size: int = None):
         img = img.resize((size, size))
     return img
 
+
+# ================================ 大门图标兼容 ================================ #
+
+async def get_mysekai_gate_icon(ctx: SekaiHandlerContext, gate: dict) -> Image.Image:
+    """保留已有静态门图标；新门从本区服定义的缩略图读取，缺素材不阻断整张图。"""
+    try:
+        return ctx.static_imgs.get(f"mysekai/gate_icon/gate_{gate.get('id', 0)}.png")
+    except FileNotFoundError:
+        asset_name = gate.get('assetbundleName')
+        if asset_name:
+            try:
+                return await ctx.rip.img(f"mysekai/thumbnail/gate_large/{asset_name}.png")
+            except Exception:
+                logger.warning(f"大门 {gate.get('id')} 的缩略图暂不可用，使用占位图")
+        return UNKNOWN_IMG
+
 # 获取属性图标
 def get_attr_icon(attr: str, size: int = None):
     img = SekaiHandlerContext.from_region('jp').static_imgs.get(f"card/attr_icon_{attr}.png")

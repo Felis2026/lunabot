@@ -1,4 +1,6 @@
 from ...utils import *
+import hashlib
+import json
 from ..common import *
 from ..handler import *
 from ..asset import *
@@ -486,14 +488,10 @@ async def compose_challenge_live_detail_image(ctx: SekaiHandlerContext, qid: int
     return await canvas.get_img()
 
 # 获取玩家加成信息
-async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> Dict[str, int]:
-    # 获取区域道具
-    area_items: List[dict] = []
-    for user_area in profile['userAreas']:
-        for user_area_item in user_area.get('areaItems', []):
-            item_id = user_area_item['areaItemId']
-            lv = user_area_item['level']
-            area_items.append(find_by(find_by(await ctx.md.area_item_levels.get(), 'areaItemId', item_id, mode='all'), 'level', lv))
+async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> dict:
+    # ================================ 全部区域道具效果 ================================ #
+    area_items = collect_user_area_item_effects(profile['userAreas'], await ctx.md.area_item_levels.get())
+    multi_unit_bonus = 0.0
 
     # 角色加成 = 区域道具 + 角色等级 + 烤森家具
     chara_bonus = { i : {
@@ -502,37 +500,44 @@ async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> Dict[
         'fixture': 0,
     } for i in range(1, 27) }
     for item in area_items:
-        if item.get('targetGameCharacterId', "any") != "any":
-            chara_bonus[item['targetGameCharacterId']]['area_item'] += item['power1BonusRate']
+        target, value = get_area_item_target(item)
+        if target == 'chara':
+            chara_bonus[value]['area_item'] += item['power1BonusRate']
+        elif target == 'all':
+            for bonus in chara_bonus.values():
+                bonus['area_item'] += item['power1BonusRate']
+        elif target == 'multi_unit':
+            multi_unit_bonus += item['power1BonusRate']
     for chara in profile['userCharacters']:
         rank = find_by(await ctx.md.character_ranks.find_by('characterId', chara['characterId'], mode='all'), 'characterRank', chara['characterRank'])
         chara_bonus[chara['characterId']]['rank'] += rank['power1BonusRate']
     for fb in profile.get('userMysekaiFixtureGameCharacterPerformanceBonuses', []):
         chara_bonus[fb['gameCharacterId']]['fixture'] += fb['totalBonusRate'] * 0.1
     
-    # 组合加成 = 区域道具 + 烤森门
+    # ================================ 组合与大门加成 ================================ #
     unit_bonus = { unit : {
         'area_item': 0,
         'gate': 0,
     } for unit in UNITS }
     for item in area_items:
-        if item.get('targetUnit', "any") != "any":
-            unit_bonus[item['targetUnit']]['area_item'] += item['power1BonusRate']
-    max_bonus = 0
-    for gate in profile.get('userMysekaiGates', []):
-        gate_id = gate['mysekaiGateId']
-        bonus = find_by(await ctx.md.mysekai_gate_levels.find_by('mysekaiGateId', gate_id, mode='all'), 'level', gate['mysekaiGateLevel'])
-        unit_bonus[UNITS[gate_id - 1]]['gate'] += bonus['powerBonusRate']
-        max_bonus = max(max_bonus, bonus['powerBonusRate'])
-    unit_bonus[UNIT_VS]['gate'] += max_bonus
+        target, value = get_area_item_target(item)
+        if target == 'unit' and value in unit_bonus:
+            unit_bonus[value]['area_item'] += item['power1BonusRate']
+    if profile.get('userMysekaiGates'):
+        gate_specs = build_mysekai_gate_specs(
+            await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+        )
+        for unit, rate in get_mysekai_gate_bonus_rates(profile['userMysekaiGates'], gate_specs).items():
+            unit_bonus[unit]['gate'] = rate
 
     # 属性加成 = 区域道具
     attr_bouns = { attr : {
         'area_item': 0,
     } for attr in CARD_ATTRS }
     for item in area_items:
-        if item.get('targetCardAttr', "any") != "any":
-            attr_bouns[item['targetCardAttr']]['area_item'] += item['power1BonusRate']
+        target, value = get_area_item_target(item)
+        if target == 'attr':
+            attr_bouns[value]['area_item'] += item['power1BonusRate']
 
     for _, bonus in chara_bonus.items():
         bonus['total'] = sum(bonus.values())
@@ -544,7 +549,8 @@ async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> Dict[
     return {
         "chara": chara_bonus,
         "unit": unit_bonus,
-        "attr": attr_bouns
+        "attr": attr_bouns,
+        "multi_unit_bonus": multi_unit_bonus,
     }
 
 # 合成加成详情图片
@@ -597,6 +603,12 @@ async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -
                             # detail = f"区域道具{attr_bonus[attr]['area_item']:.1f}%"
                             # TextBox(detail, text_style)
 
+                # 条件加成不能并入所有角色的固定合计，实际取舍交给原生内核按队伍计算。
+                if bonus['multi_unit_bonus']:
+                    with VSplit().set_padding(16).set_sep(4):
+                        TextBox(f"混团条件加成 +{bonus['multi_unit_bonus']:.1f}%", header_style)
+                        TextBox("实际生效由编队决定，不与同团额外加成直接相加", text_style)
+
     add_watermark(canvas)
     return await canvas.get_img()
 
@@ -639,43 +651,55 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
     area_item_icons: dict[int, Image.Image] = {}
     area_item_target_icons: dict[int, Image.Image] = {}
     area_item_level_bonuses: dict[int, dict[int, float]] = {}
+    area_item_multi_bonuses: dict[int, dict[int, float]] = {}
+    area_item_target_labels: dict[int, str] = {}
     area_item_max_levels: dict[int, int] = {}
     for item in await ctx.md.area_items.get():
         item_id, area_id, asset_name = item['id'], item['areaId'], item['assetbundleName']
 
         is_vs_item = False
 
-        area_item_icons[item_id] = await ctx.rip.img(f"areaitem/{asset_name}/{asset_name}.png")
         for item_lv in await ctx.md.area_item_levels.find_by('areaItemId', item_id, mode='all'):
-            area_item_level_bonuses.setdefault(item_id, {})[item_lv['level']] = item_lv['power1BonusRate']
+            target, value = get_area_item_target(item_lv)
+            bonuses = area_item_multi_bonuses if target == 'multi_unit' else area_item_level_bonuses
+            level_bonuses = bonuses.setdefault(item_id, {})
+            level_bonuses[item_lv['level']] = level_bonuses.get(item_lv['level'], 0) + item_lv['power1BonusRate']
             area_item_max_levels[item_id] = max(area_item_max_levels.get(item_id, 0), item_lv['level'])
 
             if item_id not in area_item_target_icons:
-                if item_lv.get('targetUnit', 'any') != 'any':
-                    area_item_target_icons[item_id] = get_unit_icon(item_lv['targetUnit'])
-                    if item_lv['targetUnit'] == 'piapro':
+                if target == 'unit':
+                    area_item_target_icons[item_id] = get_unit_icon(value)
+                    if value == 'piapro':
                         if filter_piapro:
                             item_ids.add(item_id)
                         is_vs_item = True
-                elif item_lv.get('targetGameCharacterId', 'any') != 'any':
-                    area_item_target_icons[item_id] = get_chara_icon_by_chara_id(item_lv['targetGameCharacterId'])
-                    if filter.cid and item_lv['targetGameCharacterId'] == filter.cid:
+                elif target == 'chara':
+                    area_item_target_icons[item_id] = get_chara_icon_by_chara_id(value)
+                    if filter.cid and value == filter.cid:
                         item_ids.add(item_id)
-                    if item_lv['targetGameCharacterId'] in UNIT_CID_MAP['piapro']:
+                    if value in UNIT_CID_MAP['piapro']:
                         is_vs_item = True
-                elif item_lv.get('targetCardAttr', 'any') != 'any':
-                    area_item_target_icons[item_id] = get_attr_icon(item_lv['targetCardAttr'])
-                    if filter.attr and item_lv['targetCardAttr'] == filter.attr:
+                elif target == 'attr':
+                    area_item_target_icons[item_id] = get_attr_icon(value)
+                    if filter.attr and value == filter.attr:
                         item_ids.add(item_id)
+                elif target == 'all':
+                    area_item_target_labels[item_id] = '全角色'
 
         if filter.flower and area_id == FLOWER_AREA_ID:
             item_ids.add(item_id)
-        if filter.tree and area_id == TREE_AREA_ID:
+        # 新树位于独立世界，不能只按旧学校区域筛选；通过多组合效果识别。
+        if filter.tree and (area_id == TREE_AREA_ID or item_id in area_item_multi_bonuses):
             item_ids.add(item_id)
         if filter.unit and area_id == UNIT_SEKAI_AREA_IDS[filter.unit] and not is_vs_item:
             item_ids.add(item_id)
 
     item_ids = sorted(item_ids)
+    # 未选中的道具不下载图标，防止一次普通查询也触发新道具素材请求。
+    for item in await ctx.md.area_items.get():
+        if item['id'] in item_ids:
+            asset_name = item['assetbundleName']
+            area_item_icons[item['id']] = await ctx.rip.img(f"areaitem/{asset_name}/{asset_name}.png")
 
     # 统计展示的最低等级
     user_area_item_lower_lv = None
@@ -764,7 +788,10 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
                     with VSplit().set_content_align('l').set_item_align('l').set_sep(8).set_item_bg(roundrect_bg()).set_padding(8):
                         # 列头
                         with HSplit().set_content_align('c').set_item_align('c').set_omit_parent_bg(True):
-                            ImageBox(area_item_target_icons.get(item_id, UNKNOWN_IMG), size=(None, 64))
+                            if item_id in area_item_target_labels:
+                                TextBox(area_item_target_labels[item_id], TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=gray_color))
+                            else:
+                                ImageBox(area_item_target_icons.get(item_id, UNKNOWN_IMG), size=(None, 64))
                             ImageBox(area_item_icons.get(item_id, UNKNOWN_IMG), size=(128, 64), image_size_mode='fit') \
                                 .set_content_align('c')
                             if current_lv:
@@ -791,6 +818,8 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
                                         color = gray_color
                                     TextBox(f"{lv}", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=color))
                                     TextBox(bonus_text, TextStyle(font=DEFAULT_BOLD_FONT, size=16, color=gray_color)).set_w(64)
+                                    if lv in area_item_multi_bonuses.get(item_id, {}):
+                                        TextBox(f"混团+{area_item_multi_bonuses[item_id][lv]:.1f}%", TextStyle(font=DEFAULT_BOLD_FONT, size=16, color=gray_color))
 
                                 if lv <= current_lv:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(4):
@@ -817,7 +846,10 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
     # 缓存full查询
     cache_key = None
     if profile is None:
-        cache_key = f"{ctx.region}_area_item_{filter.unit}_{filter.cid}_{filter.attr}_{filter.flower}_{filter.tree}"
+        # 同一筛选下的新等级和新增效果必须产生新图，不能复用更新前的静态查询缓存。
+        content = (area_item_level_bonuses, area_item_multi_bonuses, area_item_lv_materials)
+        revision = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()[:16]
+        cache_key = f"{ctx.region}_area_item_{filter.unit}_{filter.cid}_{filter.attr}_{filter.flower}_{filter.tree}_{revision}"
     return await canvas.get_img(scale=0.75, cache_key=cache_key)
 
 # 合成羁绊等级图片

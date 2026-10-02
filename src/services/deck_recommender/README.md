@@ -26,6 +26,12 @@ when intentionally testing an upgrade. See the repository
 [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md) for source and
 license details.
 
+The selected 0.4.1 kernel supports JP 7.0.0 multi-unit area item effects and
+gates without level rows. Existing calls use its default `by_deck` evaluation;
+no new command parameter is required. Upgrade the official and Preview
+processes together: their manifests include the native version and build ID,
+so existing Preview rulesets must be regenerated after an upgrade.
+
 Preview activation records can be audited without starting the Bot:
 
 ```bash

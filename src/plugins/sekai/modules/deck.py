@@ -2045,8 +2045,11 @@ async def do_deck_recommend_batch(
 
 # 构造顶配profile
 async def construct_max_profile(ctx: SekaiHandlerContext, max_area_item_level: int | None = None) -> dict:
+    gate_specs = {}
     try: 
-        await ctx.md.mysekai_gates.get()
+        gate_specs = build_mysekai_gate_specs(
+            await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+        )
         has_mysekai = True
     except:
         has_mysekai = False
@@ -2110,10 +2113,13 @@ async def construct_max_profile(ctx: SekaiHandlerContext, max_area_item_level: i
         })
 
     if has_mysekai:
-        for gid in range(1, 6):
+        # 顶配只加入本区服可升级的门；shuffle 门没有等级表，不应伪造满级。
+        for gid, gate in gate_specs.items():
+            if not gate['max_level']:
+                continue
             p['userMysekaiGates'].append({
                 "mysekaiGateId": gid,
-                "mysekaiGateLevel": 40,
+                "mysekaiGateLevel": gate['max_level'],
             })
         
         fixture_chara_bonus = { cid: 0 for cid in range(1, 27) }

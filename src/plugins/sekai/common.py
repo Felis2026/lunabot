@@ -402,3 +402,92 @@ def add_watermark_to_text(text: str, watermark_text: str) -> str:
         return text
     mid_index = len(text) // 2
     return text[:mid_index] + watermark_text + text[mid_index:]
+
+
+# ================================ 大门与区域道具效果 ================================ #
+
+def build_mysekai_gate_specs(gates: list[dict], gate_levels: list[dict]) -> dict[int, dict]:
+    """按本区服表建立大门定义；没有等级行的门不具备升级与综合力加成。"""
+    specs = {gate['id']: {**gate, 'levels': {}, 'max_level': 0} for gate in gates}
+    for row in gate_levels:
+        spec = specs.get(row['mysekaiGateId'])
+        if spec is not None and row['level'] > 0:
+            spec['levels'][row['level']] = row
+            spec['max_level'] = max(spec['max_level'], row['level'])
+    return specs
+
+
+def get_mysekai_gate_color(gate: dict) -> tuple:
+    """按大门所属团取色；shuffle 和未知团不能按门编号索引五团色表。"""
+    unit = gate.get('unit')
+    if unit in UNITS[:len(UNIT_COLORS)]:
+        return UNIT_COLORS[UNITS.index(unit)]
+    return (60, 145, 145, 255)
+
+
+def get_mysekai_gate_bonus_rates(user_gates: list[dict], specs: dict[int, dict]) -> dict[str, float]:
+    """匹配原生内核的大门规则；无支援虚拟歌手取等级最高门，同级保留抓包顺序。"""
+    rates = {unit: 0.0 for unit in UNITS}
+    highest_level = -1
+    selected_units = set()
+    for user_gate in user_gates:
+        spec = specs.get(user_gate['mysekaiGateId'], {})
+        level = user_gate['mysekaiGateLevel']
+        row = spec.get('levels', {}).get(level, {})
+        rate = row.get('powerBonusRate', 0.0)
+        unit = spec.get('unit')
+        if unit in rates and unit != UNIT_VS and unit not in selected_units:
+            rates[unit] = rate
+            selected_units.add(unit)
+        # 先选最高等级的大门，再读加成；不能跳过零加成门而改选次高门。
+        if level > highest_level:
+            highest_level = level
+            rates[UNIT_VS] = rate
+    return rates
+
+
+def build_mysekai_gate_materials(specs: dict[int, dict], materials: list[dict]) -> dict[int, dict]:
+    """通过等级行的材料组外键关联材料，不假设 groupId 编号或各门等级上限相同。"""
+    groups = {}
+    for row in materials:
+        groups.setdefault(row['groupId'], []).append(row)
+    return {
+        gate_id: {
+            level: [
+                {'mid': row['mysekaiMaterialId'], 'quantity': row['quantity'],
+                 'color': (50, 50, 50), 'sum_quantity': None}
+                for row in groups.get(level_row.get('mysekaiGateMaterialGroupId'), [])
+            ]
+            for level, level_row in sorted(spec['levels'].items())
+        }
+        for gate_id, spec in specs.items() if spec['max_level'] > 0
+    }
+
+
+def get_area_item_target(row: dict) -> tuple:
+    """区分专属、全角色与混团效果；multi_unit 是条件效果，不是可取图标的团名。"""
+    character = row.get('targetGameCharacterId', 'any')
+    if character not in ('any', None, 0):
+        return 'chara', character
+    unit = row.get('targetUnit', 'any')
+    if unit == 'multi_unit':
+        return 'multi_unit', unit
+    if unit not in ('any', 'none', None):
+        return 'unit', unit
+    attr = row.get('targetCardAttr', 'any')
+    if attr not in ('any', 'none', None):
+        return 'attr', attr
+    return 'all', None
+
+
+def collect_user_area_item_effects(user_areas: list[dict], levels: list[dict]) -> list[dict]:
+    """同一道具同一等级保留全部效果行；不改写抓包或 MasterData。"""
+    indexed = {}
+    for row in levels:
+        indexed.setdefault((row['areaItemId'], row['level']), []).append(row)
+    return [
+        row
+        for area in user_areas
+        for item in area.get('areaItems', [])
+        for row in indexed.get((item['areaItemId'], item['level']), [])
+    ]
