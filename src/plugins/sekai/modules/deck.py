@@ -46,6 +46,7 @@ from src.services.deck_recommender.masterdata_spec import (
 from .deck_preview.assumed_cards import (
     AssumedCardsContext,
     PreviewCardError,
+    get_event_bonus_card_ids,
     inject_explicit_assumed_cards,
     select_result_card_masterdata,
     validate_preview_result_cards,
@@ -1468,6 +1469,10 @@ def extract_addtional_options(args: str) -> Tuple[dict, str]:
     war_prepare, args = extract_war_prepare_options(args)
     ret.update(war_prepare)
 
+    if "全当期" in args:
+        ret['all_event_cards'] = True
+        args = args.replace("全当期", "", 1).strip()
+
     for keyword in FINAL_CHAPTER_BADGE_KEYWORDS:
         if keyword in args:
             ret['final_chapter_badge_sim'] = True
@@ -2353,7 +2358,7 @@ async def compose_deck_recommend_image(
             uid = profile['userGamedata']['userId']
 
     # 假设卡与牌子只改本次请求，不能污染抓包缓存或其他并发组卡的档案。
-    if is_preview or is_finale:
+    if is_preview or is_finale or additional.get('all_event_cards'):
         profile = deepcopy(profile)
     original_usercards = profile['userCards']
     assumed_cards_context: AssumedCardsContext | None = None
@@ -2415,18 +2420,56 @@ async def compose_deck_recommend_image(
                     # suite中没有该卡，提示需要抓包更新
                     raise ReplyException(f"当前卡组中的卡牌 {bp_card['cardId']} 不在Suite数据中，请更新抓包数据")
 
-    # ================================ 显式未来卡假设 ================================ #
+    # ================================ 固定未来卡与全当期候选 ================================ #
     # 必须在 CN 过滤/当前队伍处理完成后注入，而且先复制列表，避免临时卡污染
     # 用于头像和玩家信息绘制的原始 Suite 对象。
-    if preview_resolution is not None:
+    if preview_resolution is not None or additional.get('all_event_cards'):
+        assert_and_reply(
+            not additional.get('all_event_cards') or (
+                options.event_id and recommend_type in ('event', 'wl', 'bonus', 'wl_bonus')
+            ),
+            "“全当期”需要指定真实活动，只支持活动组卡和加成组卡",
+        )
         profile['userCards'] = list(profile['userCards'])
+        catalog_cards_by_id = {
+            card["id"]: card for card in await ctx.md.cards.get()
+            if isinstance(card.get("id"), int)
+        }
+        future_card_ids = set(preview_resolution.future_card_ids) if preview_resolution else set()
+        candidate_ids: set[int] = set()
+        if additional.get('all_event_cards'):
+            try:
+                candidate_ids = get_event_bonus_card_ids(
+                    await rule_ctx.md.event_cards.find_by('eventId', options.event_id, mode='all'),
+                    options.event_id,
+                )
+            except PreviewCardError as exc:
+                raise ReplyException(str(exc)) from exc
+            assert_and_reply(candidate_ids, "该活动没有可补入的额外加成卡")
+            filtered_candidates: set[int] = set()
+            for card_id in sorted(candidate_ids):
+                card = catalog_cards_by_id.get(card_id)
+                if card is None and card_id in future_card_ids:
+                    card = await jp_ctx.md.cards.find_by_id(card_id)
+                    if card:
+                        jp_cards_by_id[card_id] = card
+                assert_and_reply(card, f"找不到当期加成卡 {card_id} 的资料")
+                card_unit = get_unit_by_chara_id(card['characterId'])
+                if unit_filter and unit_filter != 'piapro' and card_unit == 'piapro':
+                    card_unit = card.get('supportUnit', 'none')
+                if (card_id in excluded_cards
+                    or (unit_filter and card_unit != unit_filter)
+                    or (attr_filter and card['attr'] != attr_filter)):
+                    continue
+                filtered_candidates.add(card_id)
+            candidate_ids = filtered_candidates
         future_fixed_ids = [
             card_id
             for card_id in (options.fixed_cards or [])
-            if card_id in preview_resolution.future_card_ids
+            if card_id in future_card_ids
         ]
         jp_episodes_by_card_id: dict[int, list[dict]] = {}
-        for card_id in future_fixed_ids:
+        for card_id in sorted(set(future_fixed_ids) | (candidate_ids & future_card_ids)):
             card = await jp_ctx.md.cards.find_by_id(card_id)
             if card:
                 jp_cards_by_id[card_id] = card
@@ -2435,6 +2478,10 @@ async def compose_deck_recommend_image(
                 card_id,
                 mode="all",
             )
+        catalog_episodes_by_card_id = {
+            card_id: await ctx.md.card_episodes.find_by('cardId', card_id, mode='all')
+            for card_id in candidate_ids & catalog_cards_by_id.keys()
+        }
         # 单卡设置优先叠加在对应稀有度设置上，保证临时 Suite 与实际下发给
         # 原生库的满技、满破和剧情状态一致。
         rarity_configs = {
@@ -2449,7 +2496,12 @@ async def compose_deck_recommend_image(
             for single in (options.single_card_configs or [])
         }
         assumed_config_overrides: dict[int, dict[str, bool]] = {}
-        for card_id, card in jp_cards_by_id.items():
+        configured_cards = dict(jp_cards_by_id)
+        configured_cards.update({
+            card_id: catalog_cards_by_id[card_id]
+            for card_id in candidate_ids & catalog_cards_by_id.keys()
+        })
+        for card_id, card in configured_cards.items():
             rarity_config = rarity_configs.get(card.get("cardRarityType"))
             single_config = single_configs.get(card_id)
             assumed_config_overrides[card_id] = {
@@ -2469,26 +2521,27 @@ async def compose_deck_recommend_image(
             assumed_cards_context = inject_explicit_assumed_cards(
                 profile,
                 fixed_card_ids=options.fixed_cards or [],
-                cn_catalog_card_ids={
-                    card["id"]
-                    for card in await ctx.md.cards.get()
-                    if isinstance(card.get("id"), int)
-                },
-                future_card_ids=set(preview_resolution.future_card_ids),
+                cn_catalog_card_ids=set(catalog_cards_by_id),
+                future_card_ids=future_card_ids,
                 episode_optional_future_card_ids=set(
                     preview_resolution.episode_optional_future_card_ids
-                ),
+                ) if preview_resolution else set(),
                 jp_cards_by_id=jp_cards_by_id,
                 jp_episodes_by_card_id=jp_episodes_by_card_id,
                 max_assumed_cards=max_assumed_cards,
                 card_config_overrides=assumed_config_overrides,
+                candidate_card_ids=candidate_ids,
+                cn_cards_by_id=catalog_cards_by_id,
+                cn_episodes_by_card_id=catalog_episodes_by_card_id,
             )
         except PreviewCardError as exc:
             raise ReplyException(str(exc)) from exc
         assumed_usercards_by_id = {
             user_card["cardId"]: user_card
             for user_card in profile["userCards"]
-            if user_card.get("cardId") in assumed_cards_context.assumed_card_ids
+            if user_card.get("cardId") in (
+                assumed_cards_context.assumed_card_ids | assumed_cards_context.candidate_card_ids
+            )
         }
 
     # ================================ 终章目标与牌子模拟 ================================ #
@@ -2740,7 +2793,7 @@ async def compose_deck_recommend_image(
         result_decks = result_decks[:1]
         result_algs = result_algs[:1]
 
-    if preview_resolution is not None and assumed_cards_context is not None:
+    if assumed_cards_context is not None:
         try:
             validate_preview_result_cards(
                 result_decks,
@@ -2750,8 +2803,7 @@ async def compose_deck_recommend_image(
         except PreviewCardError as exc:
             logger.error(
                 "预演组卡结果集合越界: "
-                f"event={preview_resolution.event_id} "
-                f"fp={preview_resolution.scope_fingerprint} "
+                f"event={options.event_id} "
                 f"error={get_exc_desc(exc)}"
             )
             raise ReplyException("预演结果安全校验失败，本次结果已作废") from exc
@@ -2940,8 +2992,7 @@ async def compose_deck_recommend_image(
             card = await _get_result_card_masterdata(deckcard.card_id)
             usercard = (
                 assumed_usercards_by_id.get(deckcard.card_id)
-                if assumed
-                else find_by(profile['userCards'], 'cardId', deckcard.card_id)
+                or find_by(profile['userCards'], 'cardId', deckcard.card_id)
             )
             pcard = {
                 'cardId': deckcard.card_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -16,6 +17,7 @@ class AssumedCardsContext:
     assumed_card_ids: frozenset[int]
     explicit_cn_catalog_card_ids: frozenset[int]
     submitted_card_ids: frozenset[int]
+    candidate_card_ids: frozenset[int] = frozenset()
 
     @property
     def allowed_card_ids(self) -> frozenset[int]:
@@ -36,7 +38,7 @@ def select_result_card_masterdata(
     """
     为组卡结果选择对应区服的卡牌元数据。
 
-    只有本次显式假设持有的 JP 未实装卡使用 JP 元数据；CN 已上线卡牌即使
+    只有本次授权假设持有的 JP 未实装卡使用 JP 元数据；CN 已上线卡牌即使
     Suite 尚未持有，也必须继续使用 CN 元数据，避免两个卡库被无条件混用。
     """
 
@@ -87,6 +89,34 @@ def _default_user_card(
     }
 
 
+# ================================ 目标活动加成卡 ================================ #
+
+def get_event_bonus_card_ids(
+    event_cards: Iterable[Mapping[str, Any]],
+    event_id: int,
+) -> set[int]:
+    """读取目标活动的额外加成卡，排除同表中零加成的报酬卡。"""
+
+    card_ids: set[int] = set()
+    for row in event_cards:
+        if row.get("eventId") != event_id:
+            continue
+        rates = (row.get("bonusRate", 0), row.get("leaderBonusRate", 0))
+        if any(
+            rate is not None and (
+                not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate < 0
+            )
+            for rate in rates
+        ):
+            raise PreviewCardError(f"活动 {event_id} 的卡牌加成数据异常")
+        if any(rate is not None and rate > 0 for rate in rates):
+            card_id = row.get("cardId")
+            if not isinstance(card_id, int):
+                raise PreviewCardError(f"活动 {event_id} 的加成卡缺少卡牌编号")
+            card_ids.add(card_id)
+    return card_ids
+
+
 def inject_explicit_assumed_cards(
     profile: dict[str, Any],
     *,
@@ -98,11 +128,14 @@ def inject_explicit_assumed_cards(
     jp_episodes_by_card_id: Mapping[int, Sequence[Mapping[str, Any]]],
     max_assumed_cards: int,
     card_config_overrides: Mapping[int, Mapping[str, bool]] | None = None,
+    candidate_card_ids: Iterable[int] = (),
+    cn_cards_by_id: Mapping[int, Mapping[str, Any]] | None = None,
+    cn_episodes_by_card_id: Mapping[int, Sequence[Mapping[str, Any]]] | None = None,
 ) -> AssumedCardsContext:
     """
-    只为用户通过 `#ID` 固定的 JP 未实装卡创建本次临时 userCard。
+    为显式固定未来卡与目标活动授权候选卡创建本次临时 userCard。
 
-    不写回 Suite，不把未来卡加入自由候选池，也不要求它属于目标活动。
+    固定未来卡仍受原数量限制；候选卡不固定上场，且不写回 Suite。
     """
 
     user_cards = profile.get("userCards")
@@ -121,6 +154,9 @@ def inject_explicit_assumed_cards(
     config_overrides = card_config_overrides or {}
     cn_catalog_ids = cn_catalog_card_ids or set()
     episode_optional_ids = episode_optional_future_card_ids or set()
+    candidate_ids = {int(card_id) for card_id in candidate_card_ids}
+    catalog_cards = cn_cards_by_id or {}
+    catalog_episodes = cn_episodes_by_card_id or {}
     assumed_ids: list[int] = []
     explicit_cn_catalog_ids: list[int] = []
 
@@ -128,13 +164,18 @@ def inject_explicit_assumed_cards(
     pending_cards: list[
         tuple[int, Mapping[str, Any], Sequence[Mapping[str, Any]]]
     ] = []
-    for card_id in fixed_ids:
+    for card_id in dict.fromkeys([*fixed_ids, *sorted(candidate_ids)]):
         if card_id in actual_ids:
             continue
         if card_id in cn_catalog_ids:
             # 原生组卡允许固定一张 Suite 未持有、但已存在于正式 CN 卡库的卡。
             # 它通过 fixed_cards 参数显式提交，不应被未来卡结果保护误判为越界。
             explicit_cn_catalog_ids.append(card_id)
+            if card_id in candidate_ids:
+                card = catalog_cards.get(card_id)
+                if card is None:
+                    raise PreviewCardError(f"找不到当期加成卡 {card_id} 的资料")
+                pending_cards.append((card_id, card, catalog_episodes.get(card_id, ())))
             continue
         if card_id not in future_card_ids:
             raise PreviewCardError(
@@ -148,7 +189,11 @@ def inject_explicit_assumed_cards(
             raise PreviewCardError(f"未来卡 {card_id} 的 JP 剧情资料不完整")
         pending_cards.append((card_id, card, episodes))
 
-    if len(pending_cards) > max_assumed_cards:
+    fixed_future_count = sum(
+        card_id in future_card_ids and card_id in fixed_ids
+        for card_id, _, _ in pending_cards
+    )
+    if fixed_future_count > max_assumed_cards:
         raise PreviewCardError(
             f"固定卡牌数量不能超过{max_assumed_cards}张"
         )
@@ -161,7 +206,8 @@ def inject_explicit_assumed_cards(
             episodes,
             config_overrides.get(card_id, {}),
         )
-        assumed_ids.append(card_id)
+        if card_id in future_card_ids and card_id not in cn_catalog_ids:
+            assumed_ids.append(card_id)
         user_cards.append(user_card)
 
     submitted_ids = {
@@ -174,6 +220,7 @@ def inject_explicit_assumed_cards(
         assumed_card_ids=frozenset(assumed_ids),
         explicit_cn_catalog_card_ids=frozenset(explicit_cn_catalog_ids),
         submitted_card_ids=frozenset(submitted_ids),
+        candidate_card_ids=frozenset(candidate_ids),
     )
 
 
@@ -186,9 +233,9 @@ def validate_preview_result_cards(
     """结果必须同时属于授权集合和本次真正提交给原生后端的 userCards。"""
 
     fixed_ids = {int(card_id) for card_id in fixed_card_ids}
-    if not context.assumed_card_ids <= fixed_ids:
+    if not (context.assumed_card_ids - context.candidate_card_ids) <= fixed_ids:
         raise PreviewCardError("假设未来卡没有全部出现在用户显式固定卡中")
-    if not context.explicit_cn_catalog_card_ids <= fixed_ids:
+    if not (context.explicit_cn_catalog_card_ids - context.candidate_card_ids) <= fixed_ids:
         raise PreviewCardError("Suite 未持有的 CN 卡没有全部出现在用户显式固定卡中")
     for deck in result_decks:
         for card in deck.cards:
