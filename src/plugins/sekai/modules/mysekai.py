@@ -29,6 +29,7 @@ from .profile import (
 )
 from .music import get_music_cover_thumb, is_valid_music
 from .card import get_character_sd_image
+from .deck_preview.router import extract_preview_keyword
 from ...imgtool import shrink_image
 
 
@@ -1575,15 +1576,50 @@ async def compose_mysekai_fixture_detail_image(ctx: SekaiHandlerContext, fids: L
     add_watermark(canvas)
     return await canvas.get_img()
 
-# 合成mysekai门升级材料图片
-async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int, spec_gate_id: int = None) -> Image.Image:
-    # ================================ 本区服大门定义与材料 ================================ #
+# ================================ 大门升级规则与跨服预览 ================================ #
+async def get_mysekai_gate_upgrade_data(ctx: SekaiHandlerContext, preview: bool = False) -> tuple[dict, dict]:
+    """返回本区服大门及材料；预览仅为已有国服门补充日服高等级，不改写原表。"""
+    if preview:
+        assert_and_reply(ctx.region == 'cn', "大门预览仅支持CN服务器，JP服务器请直接查询升级材料")
+
     gate_specs = build_mysekai_gate_specs(
         await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
     )
     gate_materials = build_mysekai_gate_materials(
         gate_specs, await ctx.md.mysekai_gate_material_groups.get(),
     )
+    if not preview:
+        return gate_specs, gate_materials
+
+    # ================================ 补充日服高等级 ================================ #
+    jp_md = RegionMasterDataCollection('jp')
+    jp_specs = build_mysekai_gate_specs(
+        await jp_md.mysekai_gates.get(), await jp_md.mysekai_gate_levels.get(),
+    )
+    jp_materials = build_mysekai_gate_materials(
+        jp_specs, await jp_md.mysekai_gate_material_groups.get(),
+    )
+    jp_gates_by_unit = {gate.get('unit'): gate for gate in jp_specs.values() if gate['max_level'] > 0}
+    for gate_id, gate in gate_specs.items():
+        jp_gate = jp_gates_by_unit.get(gate.get('unit'))
+        if not jp_gate or gate['max_level'] == 0:
+            continue
+        extra_levels = {
+            level: row for level, row in jp_gate['levels'].items()
+            if level > gate['max_level']
+        }
+        for level, row in extra_levels.items():
+            requirements = jp_materials[jp_gate['id']][level]
+            # 两服先各自解析材料组，再合并升级需求，避免同号 groupId 串用材料。
+            gate['levels'][level] = row
+            gate_materials[gate_id][level] = requirements
+        gate['max_level'] = max(gate['levels'])
+    return gate_specs, gate_materials
+
+
+# 合成mysekai门升级材料图片
+async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int, spec_gate_id: int = None, preview: bool = False) -> Image.Image:
+    gate_specs, gate_materials = await get_mysekai_gate_upgrade_data(ctx, preview)
     if spec_gate_id is not None:
         gate = gate_specs.get(spec_gate_id)
         assert_and_reply(gate is not None, "查询的大门不存在")
@@ -1639,6 +1675,14 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     for gid, lv_materials in gate_materials.items():
         if any(not items for items in lv_materials.values()):
             raise ReplyException(f"{gate_specs[gid]['name']}的升级材料尚未完整更新，请稍后重试")
+    if preview:
+        # 只校验当前查询的等级与门，避免其他门尚未实装的材料阻断本次预览。
+        cn_material_ids = {row['id'] for row in await ctx.md.mysekai_materials.get()}
+        assert_and_reply(
+            all(item['mid'] in cn_material_ids
+                for levels in gate_materials.values() for items in levels.values() for item in items),
+            "预览所需材料尚未在CN服务器提供，暂时无法使用国服库存计算",
+        )
     for gid, lv_materials in gate_materials.items():
         sum_materials = {}
         for items in lv_materials.values():
@@ -1676,8 +1720,21 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
+            # ================================ 预览说明与原资料卡 ================================ #
             if profile:
-                await get_detailed_profile_card(ctx, profile, pmsg)
+                header = await get_detailed_profile_card(ctx, profile, pmsg)
+                if preview:
+                    # 复用原信息栏；可选错误提示是另一列，不能通过最后一个子项定位。
+                    notice_column = next(item for item in header.items[0].items if isinstance(item, VSplit))
+            elif preview:
+                # all 查询没有账号资料卡，仍需在同款面板内明确标记日服预览。
+                with Frame().set_bg(roundrect_bg()).set_padding(16):
+                    notice_column = VSplit().set_content_align('l').set_item_align('l').set_sep(5)
+            if preview:
+                with notice_column:
+                    notice_style = TextStyle(font=DEFAULT_FONT, size=16, color=RED)
+                    TextBox("当前仅按 JP 服务器的升级材料要求预览", notice_style)
+                    TextBox("以 CN 服务器开放后的实际要求为准", notice_style)
 
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_bg(roundrect_bg()).set_padding(8):
                 for gid, lv_materials in gate_materials.items():
@@ -1696,7 +1753,8 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
                                     lv_color = red_color
 
                             with HSplit().set_content_align('l').set_item_align('l').set_sep(8).set_padding(8):
-                                TextBox(f"{level}", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=lv_color), overflow='clip').set_w(50)
+                                # 只在原等级列内水平居中，保留原垂直位置与列宽。
+                                TextBox(f"{level}", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=lv_color), overflow='clip').set_w(50).set_content_align('c')
                                 for item in items:
                                     mid, quantity, color, sum_quantity = item['mid'], item['quantity'], item['color'], item['sum_quantity']
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(4):
@@ -1714,7 +1772,9 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     if profile is None and spec_gate_id is None:
         # 固定查询图的缓存必须区分表更新，否则升到70级后仍可能返回旧40级图片。
         content = json.dumps(gate_materials, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        cache_key = f"{ctx.region}_pjsk_msg_{hashlib.sha256(content).hexdigest()[:16]}"
+        # 数字居中后不能复用旧卡面；预览模式单独缓存，避免国服追平日服后混用说明。
+        mode = 'preview' if preview else 'normal'
+        cache_key = f"{ctx.region}_pjsk_msg_centered_{mode}_{hashlib.sha256(content).hexdigest()[:16]}"
     return await canvas.get_img(cache_key=cache_key)
 
 # 合成mysekai唱片列表
@@ -2318,6 +2378,10 @@ pjsk_mysekai_gate.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     args = ctx.get_args().strip()
 
+    preview, args = extract_preview_keyword(args)
+    if preview:
+        assert_and_reply(ctx.region == 'cn', "大门预览仅支持CN服务器，JP服务器请直接查询升级材料")
+
     qid = ctx.user_id
     if 'all' in args:
         qid = None
@@ -2334,7 +2398,7 @@ async def _(ctx: SekaiHandlerContext):
         assert_and_reply(gate_id is not None, "大门参数错误，请使用团名、大门编号或完整门名")
 
     return await ctx.asend_reply_msg(await get_image_cq(
-        await compose_mysekai_door_upgrade_image(ctx, qid, gate_id),
+        await compose_mysekai_door_upgrade_image(ctx, qid, gate_id, preview=preview),
         low_quality=True
     ))
 
