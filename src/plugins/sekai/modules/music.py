@@ -1488,6 +1488,41 @@ async def get_event_of_music(ctx: SekaiHandlerContext, mid: int) -> Dict:
         return None
     return await ctx.md.events.find_by_id(em['eventId'])
 
+# ================================ 歌曲MV分类兼容 ================================ #
+
+async def get_music_categories(ctx: SekaiHandlerContext, music: dict) -> list[str] | None:
+    """兼容内嵌分类与独立分类表；None 表示未知，不改写歌曲原始数据。"""
+    categories = music.get('categories')
+    # 旧格式的空列表明确表示无 MV，不能因此请求尚未拆表区服的新接口。
+    if isinstance(categories, list) and all(isinstance(item, str) for item in categories):
+        return list(dict.fromkeys(categories))
+
+    try:
+        # 通过现有管理器更新版本并复用 musicId 索引，不直接读取可能过期的磁盘文件。
+        rows = await ctx.md.music_categories.find_by('musicId', music['id'], mode='all')
+        if not rows:
+            return None
+        categories = [row['musicCategoryName'] for row in rows]
+        if not all(isinstance(item, str) and item for item in categories):
+            raise ValueError("歌曲分类名称无效")
+        return list(dict.fromkeys(categories))
+    except Exception as exc:
+        logger.warning(f"获取歌曲{music['id']}的MV分类失败: {get_exc_desc(exc)}")
+        return None
+
+
+def get_music_mv_text(categories: list[str] | None) -> str:
+    """沿用旧 MV 名称和顺序，区分静态图片、明确无 MV 与未知分类。"""
+    if categories is None:
+        return "未知"
+    labels = {'original': '原版MV', 'mv': '3DMV', 'mv_2d': '2DMV'}
+    mv_text = " & ".join(labels[item] for item in categories if item in labels)
+    if mv_text:
+        return mv_text
+    # image 只是静态图片；未知的新枚举不能被误报为没有 MV。
+    return "无" if all(item == 'image' for item in categories) else "未知"
+
+
 # 获取歌曲详情图片
 async def compose_music_detail_image(ctx: SekaiHandlerContext, mid: int, title: str=None, title_style: TextStyle=None, title_shadow=False):
     music = await ctx.md.musics.find_by_id(mid)
@@ -1499,7 +1534,7 @@ async def compose_music_detail_image(ctx: SekaiHandlerContext, mid: int, title: 
     composer        = music["composer"]
     lyricist        = music["lyricist"]
     arranger        = music["arranger"]
-    mv_info         = music['categories']
+    mv_info         = await get_music_categories(ctx, music)
     publish_time    = datetime.fromtimestamp(music['publishedAt'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
     if music['isFullLength']:
@@ -1638,14 +1673,7 @@ async def compose_music_detail_image(ctx: SekaiHandlerContext, mid: int, title: 
                             TextBox(composer, style2)
                             TextBox(lyricist, style2)
                             TextBox(arranger, style2)
-                            mv_text = ""
-                            for item in mv_info:
-                                if item == 'original': mv_text += "原版MV & "
-                                if item == 'mv': mv_text += "3DMV & "
-                                if item == 'mv_2d': mv_text += "2DMV & "
-                            mv_text = mv_text[:-3]
-                            if not mv_text: mv_text = "无"
-                            TextBox(mv_text, style2)
+                            TextBox(get_music_mv_text(mv_info), style2)
                             TextBox(audio_len, style2)
                             TextBox(publish_time, style2)
                             TextBox(bpm_main, style2)
