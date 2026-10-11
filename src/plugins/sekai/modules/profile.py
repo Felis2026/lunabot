@@ -139,7 +139,7 @@ def get_suite_public_warning_text(ctx: SekaiHandlerContext, profile: dict | None
         or _get_requested_suite_uid_for_warning(ctx, requested_qid)
     )
     if uid and can_use_oauth_suite(ctx, requested_qid, str(uid)):
-        return '公开API即将关闭，请尽快私聊bot /授权 使本Bot能够访问您的数据'
+        return '推荐使用 OAuth 获取数据，请私聊 Bot 发送 /授权'
     return ""
 
 
@@ -3102,62 +3102,21 @@ async def _(ctx: SekaiHandlerContext):
     )
 
 
-async def reply_oauth_authorize_link(ctx: SekaiHandlerContext, url: str):
-    """
-    优先私聊授权链接。
+# ================================ 授权链接投递 ================================ #
+OAUTH_AUTHORIZE_GROUP_GUIDE = (
+    "请私聊 Bot 发送 /授权 获取链接；如需在本群发送，请使用 /授权 force。"
+)
 
-    当前阶段不做中转页，直接投递 Haruki 授权链接：
-    - 能私聊：群里只提示“已私发”
-    - 不能私聊：群里先明确建议走临时会话，再带风险提示后回落群内发链接
-    """
-    private_msg = f"请复制到浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
 
-    if not ctx.group_id:
-        return await ctx.asend_reply_msg(private_msg)
+async def reply_oauth_authorize_link(ctx: SekaiHandlerContext, url: str, force: bool = False):
+    """私聊直接发送授权链接；群内只有明确指定 force 才允许发送。"""
+    if ctx.group_id and not force:
+        return await ctx.asend_reply_msg(OAUTH_AUTHORIZE_GROUP_GUIDE)
 
-    # 这里故意不走 `send_private_msg_by_bot()` 的好友预检查。
-    # 原因是 OAuth 授权链接是极少数“值得先试发一次私聊”的场景：
-    # - 某些实现下，即使不是好友，也可能允许群临时会话私聊
-    # - 如果我们先查好友列表，就会把这类可发送场景提前误判成失败
-    #
-    # 这里的策略是：
-    # 1. 先 best-effort 试发私聊
-    # 2. 成功则群里只提示“已私发”
-    # 3. 失败再按既定策略回落群内，并明确建议用户改走临时会话
-    async def try_send_private_once() -> bool:
-        candidate_bots = []
-        if getattr(ctx, "bot", None):
-            candidate_bots.append(ctx.bot)
-        try:
-            private_bot = await aget_private_bot(int(ctx.user_id))
-        except Exception as e:
-            logger.warning(f"[sekai] 获取可用私聊 Bot 失败 qid={ctx.user_id}: {e}")
-            private_bot = None
-        if private_bot and all(str(bot.self_id) != str(private_bot.self_id) for bot in candidate_bots):
-            candidate_bots.append(private_bot)
-
-        for bot in candidate_bots:
-            try:
-                await bot.send_private_msg(user_id=int(ctx.user_id), message=private_msg)
-                return True
-            except Exception as e:
-                logger.warning(
-                    f"[sekai] OAuth 授权链接私聊发送失败 "
-                    f"qid={ctx.user_id} bot={getattr(bot, 'self_id', '?')}: {e}"
-                )
-        return False
-
-    sent = await try_send_private_once()
-    if sent:
-        return await ctx.asend_reply_msg(
-            "授权链接已私发，请注意查收。若未收到，建议点击 Bot 头像进入临时会话后重新发送 /授权。"
-        )
-
-    return await ctx.asend_reply_msg(
-        "建议优先点击 Bot 头像进入临时会话后发送 /授权 获取链接。\n"
-        "当前未能通过私聊发送授权链接，下面将直接在群内发送；若继续点击，即视为你已知晓公开发送带来的风险：\n"
-        f"{url}"
-    )
+    message = f"请复制到浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
+    if ctx.group_id:
+        message = "请勿转发授权链接。\n" + message
+    return await ctx.asend_reply_msg(message)
 
 
 sekai_oauth_authorize = SekaiCmdHandler([
@@ -3166,6 +3125,13 @@ sekai_oauth_authorize = SekaiCmdHandler([
 sekai_oauth_authorize.check_cdrate(cd).check_wblist(gbl)
 @sekai_oauth_authorize.handle()
 async def _(ctx: SekaiHandlerContext):
+    args = ctx.get_args().strip().lower()
+    assert_and_reply(args in {'', 'force'}, "参数错误，请使用 /授权 或 /授权 force")
+    force = args == 'force'
+    if ctx.group_id and not force:
+        # 普通群聊只给引导，不生成 pending state，也不清理账号缓存或请求 Cloud。
+        return await ctx.asend_reply_msg(OAUTH_AUTHORIZE_GROUP_GUIDE)
+
     qid = str(ctx.user_id)
     try:
         # 授权前先清掉本进程中的旧状态，减少“刚授权成功但短时间还走旧缓存”的错觉。
@@ -3175,7 +3141,7 @@ async def _(ctx: SekaiHandlerContext):
     except Exception as e:
         raise ReplyException(f"生成授权链接失败: {e}")
 
-    return await reply_oauth_authorize_link(ctx, url)
+    return await reply_oauth_authorize_link(ctx, url, force=force)
 
 
 # 查询 suite 抓包数据状态
