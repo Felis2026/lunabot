@@ -16,9 +16,6 @@ HONOR_DIFF_SCORE_MAP = {
     4701: ("append", "allPerfect"),
 }
 
-bonds_honor_sd_face_pos_config = Config('sekai.bonds_honor_sd_face_pos')
-
-
 # ======================= 处理逻辑 ======================= #
 
 # 从cuid获取cid
@@ -173,9 +170,10 @@ async def compose_full_honor_image(ctx: SekaiHandlerContext, profile_honor: Dict
 
         c1_img = await ctx.rip.img(f"bonds_honor/character/chr_sd_{cuid1:02d}_01.png")
         c2_img = await ctx.rip.img(f"bonds_honor/character/chr_sd_{cuid2:02d}_01.png")
-        face_pos = bonds_honor_sd_face_pos_config.get_all() or {}
-        c1_face = face_pos.get(cuid1, c1_img.size[0] // 2)
-        c2_face = face_pos.get(cuid2, c2_img.size[0] // 2)
+        # 当前人物素材保留完整画布，旧偏移表与其坐标不匹配。
+        # 主牌和副牌均按画布中心定位，避免人物偏移后被中线裁掉。
+        c1_face = c1_img.size[0] // 2
+        c2_face = c2_img.size[0] // 2
 
         if rev: 
             c1_img, c2_img = c2_img, c1_img
