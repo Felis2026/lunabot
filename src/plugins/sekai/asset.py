@@ -12,12 +12,13 @@ MASTER_DB_CACHE_DIR = f"{SEKAI_ASSET_DIR}/masterdata/"
 # compact 区服的 costume3ds 可能缺少 assetbundleName，
 # 这里使用独立的 sidecar 补丁目录持久化补全结果，不改写上游原始 masterdata 文件。
 MASTER_DB_PATCH_DIR = f"{SEKAI_ASSET_DIR}/masterdata_patch/"
+COSTUME3DS_ASSET_PATCH_VERSION = 2
 DEFAULT_INDEX_KEYS = ['id']
 DEFAULT_SORT_KEYS = []
 
 # 运行期缓存：按区服缓存 costume3ds 资源名补丁，避免重复读取和重复生成。
 _costume3ds_asset_patch_cache: Dict[str, Dict[int, str]] = {}
-_costume3ds_asset_patch_meta: Dict[str, Tuple[str, str]] = {}
+_costume3ds_asset_patch_meta: Dict[str, Tuple[str, str, int]] = {}
 _costume3ds_asset_patch_lock = threading.Lock()
 
 def get_multi_keys(data: dict, keys: List[Any]):
@@ -40,7 +41,7 @@ def get_masterdata_patch_path(region: str, name: str) -> str:
 
 def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
     # 为 compact 区服生成 costume3ds 的资源名补丁：
-    # 仅对本区服缺少 assetbundleName 的条目，尝试用 JP 同 id 的资源名补齐。
+    # 缺失名称沿用 JP 同 id 补全；数字名称按部位转换，并用 JP 实际资源名验证。
     region_path = get_masterdata_cache_path(region, "costume3ds")
     jp_path = get_masterdata_cache_path("jp", "costume3ds")
     if not os.path.exists(region_path):
@@ -53,35 +54,52 @@ def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
     region_costume3ds = load_json(region_path)
     jp_costume3ds = load_json(jp_path)
 
+    # ================================ JP资源名参照 ================================ #
     jp_asset_map: Dict[int, str] = {}
+    jp_asset_names_by_part: set[tuple[str, str]] = set()
     for item in jp_costume3ds:
         asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
         if asset_name:
             jp_asset_map[item["id"]] = asset_name
+            jp_asset_names_by_part.add((asset_name, item.get("partType")))
 
+    # ================================ 缺失与数字资源名补丁 ================================ #
     patch: Dict[int, str] = {}
     missing_count = 0
+    missing_patched_count = 0
+    numeric_count = 0
+    numeric_patched_count = 0
     for item in region_costume3ds:
         asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
-        if asset_name:
-            continue
-        missing_count += 1
-        jp_asset_name = jp_asset_map.get(item["id"])
-        if jp_asset_name:
-            patch[item["id"]] = jp_asset_name
+        if not asset_name:
+            missing_count += 1
+            jp_asset_name = jp_asset_map.get(item["id"])
+            if jp_asset_name:
+                patch[item["id"]] = jp_asset_name
+                missing_patched_count += 1
+        elif isinstance(asset_name, str) and asset_name.isdigit():
+            numeric_count += 1
+            part_type = item.get("partType")
+            candidate = f"cos{asset_name}_{part_type}"
+            # CN 与 JP 的衣装 id、seq 不一定相同；不能靠减固定偏移或 seq 猜对应关系。
+            # 保留编号前导零，仅替换 JP 中确实存在且部位一致的完整资源名。
+            if (candidate, part_type) in jp_asset_names_by_part:
+                patch[item["id"]] = candidate
+                numeric_patched_count += 1
 
     logger.info(
         f"MasterData [{region}.costume3ds] 补丁生成完成: 缺失{missing_count}条, "
-        f"JP补齐{len(patch)}条, 仍缺失{missing_count - len(patch)}条"
+        f"JP补齐{missing_patched_count}条, 仍缺失{missing_count - missing_patched_count}条, "
+        f"数字名称{numeric_count}条, 已验证转换{numeric_patched_count}条"
     )
     return patch
 
 def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
-    # 按区服版本 + JP 版本加载补丁；版本未变化时直接复用缓存，
-    # 版本变化时重新生成并写入 sidecar 文件。
+    # 按区服版本 + JP 版本 + 规则版本加载补丁；规则升级也必须淘汰旧 sidecar，
+    # 否则数据版本不变时会继续命中只补全缺失名称的旧补丁。
     region_version = get_masterdata_cache_version(region, "costume3ds")
     jp_version = get_masterdata_cache_version("jp", "costume3ds")
-    current_meta = (region_version, jp_version)
+    current_meta = (region_version, jp_version, COSTUME3DS_ASSET_PATCH_VERSION)
 
     with _costume3ds_asset_patch_lock:
         if _costume3ds_asset_patch_meta.get(region) == current_meta:
@@ -96,6 +114,7 @@ def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
                 if (
                     patch_data.get("region_version") == region_version
                     and patch_data.get("jp_version") == jp_version
+                    and patch_data.get("patch_version") == COSTUME3DS_ASSET_PATCH_VERSION
                 ):
                     patch = {
                         int(costume3d_id): asset_name
@@ -110,6 +129,7 @@ def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
             dump_json({
                 "region_version": region_version,
                 "jp_version": jp_version,
+                "patch_version": COSTUME3DS_ASSET_PATCH_VERSION,
                 "assetbundle_map": {str(costume3d_id): asset_name for costume3d_id, asset_name in patch.items()},
             }, patch_path, indent=False)
 
@@ -120,9 +140,10 @@ def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
 def make_costume3ds_map_fn(region: str):
     def costume3ds_map_fn(costume3ds: List[Dict[str, Any]]):
         # 第一步：把 compact 数据中的 _assetbundleName 统一归一化到 assetbundleName。
-        # 第二步：对仍然缺失资源名的条目，应用 sidecar 补丁进行补全。
+        # 第二步：对缺失或纯数字资源名，应用已经验证的 sidecar 补丁。
         normalized_count = 0
         missing_count = 0
+        numeric_count = 0
         for item in costume3ds:
             asset_name = item.get("assetbundleName") or item.get("_assetbundleName")
             if asset_name and item.get("assetbundleName") != asset_name:
@@ -130,24 +151,32 @@ def make_costume3ds_map_fn(region: str):
                 normalized_count += 1
             if not item.get("assetbundleName"):
                 missing_count += 1
+            elif isinstance(asset_name, str) and asset_name.isdigit():
+                numeric_count += 1
 
-        if missing_count == 0:
+        if missing_count == 0 and numeric_count == 0:
             return costume3ds
 
         patch = load_costume3ds_assetbundle_patch(region)
         patched_count = 0
+        numeric_patched_count = 0
         for item in costume3ds:
-            if item.get("assetbundleName"):
+            current_name = item.get("assetbundleName")
+            if current_name and not (isinstance(current_name, str) and current_name.isdigit()):
                 continue
             asset_name = patch.get(item["id"])
             if asset_name:
                 item["assetbundleName"] = asset_name
-                patched_count += 1
+                if current_name:
+                    numeric_patched_count += 1
+                else:
+                    patched_count += 1
 
         remaining_count = sum(1 for item in costume3ds if not item.get("assetbundleName"))
         logger.info(
             f"MasterData [{region}.costume3ds] 映射完成: 本地归一化{normalized_count}条, "
-            f"补丁补齐{patched_count}条, 剩余缺失{remaining_count}条"
+            f"补丁补齐{patched_count}条, 数字名称转换{numeric_patched_count}条, "
+            f"剩余缺失{remaining_count}条"
         )
         return costume3ds
 
