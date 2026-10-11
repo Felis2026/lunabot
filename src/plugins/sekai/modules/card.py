@@ -425,7 +425,7 @@ async def compose_card_story_summary_image(
                 with VSplit().set_padding(0).set_sep(4).set_item_align('l').set_content_align('l'):
                     TextBox(f"#{cid} {title}", style1)
                     TextBox(f"{cn_title} - 卡牌故事剧情总结", style1)
-                    TextBox("内容由AI生成，请勿转载到其他地方", style2)
+                    TextBox("内容由AI生成，请勿转载到其他地方", style2.replace(color=(200, 0, 0)))
 
             for i, ep in enumerate(eps, 1):
                 with VSplit().set_padding(16).set_sep(16).set_item_align('lt').set_content_align('lt'):
