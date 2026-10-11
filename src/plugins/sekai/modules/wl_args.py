@@ -7,6 +7,8 @@ from typing import Any, Iterable, Optional, Tuple
 
 MAX_WL_TURN = 99
 DEFAULT_WL_SIMULATION_MAX_TURN = 2
+# 当前固定版本内核将第三轮以后的真实活动也判为 WL3，不能据此放行 WL4。
+MAX_SUPPORTED_FINALE_TURN = 3
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,7 @@ def build_world_bloom_turn_index(
             isinstance(character_id, int)
             and character_id > 0
             and event_id in event_by_id
+            and chapter.get("worldBloomChapterType") != "finale"
         ):
             event_ids_by_character[character_id].add(event_id)
 
@@ -175,6 +178,72 @@ def collect_world_bloom_turn_events(
             event.get("id", 10**9),
         ),
     )
+
+
+# ================================ 终章识别与轮次 ================================ #
+
+def is_world_bloom_finale(
+    event_id: int | None,
+    chapters: Iterable[dict[str, Any]],
+) -> bool:
+    """按真实章节类型识别终章，不依赖活动号或活动名称。"""
+
+    return any(
+        chapter.get("eventId") == event_id
+        and chapter.get("worldBloomChapterType") == "finale"
+        for chapter in chapters
+    )
+
+
+def get_world_bloom_finale_turn(
+    events: Iterable[dict[str, Any]],
+    chapters: Iterable[dict[str, Any]],
+    event_id: int,
+) -> int:
+    """按终章开始前的角色 WL 时间线定位轮次；缺少依据时不猜测。"""
+
+    event_rows, chapter_rows = list(events), list(chapters)
+    if not is_world_bloom_finale(event_id, chapter_rows):
+        raise ValueError(f"活动 {event_id} 不是 WL 终章")
+    finale = next((event for event in event_rows if event.get("id") == event_id), None)
+    start_at = finale.get("startAt") if finale else None
+    if not isinstance(start_at, (int, float)):
+        raise ValueError(f"活动 {event_id} 缺少终章开始时间，无法确定 WL 轮次")
+    preceding = [
+        event for event in event_rows
+        if isinstance(event.get("startAt"), (int, float))
+        and event["startAt"] < start_at
+    ]
+    timelines = build_world_bloom_turn_index(preceding, chapter_rows)
+    # WL3 改为混合角色分组，不能再按所属团或终章出现次数推断轮次。
+    turn = max((len(timeline) for timeline in timelines.values()), default=0)
+    if turn == 0:
+        raise ValueError(f"活动 {event_id} 缺少此前的角色 WL 数据，无法确定轮次")
+    return turn
+
+
+def select_world_bloom_finale(
+    events: Iterable[dict[str, Any]],
+    chapters: Iterable[dict[str, Any]],
+    *,
+    turn: int | None = None,
+) -> dict[str, Any]:
+    """定位指定轮次或当前区服最新的已发布终章，供正式组卡与预览共用。"""
+
+    event_rows, chapter_rows = list(events), list(chapters)
+    candidates = [
+        event for event in event_rows
+        if is_world_bloom_finale(event.get("id"), chapter_rows)
+        and (turn is None or get_world_bloom_finale_turn(event_rows, chapter_rows, event["id"]) == turn)
+    ]
+    if turn is None:
+        if not candidates:
+            raise ValueError("当前服务器尚无可用的 WL 终章活动")
+        # 按当前区服的活动时间线取最新，不借用 JP 数据，也不假定活动号连续。
+        return max(candidates, key=lambda event: (event.get("startAt", 0), event["id"]))
+    if len(candidates) != 1:
+        raise ValueError(f"找不到唯一的第{turn}次 WL 终章活动")
+    return candidates[0]
 
 
 # ================================ WL 章节选择 ================================ #

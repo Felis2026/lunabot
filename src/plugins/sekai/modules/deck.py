@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from ...utils import *
 from ..common import *
 from ..handler import *
@@ -67,9 +69,13 @@ from .wl_args import (
     extract_wl_role_selector,
     extract_wl_turn_selector,
     get_wl_simulation_max_turn,
+    MAX_SUPPORTED_FINALE_TURN,
+    get_world_bloom_finale_turn,
+    is_world_bloom_finale,
     normalize_wl_args,
     remove_matched_text,
     select_world_bloom_turn,
+    select_world_bloom_finale,
 )
 from sekai_deck_recommend_cpp import (
     DeckRecommendOptions, 
@@ -288,25 +294,16 @@ def format_hhmm_short(total_hours: float) -> str:
 
 # ================================ 终章目标角色与牌子模拟 ================================ #
 
-FINAL_CHAPTER_HONOR_UNIT_NAME_MAP = {
-    "light_sound": "lightsound",
-    "idol": "idol",
-    "street": "street",
-    "theme_park": "themepark",
-    "school_refusal": "schoolrefusal",
-    "piapro": "piapro",
-}
-
-
 async def normalize_final_chapter_max_profile_honors(
     ctx: SekaiHandlerContext,
     profile: dict,
+    event_id: int = 180,
 ) -> None:
     """将顶配档案中互斥的终章排名称号收敛为每个角色一枚。"""
 
     bonus_rows = await ctx.md.event_honor_bonuses.find_by(
         "eventId",
-        180,
+        event_id,
         mode="all",
     )
     if not bonus_rows:
@@ -354,7 +351,7 @@ async def get_final_chapter_target_cid(
     终章的特殊加成和支援队在 cpp 里都与“队长角色”绑定，
     因此 Python 侧需要尽量把用户的“想冲某个角色”转换成确定目标。
     """
-    if options.event_id != 180:
+    if not await is_final_chapter_event(ctx, options.event_id):
         return None
 
     if options.world_bloom_character_id:
@@ -383,7 +380,7 @@ async def apply_final_chapter_target_character(
     把终章目标角色固化为固定队长角色，以贴合 cpp 的终章规则。
     """
     target_cid = await get_final_chapter_target_cid(ctx, options, use_current_deck)
-    if options.event_id != 180 or target_cid is None:
+    if not await is_final_chapter_event(ctx, options.event_id) or target_cid is None:
         return target_cid
 
     if options.fixed_characters:
@@ -414,36 +411,12 @@ async def apply_final_chapter_target_character(
     return target_cid
 
 
-async def get_final_chapter_wl2_chapter_no(
-    ctx: SekaiHandlerContext,
-    cid: int,
-) -> Optional[int]:
-    """
-    获取目标角色在第二轮 WL 中对应的章节号，用于模拟终章牌子。
-    """
-    unit = get_unit_by_chara_id(cid)
-    if not unit:
-        return None
+async def is_final_chapter_event(ctx: SekaiHandlerContext, event_id: Optional[int]) -> bool:
+    """共用真实终章识别；180 保留原有缺活动数据时的兼容入口。"""
 
-    if unit == "piapro":
-        event = await ctx.md.events.find_by_id(179)
-        if not event:
-            return None
-        chapters = await get_wl_events(ctx, event['id'])
-    else:
-        unit_events = [
-            event for event in await ctx.md.events.get()
-            if event.get('eventType') == 'world_bloom' and event.get('unit') == unit
-        ]
-        unit_events.sort(key=lambda x: x['startAt'])
-        if len(unit_events) < 2:
-            return None
-        chapters = await get_wl_events(ctx, unit_events[1]['id'])
-
-    for chapter in chapters:
-        if chapter.get('wl_cid') == cid:
-            return chapter.get('id', 0) // 1000
-    return None
+    if event_id is None:
+        return False
+    return event_id == 180 or is_world_bloom_finale(event_id, await ctx.md.world_blooms.get())
 
 
 async def apply_final_chapter_badge_simulation(
@@ -451,9 +424,10 @@ async def apply_final_chapter_badge_simulation(
     profile: dict,
     target_cid: Optional[int],
     enabled: bool,
+    event_id: int = 180,
 ) -> None:
     """
-    通过临时注入一枚 WL2 高阶 honor，模拟终章牌子加成。
+    按目标终章的称号映射临时补入一枚 TOP1000，不跨 WL 轮次套牌。
     """
     if not enabled or target_cid is None:
         return
@@ -465,7 +439,7 @@ async def apply_final_chapter_badge_simulation(
     }
     final_chapter_honor_rows = await ctx.md.event_honor_bonuses.find_by(
         "eventId",
-        180,
+        event_id,
         mode="all",
     )
     if any(
@@ -475,29 +449,17 @@ async def apply_final_chapter_badge_simulation(
     ):
         return
 
-    chapter_no = await get_final_chapter_wl2_chapter_no(ctx, target_cid)
-    assert_and_reply(chapter_no is not None, "找不到该角色在 WL2 中对应的章节，无法模拟终章牌子")
-
-    unit = get_unit_by_chara_id(target_cid)
-    unit_name = FINAL_CHAPTER_HONOR_UNIT_NAME_MAP.get(unit)
-    assert_and_reply(unit_name is not None, "无法识别该角色对应的终章牌子类型")
-
-    honors = await ctx.md.honors.get()
-    asset_name = f"honor_top_001000_event_wl_2nd_{unit_name}_cp{chapter_no}"
-    honor = find_by_predicate(
-        honors,
-        lambda x: x.get('assetbundleName') == asset_name and x.get('honorRarity') in ('high', 'highest'),
-    )
-    if honor is None:
-        honor = find_by_predicate(
-            honors,
-            lambda x: (
-                isinstance(x.get('assetbundleName'), str)
-                and x['assetbundleName'].endswith(f"event_wl_2nd_{unit_name}_cp{chapter_no}")
-                and x.get('honorRarity') in ('high', 'highest')
-            ),
-        )
-    assert_and_reply(honor is not None, "找不到可用于模拟的终章牌子 honor")
+    eligible_ids = {
+        row.get("honorId") for row in final_chapter_honor_rows
+        if row.get("leaderGameCharacterId") == target_cid
+    }
+    # WL3 使用 part 分组，不再按所属团拼资产名；以后轮次也只认该活动的映射。
+    honor = next((
+        item for item in await ctx.md.honors.get()
+        if item.get("id") in eligible_ids
+        and str(item.get("assetbundleName", "")).startswith("honor_top_001000_")
+    ), None)
+    assert_and_reply(honor is not None, "找不到该终章目标角色对应的 TOP1000 牌子，无法模拟")
 
     user_honors = profile.setdefault('userHonors', [])
     if find_by(user_honors, 'honorId', honor['id']):
@@ -573,11 +535,34 @@ async def extract_target_event(
     
     forced_event_id = None
 
-    # 总是替换终章
-    for keyword in ('终章', ):
-        if keyword in args:
-            forced_event_id = 180
-            args = args.replace(keyword, " event180 " if match_full else " 180 ").strip()
+    # 指定轮次时按真实数据定位；单独“终章”取当前查询区服最新的终章。
+    if "终章" in args:
+        explicit_id, _ = extract_explicit_event_id(args, match_type=match_type, leading_simple_only=True)
+        if selector := extract_wl_turn_selector(args):
+            assert_and_reply(not selector.force_simulated, "终章只支持已发布的真实活动规则，不能使用“模拟WL”")
+            assert_and_reply(explicit_id is None, "不能同时指定活动ID和终章轮次")
+            try:
+                finale = select_world_bloom_finale(
+                    await ctx.md.events.get(), await ctx.md.world_blooms.get(), turn=selector.turn,
+                )
+            except ValueError as exc:
+                raise ReplyException(str(exc)) from exc
+            forced_event_id = finale["id"]
+            args = remove_matched_text(args, selector.matched_text)
+        else:
+            if explicit_id is not None:
+                forced_event_id = explicit_id
+            else:
+                try:
+                    finale = select_world_bloom_finale(
+                        await ctx.md.events.get(), await ctx.md.world_blooms.get(),
+                    )
+                except ValueError as exc:
+                    raise ReplyException(str(exc)) from exc
+                forced_event_id = finale["id"]
+        args = remove_matched_text(args, "终章")
+        if explicit_id is None:
+            args = normalize_wl_args(f"{'event' if match_full else ''}{forced_event_id} {args}")
 
     # 解析成功后需要移除的文本
     event_matched_texts: list[str] = []
@@ -657,7 +642,8 @@ async def extract_target_event(
 
     # 获取WL章节
     wl_cid = None
-    wl_events = await get_wl_events(ctx, event['id']) if event_id != 180 else []
+    final_chapter = await is_final_chapter_event(ctx, event['id'])
+    wl_events = await get_wl_events(ctx, event['id']) if not final_chapter else []
     if wl_events:
         if not chapter_id and not chapter_nickname:
             # 获取默认章节
@@ -700,7 +686,7 @@ async def extract_target_event(
         wl_cid = chapter['wl_cid']
 
     else:
-        if event_id == 180 and chapter_nickname:
+        if final_chapter and chapter_nickname:
             # 终章不把昵称解释成“WL章节”，而是作为想冲的目标角色继续向下传递。
             wl_cid = get_cid_by_nickname(chapter_nickname)
             assert_and_reply_or_return(wl_cid, f"无法识别终章目标角色 {chapter_nickname}")
@@ -756,9 +742,43 @@ async def extract_preview_target_event(
     event_id, event_matched_text = extract_explicit_event_id(
         args,
         match_type=match_type,
+        leading_simple_only="终章" in args,
     )
     turn_selector = extract_wl_turn_selector(args)
     jp_ctx = SekaiHandlerContext.from_region("jp")
+    if "终章" in args:
+        if turn_selector:
+            assert_and_reply(not turn_selector.force_simulated, "终章只支持已发布的真实活动规则，不能使用“模拟WL”")
+            assert_and_reply(event_id is None, "不能同时指定活动ID和终章轮次")
+            # CN 优先，未来轮次才由 JP 定位，后续仍执行原有正式切回检查。
+            try:
+                finale = select_world_bloom_finale(
+                    await ctx.md.events.get(), await ctx.md.world_blooms.get(), turn=turn_selector.turn,
+                )
+            except ValueError:
+                try:
+                    finale = select_world_bloom_finale(
+                        await jp_ctx.md.events.get(), await jp_ctx.md.world_blooms.get(), turn=turn_selector.turn,
+                    )
+                except ValueError as exc:
+                    raise ReplyException(str(exc)) from exc
+            event_id = finale["id"]
+            args = remove_matched_text(args, turn_selector.matched_text)
+            turn_selector = None
+        else:
+            if event_id is None:
+                # 未指定轮次时仍以 CN 最新终章为目标，预览参数不能偷偷切成 JP 最新。
+                try:
+                    finale = select_world_bloom_finale(
+                        await ctx.md.events.get(), await ctx.md.world_blooms.get(),
+                    )
+                except ValueError as exc:
+                    raise ReplyException(str(exc)) from exc
+                event_id = finale["id"]
+        args = remove_matched_text(args, "终章")
+        if event_matched_text is None:
+            event_matched_text = f"event{event_id}"
+            args = normalize_wl_args(f"{event_matched_text} {args}")
     selected_role_nickname: str | None = None
     selected_role_cid: int | None = None
     rule_event: dict | None = None
@@ -912,6 +932,8 @@ async def extract_preview_target_event(
     wl_cid = None
     chapter_arg = None
     role_arg = None
+    finale = False
+    finale_turn = None
     if event_type == "world_bloom":
         chapters = [
             chapter
@@ -936,15 +958,26 @@ async def extract_preview_target_event(
             not (chapter_no and selected_role_cid),
             "不能同时指定 WL 章节号和角色章节",
         )
-        try:
-            chapter = choose_world_bloom_chapter(
-                chapters,
-                chapter_no=chapter_no,
-                character_id=selected_role_cid,
-            )
-        except ValueError as exc:
-            raise ReplyException(str(exc)) from exc
-        wl_cid = chapter["gameCharacterId"]
+        finale = is_world_bloom_finale(event_id, chapters)
+        if finale:
+            assert_and_reply(chapter_no is None, "终章不区分角色章节，请直接指定目标角色")
+            try:
+                finale_turn = get_world_bloom_finale_turn(
+                    await jp_ctx.md.events.get(), await jp_ctx.md.world_blooms.get(), event_id,
+                )
+            except ValueError as exc:
+                raise ReplyException(str(exc)) from exc
+            wl_cid = selected_role_cid
+        else:
+            try:
+                chapter = choose_world_bloom_chapter(
+                    chapters,
+                    chapter_no=chapter_no,
+                    character_id=selected_role_cid,
+                )
+            except ValueError as exc:
+                raise ReplyException(str(exc)) from exc
+            wl_cid = chapter["gameCharacterId"]
     else:
         chapter_no, chapter_arg = extract_wl_chapter_selector(args)
         role_nickname, role_arg = extract_wl_role_selector(
@@ -973,6 +1006,8 @@ async def extract_preview_target_event(
         episode_optional_future_card_ids=frozenset(
             preview_manager.episode_optional_future_card_ids()
         ),
+        is_finale=finale,
+        world_bloom_turn=finale_turn,
     )
     return args, resolution, True
 
@@ -988,18 +1023,11 @@ async def extract_target_event_or_simulate_event(
     # ================================ 终章目标角色直通 ================================ #
     # 终章和普通 WL 不同，角色名表示“想冲的目标角色”，不是章节昵称。
     # 这里直接在上层消化掉这层语义，避免落到普通 WL 章节解析里。
-    final_keyword_text = None
-    for keyword in ("终章", "活动180", "event180"):
-        if keyword in args:
-            final_keyword_text = keyword
-            break
-    if final_keyword_text:
-        for nickname, cid in get_character_nickname_data().nickname_ids:
-            if nickname in args:
-                args = args.replace(final_keyword_text, "", 1).replace(nickname, "", 1).strip()
-                options.event_id = 180
-                options.world_bloom_character_id = cid
-                return args
+    if "终章" in args:
+        event, cid, args = await extract_target_event(ctx, args, "all", True, True)
+        options.event_id = event["id"]
+        options.world_bloom_character_id = cid
+        return args
 
     # ================================ WL活动轮次 ================================ #
     # 真实轮次完全按 worldBlooms 中是否包含目标角色动态定位，VS 也不再依赖
@@ -2221,9 +2249,22 @@ async def compose_deck_recommend_image(
 
     NO_MUSIC_TYPES = ["bonus", "wl_bonus", "mysekai"]
 
-    is_wl = options.world_bloom_character_id or options.event_id == 180
     is_preview = preview_resolution is not None
     jp_ctx = SekaiHandlerContext.from_region('jp')
+    rule_ctx = jp_ctx if is_preview else ctx
+    is_finale = preview_resolution.is_finale if is_preview else await is_final_chapter_event(rule_ctx, options.event_id)
+    is_wl = bool(options.world_bloom_character_id or is_finale)
+    if is_finale and options.event_id != 180:
+        try:
+            finale_turn = (preview_resolution.world_bloom_turn if is_preview else None) or get_world_bloom_finale_turn(
+                await rule_ctx.md.events.get(), await rule_ctx.md.world_blooms.get(), options.event_id,
+            )
+        except ValueError as exc:
+            raise ReplyException(str(exc)) from exc
+        assert_and_reply(
+            finale_turn <= MAX_SUPPORTED_FINALE_TURN,
+            f"当前原生组卡库尚不支持 WL{finale_turn} 终章",
+        )
 
     if options.live_type == "mysekai":
         recommend_type = "mysekai"
@@ -2311,6 +2352,9 @@ async def compose_deck_recommend_image(
             )
             uid = profile['userGamedata']['userId']
 
+    # 假设卡与牌子只改本次请求，不能污染抓包缓存或其他并发组卡的档案。
+    if is_preview or is_finale:
+        profile = deepcopy(profile)
     original_usercards = profile['userCards']
     assumed_cards_context: AssumedCardsContext | None = None
     assumed_usercards_by_id: dict[int, dict] = {}
@@ -2449,13 +2493,13 @@ async def compose_deck_recommend_image(
 
     # ================================ 终章目标与牌子模拟 ================================ #
     # 终章的支援和额外加成都跟队长角色绑定，因此要先把目标角色固化，再决定后续裁卡池策略。
-    final_chapter_target_cid = await apply_final_chapter_target_character(ctx, options, use_current_deck)
+    final_chapter_target_cid = await apply_final_chapter_target_character(rule_ctx, options, use_current_deck)
 
-    if options.event_id == 180 and (use_max_profile or use_sub_max_profile):
-        await normalize_final_chapter_max_profile_honors(ctx, profile)
+    if is_finale and (use_max_profile or use_sub_max_profile):
+        await normalize_final_chapter_max_profile_honors(rule_ctx, profile, options.event_id)
 
     assert_and_reply(
-        not additional.get('final_chapter_badge_sim', False) or options.event_id == 180,
+        not additional.get('final_chapter_badge_sim', False) or is_finale,
         "“tk牌”仅支持终章活动组卡使用",
     )
     assert_and_reply(
@@ -2464,14 +2508,15 @@ async def compose_deck_recommend_image(
     )
 
     await apply_final_chapter_badge_simulation(
-        ctx,
+        rule_ctx,
         profile,
         final_chapter_target_cid,
         bool(additional.get('final_chapter_badge_sim', False)),
+        options.event_id,
     )
 
     # ================================ 终章下发参数纠偏 ================================ #
-    # event180 在 MasterData 里只有 finale 章节，没有“按角色拆开的 worldBloom chapter”。
+    # 终章在 MasterData 里只有 finale 章节，没有“按角色拆开的 worldBloom chapter”。
     # 因此这里不能再把目标角色继续塞进 world_bloom_character_id 下发给后端，
     # 否则服务端会误走“按章节找角色”的分支并直接报 chapter not found。
     #
@@ -2479,11 +2524,11 @@ async def compose_deck_recommend_image(
     # 1. 固定卡牌时，第一张固定卡就是队长；
     # 2. 只指定角色时，前面已经转成 fixed_characters 约束；
     # 3. tk牌则通过临时注入 honor 来模拟，不需要额外 chapter 参数。
-    if options.event_id == 180:
+    if is_finale:
         options.world_bloom_character_id = None
 
     # 终章指定固定卡牌时，需要保证“第一张固定卡就是队长角色”，因此直接走 DFS。
-    if options.event_id == 180 and options.fixed_cards:
+    if is_finale and options.fixed_cards:
         options.algorithm = "dfs"
 
     # 如果卡组完全固定则只需要跑一种算法；但 WL / 终章仍然需要整份卡池来计算支援加成，
@@ -2812,7 +2857,7 @@ async def compose_deck_recommend_image(
 
     # 获取WL角色名字和头像
     wl_chara_name = None
-    wl_display_cid = final_chapter_target_cid if event_id == 180 else options.world_bloom_character_id
+    wl_display_cid = final_chapter_target_cid if is_finale else options.world_bloom_character_id
     if wl_display_cid:
         wl_chara = await ctx.md.game_characters.find_by_id(wl_display_cid)
         if wl_chara:
@@ -2994,7 +3039,7 @@ async def compose_deck_recommend_image(
                             ImageBox(chara_icon, size=(None, 50))
                             TextBox(f"{chara_name}", TextStyle(font=DEFAULT_BOLD_FONT, size=30, color=(70, 70, 70)))
                         if wl_chara_name:
-                            wl_desc = "目标" if event_id == 180 else "章节"
+                            wl_desc = "目标" if is_finale else "章节"
                             ImageBox(wl_chara_icon, size=(None, 50))
                             TextBox(f"{wl_chara_name} {wl_desc}", TextStyle(font=DEFAULT_BOLD_FONT, size=30, color=(70, 70, 70)))
                         if unit_logo and attr_icon:
@@ -3645,11 +3690,36 @@ async def _validate_cn_event_rules_for_cutover(
         ]
         if not chapters:
             return False
+        finale = is_world_bloom_finale(event_id, chapters)
+        if finale:
+            if len(chapters) != 1 or chapters[0].get('worldBloomChapterType') != 'finale':
+                return False
+            try:
+                turn = get_world_bloom_finale_turn(
+                    await ctx.md.events.get(), await ctx.md.world_blooms.get(), event_id,
+                )
+            except ValueError:
+                return False
+            if turn > MAX_SUPPORTED_FINALE_TURN:
+                return False
+            # 新终章不能只凭活动行切回，技能上限与对应轮次的牌子必须同时落地。
+            honor_rows = await ctx.md.event_honor_bonuses.find_by('eventId', event_id, mode='all')
+            skill_limits = await ctx.md.event_skill_score_up_limits.find_by('eventId', event_id, mode='all')
+            fixture_limits = await ctx.md.event_mysekai_fixture_game_character_performance_bonus_limits.find_by(
+                'eventId', event_id, mode='all',
+            )
+            # WL2 的旧终章没有技能上限行，继续保留内核已有的旧规则回退。
+            valid_skill_limits = len(skill_limits) == 1 or (event_id == 180 and not skill_limits)
+            if not honor_rows or not valid_skill_limits or len(fixture_limits) != 1:
+                return False
+            honor_ids = {honor['id'] for honor in await ctx.md.honors.get()}
+            if any(row.get('honorId') not in honor_ids for row in honor_rows):
+                return False
         character_ids = {
             character["id"]
             for character in await ctx.md.game_characters.get()
         }
-        chapter_keys: set[tuple[int, int]] = set()
+        chapter_keys: set[tuple[int, int | None]] = set()
         for chapter in chapters:
             chapter_no = chapter.get("chapterNo")
             character_id = chapter.get("gameCharacterId")
@@ -3657,7 +3727,7 @@ async def _validate_cn_event_rules_for_cutover(
             if (
                 not isinstance(chapter_no, int)
                 or chapter_no <= 0
-                or character_id not in character_ids
+                or (not finale and character_id not in character_ids)
                 or chapter_key in chapter_keys
             ):
                 return False

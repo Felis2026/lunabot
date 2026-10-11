@@ -48,6 +48,8 @@ class PreviewEventResolution:
     scope_fingerprint: str = ""
     future_card_ids: frozenset[int] = frozenset()
     episode_optional_future_card_ids: frozenset[int] = frozenset()
+    is_finale: bool = False
+    world_bloom_turn: int | None = None
 
 
 @dataclass

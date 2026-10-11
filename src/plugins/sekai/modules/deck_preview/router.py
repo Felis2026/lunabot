@@ -35,6 +35,7 @@ def extract_explicit_event_id(
     args: str,
     *,
     match_type: str,
+    leading_simple_only: bool = False,
 ) -> tuple[Optional[int], Optional[str]]:
     """只定位显式活动参数，不把歌曲ID或其他数值误当成 fallback 目标。"""
 
@@ -43,7 +44,9 @@ def extract_explicit_event_id(
         if match:
             return int(match.group(1)), match.group(0)
     if match_type in {"simple", "all"}:
-        match = re.search(r"(?<!\S)(\d{1,3})(?!\S)", args)
+        # “终章 74”中的数字可能是歌曲；终章入口只把首参数裸数字当作活动。
+        pattern = r"^\s*(\d{1,3})(?!\S)" if leading_simple_only else r"(?<!\S)(\d{1,3})(?!\S)"
+        match = re.search(pattern, args)
         if match:
             return int(match.group(1)), match.group(0)
     return None, None

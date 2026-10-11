@@ -20,13 +20,32 @@ from src.services.deck_recommender.masterdata_spec import (
 )
 
 from .protocol import PREVIEW_DATA_SCOPE, PREVIEW_NATIVE_REGION
+try:
+    from ..wl_args import (
+        MAX_SUPPORTED_FINALE_TURN,
+        get_world_bloom_finale_turn,
+        is_world_bloom_finale,
+    )
+except ImportError:
+    # 独立 builder 使用 deck_preview 包加载，与 Bot 内的包层级不同。
+    from wl_args import (
+        MAX_SUPPORTED_FINALE_TURN,
+        get_world_bloom_finale_turn,
+        is_world_bloom_finale,
+    )
 
 
 MANIFEST_SCHEMA_VERSION = 1
-BUILDER_VERSION = 3
+BUILDER_VERSION = 4
 SUPPORTED_EVENT_TYPES = frozenset({"marathon", "world_bloom"})
 JP_GLOBAL_OVERRIDE_FILE = "worldBloomSupportDeckBonuses.json"
 EPISODE_OPTIONAL_CARD_SUPPLY_TYPES = frozenset({"collaboration_limited"})
+FINALE_RULE_FILES = (
+    "eventCardBonusLimits.json",
+    "eventHonorBonuses.json",
+    "eventMysekaiFixtureGameCharacterPerformanceBonusLimits.json",
+    "eventSkillScoreUpLimits.json",
+)
 
 
 class RulesetBuildError(RuntimeError):
@@ -533,18 +552,52 @@ def _validate_event_rules(
     ]
     if not chapters:
         raise RulesetBuildError(f"WL {event_id} 缺少章节")
-    chapter_keys: set[tuple[int, int]] = set()
+    finale = is_world_bloom_finale(event_id, chapters)
+    if finale:
+        # 终章没有角色章节；只开放有真实轮次依据且内核已支持的规则。
+        if len(chapters) != 1 or chapters[0].get("worldBloomChapterType") != "finale":
+            raise RulesetBuildError(f"WL {event_id} 终章与角色章节混合")
+        try:
+            turn = get_world_bloom_finale_turn(jp["events.json"], jp["worldBlooms.json"], event_id)
+        except ValueError as exc:
+            raise RulesetBuildError(str(exc)) from exc
+        if turn > MAX_SUPPORTED_FINALE_TURN:
+            raise RulesetBuildError(f"当前原生组卡库尚不支持 WL{turn} 终章")
+    chapter_keys: set[tuple[int, int | None]] = set()
     character_ids = _ids(cn["gameCharacters.json"])
     for chapter in chapters:
         chapter_key = (chapter.get("chapterNo"), chapter.get("gameCharacterId"))
         if (
-            not all(isinstance(value, int) and value > 0 for value in chapter_key)
+            not isinstance(chapter_key[0], int) or chapter_key[0] <= 0
+            or (not finale and (not isinstance(chapter_key[1], int) or chapter_key[1] <= 0))
             or chapter_key in chapter_keys
         ):
             raise RulesetBuildError(f"WL {event_id} 章节号或角色不唯一")
-        if chapter["gameCharacterId"] not in character_ids:
+        if not finale and chapter["gameCharacterId"] not in character_ids:
             raise RulesetBuildError(f"WL {event_id} 章节引用未知角色")
         chapter_keys.add(chapter_key)
+
+    if finale:
+        # cardBonusLimits 无行时由内核按轮次使用默认值，不能伪造旧终章的四卡上限。
+        for filename, rate_field in (
+            ("eventSkillScoreUpLimits.json", "scoreUpRateLimit"),
+            ("eventMysekaiFixtureGameCharacterPerformanceBonusLimits.json", "bonusRateLimit"),
+        ):
+            rows = [row for row in jp.get(filename, []) if row.get("eventId") == event_id]
+            if len(rows) != 1:
+                raise RulesetBuildError(f"WL {event_id} 缺少唯一的 {filename}")
+            _validate_rate(rows[0].get(rate_field), f"WL {event_id} {rate_field}")
+        honor_rows = [
+            row for row in jp.get("eventHonorBonuses.json", [])
+            if row.get("eventId") == event_id
+        ]
+        if not honor_rows:
+            raise RulesetBuildError(f"WL {event_id} 缺少终章称号加成")
+        honor_ids = _ids(cn["honors.json"]) | _ids(jp["honors.json"])
+        for row in honor_rows:
+            if row.get("honorId") not in honor_ids or row.get("leaderGameCharacterId") not in character_ids:
+                raise RulesetBuildError(f"WL {event_id} 终章称号引用不完整")
+            _validate_rate(row.get("bonusRate"), f"WL {event_id} 称号 bonusRate")
 
     limited = [
         item
@@ -693,6 +746,30 @@ def build_ruleset_contents(
             f"jp/{JP_GLOBAL_OVERRIDE_FILE}"
         ]
 
+    # ================================ 终章专属规则与称号 ================================ #
+    # 只追加本次接受的未来终章，不替换 CN 正式规则，也不把整份 JP 称号库带入。
+    finale_ids = {
+        event_id for event_id in wl_ids
+        if is_world_bloom_finale(event_id, jp["worldBlooms.json"])
+    }
+    for filename in FINALE_RULE_FILES:
+        if filename in expected_set:
+            changed[filename] = _append_without_id_conflict(
+                cn[filename],
+                (row for row in jp[filename] if row.get("eventId") in finale_ids),
+                filename.removesuffix(".json"),
+            )
+    required_honor_ids = {
+        row["honorId"] for row in jp.get("eventHonorBonuses.json", [])
+        if row.get("eventId") in finale_ids
+    } - _ids(cn["honors.json"])
+    if required_honor_ids:
+        changed["honors.json"] = _append_without_id_conflict(
+            cn["honors.json"],
+            (honor for honor in jp["honors.json"] if honor.get("id") in required_honor_ids),
+            "honors",
+        )
+
     for filename, value in changed.items():
         outputs[filename] = _canonical_json_bytes(value)
 
@@ -717,7 +794,8 @@ def build_ruleset_contents(
             str(event_id): [
                 {
                     "chapter_no": item["chapterNo"],
-                    "game_character_id": item["gameCharacterId"],
+                    "game_character_id": item.get("gameCharacterId"),
+                    "chapter_type": item.get("worldBloomChapterType"),
                 }
                 for item in sorted(
                     (
@@ -727,7 +805,7 @@ def build_ruleset_contents(
                     ),
                     key=lambda chapter: (
                         chapter["chapterNo"],
-                        chapter["gameCharacterId"],
+                        chapter.get("gameCharacterId") or 0,
                     ),
                 )
             ]
@@ -1059,12 +1137,14 @@ def run_official_native_canaries(
                 chapters = [
                     {
                         "chapter_no": chapter["chapterNo"],
-                        "game_character_id": chapter["gameCharacterId"],
+                        "game_character_id": chapter.get("gameCharacterId"),
+                        "chapter_type": chapter.get("worldBloomChapterType"),
                     }
                     for chapter in world_blooms
                     if chapter.get("eventId") == event_id
                     and isinstance(chapter.get("chapterNo"), int)
-                    and isinstance(chapter.get("gameCharacterId"), int)
+                    and (isinstance(chapter.get("gameCharacterId"), int)
+                         or chapter.get("worldBloomChapterType") == "finale")
                 ]
                 if not chapters:
                     raise RulesetBuildError("CN 快照中的 WL 活动缺少章节")
