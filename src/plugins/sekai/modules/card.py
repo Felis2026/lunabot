@@ -1,3 +1,6 @@
+from PIL import ImageDraw
+from zoneinfo import ZoneInfo
+
 from ...utils import *
 from ...llm import translate_text, ChatSession, get_model_preset, ChatSessionResponse
 from ..common import *
@@ -573,107 +576,267 @@ async def get_card_story_summary(ctx: SekaiHandlerContext, card: dict, refresh: 
         eps, summary,
     )
 
-# 合成卡牌一览图片
-async def compose_box_image(ctx: SekaiHandlerContext, qid: int, cards: dict, show_id: bool, show_box: bool, use_after_training=True):
-    pcards = []
-    if qid:
-        profile, pmsg = await get_detailed_profile(ctx, qid, filter=get_detailed_profile_card_filter('userCards'), raise_exc=show_box)
-        if profile:
-            pcards = profile['userCards']
-        
-    # collect card imgs
-    async def get_card_full_thumbnail_nothrow(card):
-        if pcard := find_by(pcards, 'cardId', card['id']):
-            return await get_card_full_thumbnail(ctx, card, pcard=pcard)
+# ================================ 卡库分组与收集进度 ================================ #
+
+def _extract_box_view_args(args: str) -> tuple[str, bool, str]:
+    """先提取独立显示参数，避免与原角色、属性、稀有度筛选互相误识别。"""
+    remaining, layouts = [], set()
+    show_unowned = False
+    for token in args.split():
+        keyword = token.lower()
+        if keyword in {'缺卡', '未拥有', '未持有', 'unowned'}:
+            show_unowned = True
+        elif keyword in {'属性', '属性分组', 'attr'}:
+            layouts.add('attribute')
+        elif keyword in {'时间', '获取时间', 'time'}:
+            layouts.add('time')
         else:
-            after_training = has_after_training(card) and use_after_training
-            if only_has_after_training(card):
-                after_training = True
-            return await get_card_full_thumbnail(ctx, card, after_training)
-    card_imgs = await batch_gather(*[get_card_full_thumbnail_nothrow(card) for card in cards])
+            remaining.append(token)
+    assert_and_reply(len(layouts) <= 1, '属性分组与获取时间不能同时使用')
+    layout = next(iter(layouts), 'character')
+    assert_and_reply(not (show_unowned and layout == 'time'), '缺卡不能与获取时间同时使用')
+    return ' '.join(remaining), show_unowned, layout
 
-    # collect chara cards
-    chara_cards = {}
-    for card, img in zip(cards, card_imgs):
-        if not img: continue
-        chara_id = card['characterId']
-        if chara_id not in chara_cards:
-            chara_cards[chara_id] = []
-        card['img'] = img
-        card['has'] = find_by(pcards, 'cardId', card['id']) is not None
-        if show_box and not card['has']:
-            continue
-        chara_cards[chara_id].append(card)
 
-    # sort by chara id and rarity
-    chara_cards = list(chara_cards.items())
-    chara_cards.sort(key=lambda x: x[0])
-    for i in range(len(chara_cards)):
-        chara_cards[i][1].sort(key=lambda x: (x['cardRarityType'], x['releaseAt'], x['id']))
+def _group_box_cards(cards: list[dict]) -> list[tuple[int, list[dict]]]:
+    """按角色和原卡牌顺序分组，不修改 MasterData 中的记录。"""
+    groups = {}
+    for card in cards:
+        groups.setdefault(card['characterId'], []).append(card)
+    return sorted((chara_id, sorted(values, key=lambda card: (card['cardRarityType'], card['releaseAt'], card['id'])))
+                  for chara_id, values in groups.items())
 
-    # 计算最佳高度限制
-    max_card_num = max([len(cards) for _, cards in chara_cards]) if chara_cards else 0
-    best_height, best_value = 10000, 1e9
-    for i in range(1, max_card_num + 1):
-        # 计算优化目标：max(h,w)越小越好，空白越少越好
-        max_height = 0
-        total_width = 0
-        for _, cards in chara_cards:
-            max_height = max(max_height, min(len(cards), i))
-        total, space = 0, 0
-        for _, cards in chara_cards:
-            width = math.ceil(len(cards) / i)
-            total_width += width
-            total += max_height * width
-            space += max_height * width - len(cards)
-        # value = max(total_width, max_height) * total / (total - space)
-        value = max(total_width, max_height * 0.5) if total_width > 9 else max(total_width * 0.5, max_height)
+
+def _get_box_geometry(groups: list[tuple]) -> tuple[int, int, int]:
+    """沿用卡库的行列平衡算法，返回行数上限、卡牌尺寸和间距。"""
+    maximum = max((len(cards) for _, cards in groups), default=1)
+    best_height, best_value = 1, float('inf')
+    for height in range(1, maximum + 1):
+        rows = max((min(len(cards), height) for _, cards in groups), default=1)
+        columns = sum(math.ceil(len(cards) / height) for _, cards in groups)
+        value = max(columns, rows * 0.5) if columns > 9 else max(columns * 0.5, rows)
         if value < best_value:
-            best_height, best_value = i, value
+            best_height, best_value = height, value
+    columns = sum(math.ceil(len(cards) / best_height) for _, cards in groups)
+    # 卡片仍按原有面积区间从 100px 收敛到 48px，不缩放整张画布。
+    area = columns * (best_height + 4)
+    interp = min(1.0, max(0.0, (area - 9 * 5) / (26 * 50 - 9 * 5)))
+    return best_height, int(100 + (48 - 100) * interp), int(8 + (4 - 8) * interp)
 
-    # 计算总宽度并决定绘制卡牌的大小
-    total_width = 0
-    for _, cards in chara_cards:
-        width = max(1, math.ceil(len(cards) / best_height))
-        total_width += width
-    area = total_width * (best_height + 4)
 
-    start_area, start_sz, start_sep = 9 * 5, 100, 8
-    end_area, end_sz, end_sep = 26 * 50, 48, 4
-    interp = min(1.0, max(0.0, (area - start_area) / (end_area - start_area)))
-    sep = int(start_sep + (end_sep - start_sep) * interp)
-    sz = int(start_sz + (end_sz - start_sz) * interp)
+def _get_box_group_width(groups: list[tuple], height: int, size: int, gap: int) -> int:
+    """计算角色分列宽度，包含列间距但不包含面板内边距。"""
+    widths = [size * math.ceil(len(cards) / height) + gap * (math.ceil(len(cards) / height) - 1)
+              for _, cards in groups]
+    return sum(widths) + 4 * max(0, len(widths) - 1)
 
-    # 绘制单张卡
+
+def _draw_box_progress_bar(width: int, height: int, ratio: float, color):
+    """使用原绘图控件绘制收集进度条。"""
+    with Frame().set_size((width, height)).set_content_align('l'):
+        Spacer(w=width, h=height).set_bg(RoundRectBg(fill=(200, 200, 200, 140), radius=height // 2))
+        filled = int(width * max(0.0, min(1.0, ratio)))
+        if filled:
+            Spacer(w=max(2, filled), h=height).set_bg(RoundRectBg(fill=color, radius=height // 2))
+
+
+def _draw_box_progress_avatar(chara_id: int, size: int, ratio: float, color):
+    """原角色头像外增加进度环，使用角色 MasterData 配色。"""
+    ring_width = max(4, size // 12)
+    padding = ring_width + max(2, size // 28)
+    inner_size = max(1, size - padding * 2)
+    image = Image.new('RGBA', (size, size))
+    avatar = get_chara_icon_by_chara_id(chara_id).resize((inner_size, inner_size), Image.Resampling.LANCZOS)
+    mask = Image.new('L', (inner_size, inner_size))
+    ImageDraw.Draw(mask).ellipse((0, 0, inner_size - 1, inner_size - 1), fill=255)
+    image.paste(avatar, (padding, padding), mask)
+    drawing = ImageDraw.Draw(image)
+    offset = ring_width // 2
+    bounds = (offset, offset, size - offset - 1, size - offset - 1)
+    drawing.arc(bounds, -90, 270, fill=(160, 160, 160, 190), width=ring_width)
+    if ratio > 0:
+        drawing.arc(bounds, -90, -90 + 360 * min(1.0, ratio), fill=color, width=ring_width)
+    ImageBox(image, size=(size, size))
+
+
+def _get_box_card_created_time(pcard: dict) -> datetime | None:
+    """解析毫秒获取时间；缺失或异常时间保留在未知时间分组中。"""
+    try:
+        timestamp = float(pcard.get('createdAt', 0))
+        if timestamp > 0:
+            return datetime.fromtimestamp(timestamp / 1000, ZoneInfo('Asia/Shanghai'))
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+# ================================ 卡库数据与原缩略图 ================================ #
+
+async def compose_box_image(
+    ctx: SekaiHandlerContext, qid: int, cards: list[dict], show_id: bool, show_box: bool,
+    use_after_training=True, show_unowned=False, layout='character',
+):
+    """绘制筛选后的卡库，支持缺卡、属性分组与持有卡获取时间线。"""
+    assert_and_reply(layout in {'character', 'attribute', 'time'}, '不支持的卡库排版')
+    assert_and_reply(not (show_unowned and (show_box or layout == 'time')), '缺卡不能与 box 或获取时间同时使用')
+    profile, pmsg = None, ''
+    if qid:
+        profile, pmsg = await get_detailed_profile(
+            ctx, qid, filter=get_detailed_profile_card_filter('userCards'),
+            raise_exc=show_box or show_unowned or layout == 'time',
+        )
+    assert_and_reply(profile or not (show_box or show_unowned or layout == 'time'), '此显示方式需要抓包数据')
+    pcards = {pcard['cardId']: pcard for pcard in profile['userCards']} if profile else {}
+    # 统计分母始终取完整筛选集，不能在过滤未持有卡或切换视图后缩小。
+    all_cards = [dict(card, has=card['id'] in pcards) for card in cards]
+    visible = [card for card in all_cards
+               if (not show_box or card['has']) and (not show_unowned or not card['has'])
+               and (layout != 'time' or card['has'])]
+    assert_and_reply(visible, '没有符合条件的未持有卡牌' if show_unowned else '没有符合条件的卡牌')
+
+    async def load_thumbnail(card):
+        if pcard := pcards.get(card['id']):
+            return await get_card_full_thumbnail(ctx, card, pcard=pcard)
+        after_training = only_has_after_training(card) or (has_after_training(card) and use_after_training)
+        return await get_card_full_thumbnail(ctx, card, after_training)
+
+    card_imgs = await batch_gather(*[load_thumbnail(card) for card in visible])
+    visible = [dict(card, img=img) for card, img in zip(visible, card_imgs) if img is not None]
+    assert_and_reply(visible, '没有可显示的卡牌图片')
+    chara_cards = _group_box_cards(visible)
+    geometry = _get_box_geometry(chara_cards)
+    best_height, size, gap = geometry
+    chara_colors = {
+        chara_id: color_code_to_rgb((await ctx.md.game_character_units.find_by_id(chara_id))['colorCode'])
+        for chara_id, _ in chara_cards
+    }
+
+    def style(font_size, bold=False, auxiliary=False):
+        return TextStyle(font=DEFAULT_BOLD_FONT if bold else DEFAULT_FONT, size=font_size,
+                         color=(100, 100, 100) if auxiliary else BLACK)
+
     def draw_card(card):
-        with Frame().set_content_align('rt'):
-            ImageBox(card['img'], size=(sz, sz))
-            supply_name = card['supply_show_name']
-            if supply_name in ['期间限定', 'WL限定', '联动限定']:
-                ImageBox(ctx.static_imgs.get(f"card/term_limited.png"), size=(int(sz*0.6), None))
-            elif supply_name in ['CFes限定', 'BFes限定']:
-                ImageBox(ctx.static_imgs.get(f"card/fes_limited.png"), size=(int(sz*0.6), None))
-            if not card['has'] and profile:
-                Spacer(w=sz, h=sz).set_bg(RoundRectBg(fill=(0,0,0,120), radius=2))
-        if show_id:
-            TextBox(f"{card['id']}", TextStyle(font=DEFAULT_FONT, size=12, color=BLACK)).set_w(sz)
+        # 卡面与 ID 必须作为一个网格项，否则开启 id 会把列数翻倍并挤出面板。
+        with VSplit().set_w(size).set_sep(0).set_content_align('lt').set_item_align('lt'):
+            with Frame().set_content_align('rt'):
+                ImageBox(card['img'], size=(size, size))
+                supply_name = card.get('supply_show_name')
+                if supply_name in ['期间限定', 'WL限定', '联动限定']:
+                    ImageBox(ctx.static_imgs.get('card/term_limited.png'), size=(int(size * 0.6), None))
+                elif supply_name in ['CFes限定', 'BFes限定']:
+                    ImageBox(ctx.static_imgs.get('card/fes_limited.png'), size=(int(size * 0.6), None))
+                if not card['has'] and profile:
+                    Spacer(w=size, h=size).set_bg(RoundRectBg(fill=(0, 0, 0, 120), radius=2))
+            if show_id:
+                TextBox(str(card['id']), style(12)).set_w(size)
+
+    def draw_character(chara_id, group, selected, show_count=True):
+        columns = max(1, math.ceil(len(group) / best_height))
+        rows = max(1, min(best_height, len(group)))
+        width = size * columns + gap * (columns - 1)
+        total = sum(card['characterId'] == chara_id for card in selected)
+        owned = sum(card['characterId'] == chara_id and card['has'] for card in selected)
+        with VSplit().set_content_align('t').set_item_align('c').set_sep(3):
+            if show_count and profile:
+                TextBox(str(len(group) if show_unowned else owned), style(max(11, int(size * 0.2)), bold=True)).set_w(width).set_content_align('c')
+            if profile:
+                _draw_box_progress_avatar(chara_id, size, owned / total if total else 0, chara_colors[chara_id])
+            else:
+                ImageBox(get_chara_icon_by_chara_id(chara_id), size=(size, size))
+            Spacer(w=width, h=max(4, gap)).set_bg(FillBg(chara_colors[chara_id]))
+            with Grid(row_count=rows, vertical=rows > columns).set_content_align('lt').set_item_align('lt').set_sep(gap, gap):
+                for card in group:
+                    draw_card(card)
+
+    # ================================ 单角色收集进度 ================================ #
+    def draw_single_progress(chara_id, width):
+        selected = [card for card in all_cards if card['characterId'] == chara_id]
+        with HSplit().set_w(width).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_content_align('l').set_item_align('c'):
+            ImageBox(get_chara_icon_by_chara_id(chara_id), size=(56, 56))
+            with VSplit().set_w(width - 104).set_sep(8).set_content_align('lt').set_item_align('lt'):
+                TextBox('收集进度', style(20, bold=True))
+                for rarity in [names[0] for names in CARD_RARE_NAMES]:
+                    rarity_cards = [card for card in selected if card['cardRarityType'] == rarity]
+                    if not rarity_cards:
+                        continue
+                    with HSplit().set_sep(0).set_content_align('c').set_w(width - 104):
+                        if rarity == 'rarity_birthday':
+                            ImageBox(ctx.static_imgs.get('card/rare_birthday.png'), size=(14, 14))
+                        else:
+                            for _ in range(int(rarity.rsplit('_', 1)[1])):
+                                ImageBox(ctx.static_imgs.get('card/rare_star_normal.png'), size=(14, 14))
+                    owned = sum(card['has'] for card in rarity_cards)
+                    TextBox(f'{owned}/{len(rarity_cards)}', style(12)).set_w(width - 104).set_content_align('c')
+                    _draw_box_progress_bar(width - 104, 8, owned / len(rarity_cards), chara_colors[chara_id])
+
+    # ================================ 属性分区与获取时间线 ================================ #
+    attribute_names = [('cute', '可爱'), ('cool', '帅气'), ('pure', '纯真'), ('happy', '快乐'), ('mysterious', '神秘')]
+    attribute_groups = [(attr, label, _group_box_cards([card for card in visible if card['attr'] == attr]))
+                        for attr, label in attribute_names]
+    attribute_groups = [entry for entry in attribute_groups if entry[2]]
+    months = {}
+    if layout == 'time':
+        for card in visible:
+            card['created_time'] = _get_box_card_created_time(pcards[card['id']])
+        visible.sort(key=lambda card: (card['created_time'] is None,
+                                     card['created_time'].timestamp() if card['created_time'] else 0, card['id']))
+        for card in visible:
+            label = card['created_time'].strftime('%Y.%m') if card['created_time'] else '获取时间未知'
+            months.setdefault(label, []).append(card)
+        best_height, size, gap = _get_box_geometry(list(months.items()))
 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
             if qid:
                 await get_detailed_profile_card(ctx, profile, pmsg)
-            with HSplit().set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt').set_padding(16).set_sep(4):
-                for chara_id, cards in chara_cards:
-                    with VSplit().set_content_align('t').set_item_align('t').set_sep(sep):
-                        ImageBox(get_chara_icon_by_chara_id(chara_id), size=(sz, sz))
-                        chara_color = color_code_to_rgb((await ctx.md.game_character_units.find_by_id(chara_id))['colorCode'])
-                        col_num = max(1, len(range(0, len(cards), best_height)))
-                        row_num = max(1, min(best_height, len(cards)))
-                        Spacer(w=sz * col_num + sep * (col_num - 1), h=sep).set_bg(FillBg(chara_color))
-                        with Grid(row_count=row_num, vertical=row_num > col_num).set_content_align('lt').set_item_align('lt').set_sep(sep, sep):
-                            for card in cards:
-                                draw_card(card)
-            
+            if layout == 'time':
+                widths = {label: max(58, (size + 4) * math.ceil(len(group) / best_height)
+                                    + gap * (math.ceil(len(group) / best_height) - 1)) for label, group in months.items()}
+                width = max(480, sum(widths.values()) + 4 * (len(months) - 1) + 32)
+                with VSplit().set_w(width).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt'):
+                    with HSplit().set_sep(20).set_item_align('c'):
+                        TextBox('卡牌一览', style(26, bold=True))
+                        TextBox(f'获取时间 · {len(visible)} 张', style(17, auxiliary=True))
+                    with HSplit().set_sep(4).set_content_align('lt').set_item_align('lt'):
+                        for label, group in months.items():
+                            month_width = widths[label]
+                            with VSplit().set_w(month_width).set_sep(8).set_content_align('t').set_item_align('c'):
+                                TextBox(label, style(max(11, int(size * 0.2)), bold=True)).set_w(month_width).set_content_align('c')
+                                with Frame().set_size((month_width, 18)).set_content_align('c'):
+                                    Spacer(w=month_width, h=2).set_bg(FillBg((100, 100, 100, 100)))
+                                    Spacer(w=8, h=8).set_bg(RoundRectBg(fill=(100, 100, 100), radius=4))
+                                TextBox(f'{len(group)} 张', style(12, auxiliary=True)).set_w(month_width).set_content_align('c')
+                                with Grid(col_count=max(1, math.ceil(len(group) / best_height))).set_sep(gap, gap).set_content_align('lt'):
+                                    for card in group:
+                                        with VSplit().set_padding(2).set_sep(2).set_content_align('c').set_item_align('c'):
+                                            draw_card(card)
+                                            day = f"{card['created_time'].day:02d}日" if card['created_time'] else '未知'
+                                            TextBox(day, style(11, auxiliary=True)).set_w(size).set_content_align('c')
+            elif layout == 'attribute':
+                width = max(480, max(_get_box_group_width(group, *geometry) for _, _, group in attribute_groups) + 32)
+                for attr, label, group in attribute_groups:
+                    selected = [card for card in all_cards if card['attr'] == attr]
+                    with VSplit().set_w(width).set_padding(16).set_sep(8).set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt'):
+                        with HSplit().set_sep(8).set_content_align('l').set_item_align('c'):
+                            icon = ctx.static_imgs.get(f'card/attr_icon_{attr}.png')
+                            ImageBox(icon, size=(24, 24))
+                            TextBox(label, style(20, bold=True)).set_w(90)
+                            if profile:
+                                owned = sum(card['has'] for card in selected)
+                                TextBox(f'{owned}/{len(selected)}', style(18, bold=True)).set_w(96).set_content_align('r')
+                                color = icon.convert('RGB').resize((1, 1)).getpixel((0, 0))
+                                _draw_box_progress_bar(260, 12, owned / len(selected), color)
+                        with HSplit().set_sep(4).set_content_align('lt').set_item_align('lt'):
+                            for chara_id, values in group:
+                                draw_character(chara_id, values, selected)
+            else:
+                width = max(480, _get_box_group_width(chara_cards, *geometry) + 32)
+                if len(chara_cards) == 1 and profile:
+                    draw_single_progress(chara_cards[0][0], width)
+                with HSplit().set_w(width).set_padding(16).set_sep(4).set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt'):
+                    for chara_id, group in chara_cards:
+                        draw_character(chara_id, group, all_cards, len(chara_cards) != 1)
+
     add_watermark(canvas)
     return await canvas.get_img()
 
@@ -1205,6 +1368,7 @@ pjsk_box.check_cdrate(cd).check_wblist(gbl)
 @pjsk_box.handle()
 async def _(ctx: SekaiHandlerContext):
     args = ctx.get_args().strip()
+    args, show_unowned, layout = _extract_box_view_args(args)
     cards, args = await search_multi_cards(ctx, args, contain_leak=False)
 
     show_id = False
@@ -1217,6 +1381,8 @@ async def _(ctx: SekaiHandlerContext):
         show_box = True
         args = args.replace('box', '').strip()
 
+    assert_and_reply(not (show_box and show_unowned), '缺卡不能与 box 同时使用')
+
     use_after_training = True
     if 'before' in args:
         use_after_training = False
@@ -1226,7 +1392,8 @@ async def _(ctx: SekaiHandlerContext):
     assert_and_reply(cards, "没有找到符合条件的卡牌")
     
     await ctx.asend_reply_msg(await get_image_cq(
-        await compose_box_image(ctx, ctx.user_id, cards, show_id, show_box, use_after_training),
+        await compose_box_image(ctx, ctx.user_id, cards, show_id, show_box, use_after_training,
+                                show_unowned=show_unowned, layout=layout),
         low_quality=True,
     ))
 
