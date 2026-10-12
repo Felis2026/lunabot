@@ -3,6 +3,12 @@ multi_image_max_num: 64           # 多图操作输入最大数量
 cpp_binary_path: data/imgtool/imgtool-cpp
 cpp_timeout_seconds: 30
 
+# 原图随 data 目录持久保存；达到容量上限后仍可生成，但不再新增收录。
+sayings:
+  page_size: 16                  # 每页两列八行，最多 16 张
+  max_per_group: 3000            # 每群最多收录条数，删除后释放名额
+  max_total_mb: 1024             # 所有群语录图片总容量上限(MB)
+
 # 独立限制重型图片任务，避免占满 Bot 共用线程池和内存。
 max_concurrent_jobs: 2
 max_queued_jobs: 4
