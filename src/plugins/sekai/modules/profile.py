@@ -1385,7 +1385,9 @@ async def get_detailed_profile(
     ignore_hide=False, 
     filter: list[str] | set[str] | None=None,
     strict: bool=True,
+    require_verified_public: bool=False,
 ) -> Tuple[dict, str]:
+    """读取 Suite 数据；敏感查询可要求公开接口仅服务当前 QQ 已验证的账号。"""
     cache_path = None
     uid = None
     use_suite_api_public = False
@@ -1413,10 +1415,18 @@ async def get_detailed_profile(
         profile = None
         profile_source_fallback = 'haruki_public'
 
+        # ================================ 敏感查询账号归属 ================================ #
+        # 验证记录按当前 QQ、区服和选中的 UID 判断，u2 等账号分别检查。
+        public_access_verified = True
+        if require_verified_public:
+            verified_uids = {str(item) for item in get_user_verified_uids(ctx)}
+            public_access_verified = str(uid) in verified_uids
+
         # ================================ 优先尝试 OAuth（仅 self-query） ================================ #
         # OAuth 只允许“当前用户查自己的 suite 远端数据”命中。
         # 其余情况（@别人、直接输 UID、管理员代查）统一保持公开接口行为。
-        if can_use_oauth_suite(ctx, qid, uid):
+        if can_use_oauth_suite(ctx, qid, uid) or (require_verified_public and not public_access_verified):
+            # 待验证账号通过 OAuth 确认访问权限，背包查询据此选择数据来源。
             oauth_profile = await get_oauth_game_data(
                 str(qid),
                 ctx.region,
@@ -1431,13 +1441,17 @@ async def get_detailed_profile(
                 # - 如果这里把标量当失败吞掉，就会错误回退到 Public-API
                 profile = oauth_profile
                 profile_source_fallback = 'haruki_oauth'
-            elif suite_mode == 'oauth':
+            elif suite_mode == 'oauth' and not require_verified_public:
                 raise ReplyException("当前抓包模式为 oauth，但 OAuth2 数据暂不可用")
 
         # ================================ 回退到公开 / 旧后端接口 ================================ #
         # 当前主部署使用的是公开 suite 接口契约；但这里仍保留旧后端的 mode/filter 兼容，
         # 这样其他沿用老链路的实例升级后不会立刻失效。
         if profile is None:
+            assert_and_reply(public_access_verified,
+                             '查询背包需要先授权或验证当前游戏账号。\n'
+                             '授权：私聊 Bot 发送 /授权\n'
+                             f'验证：发送 /{ctx.region}pjsk验证')
             req_url = url.format(uid=uid)
             try:
                 if use_suite_api_public:

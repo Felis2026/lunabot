@@ -674,6 +674,7 @@ class RegionMasterDataCollection:
         self.mysekai_material_chara_relations                               = RegionMasterDataWrapper(region, "mysekaiMaterialGameCharacterRelations")
         self.resource_boxes                                                 = RegionMasterDataWrapper(region, "resourceBoxes")
         self.boost_items                                                    = RegionMasterDataWrapper(region, "boostItems")
+        self.materials                                                      = RegionMasterDataWrapper(region, "materials")
         self.mysekai_fixture_tags                                           = RegionMasterDataWrapper(region, "mysekaiFixtureTags")
         self.mysekai_blueprint_material_cost                                = RegionMasterDataWrapper(region, "mysekaiBlueprintMysekaiMaterialCosts")
         self.mysekai_fixture_only_disassemble_materials                     = RegionMasterDataWrapper(region, "mysekaiFixtureOnlyDisassembleMaterials")

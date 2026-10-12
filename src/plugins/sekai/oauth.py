@@ -220,6 +220,11 @@ async def get_oauth_game_data(
             except Exception:
                 detail = await response.text()
 
+            # 与公开 Suite 接口一致：旧后端可能不支持新库存字段的 key 筛选。
+            # 只回退一次全量请求，随后由业务层检查字段；不能误报成授权失效。
+            if response.status == 400 and filter:
+                return await get_oauth_game_data(qid, region, data_type, uid, filter=None)
+
             if response.status == 404:
                 if isinstance(detail, dict) and detail.get("code") == "no_oauth_token":
                     return None
