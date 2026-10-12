@@ -1625,6 +1625,7 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
         assert_and_reply(gate is not None, "查询的大门不存在")
         assert_and_reply(gate['max_level'] > 0, "查询的大门没有升级等级，无需升级材料")
 
+    auto_preview_allowed = ctx.region == 'cn' and qid is not None and spec_gate_id is not None and not preview
     profile = None
     if qid:
         profile, pmsg = await get_detailed_profile(
@@ -1659,6 +1660,17 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
             if not spec_gate_id:
                 raise ReplyException("你的所有可升级大门已经满级")
 
+    # ================================ 指定满级门自动预览 ================================ #
+    # 仅个人CN指定门查询自动切换；默认选门、all和JP查询保持原行为。
+    # 复用同份CN资料与库存，不再次获取抓包，也不把日服等级写回玩家数据。
+    if profile and auto_preview_allowed:
+        current_level = spec_lvs.get(spec_gate_id, 0)
+        if current_level >= gate_specs[spec_gate_id]['max_level']:
+            preview_specs, preview_materials = await get_mysekai_gate_upgrade_data(ctx, preview=True)
+            if preview_specs[spec_gate_id]['max_level'] > current_level:
+                gate_specs, gate_materials = preview_specs, preview_materials
+                preview = True
+
     # 根据指定lv截断
     for gid, lv_materials in gate_materials.items():
         spec_lv = spec_lvs.get(gid, 0)
@@ -1673,7 +1685,8 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
     # ================================ 材料完整性与累计消耗 ================================ #
     # 表部分更新时不能把缺材料的等级当作免费，也不能误报满级。
     for gid, lv_materials in gate_materials.items():
-        if any(not items for items in lv_materials.values()):
+        expected_levels = set(range(spec_lvs.get(gid, 0) + 1, gate_specs[gid]['max_level'] + 1))
+        if any(not items for items in lv_materials.values()) or (preview and set(lv_materials) != expected_levels):
             raise ReplyException(f"{gate_specs[gid]['name']}的升级材料尚未完整更新，请稍后重试")
     if preview:
         # 只校验当前查询的等级与门，避免其他门尚未实装的材料阻断本次预览。
