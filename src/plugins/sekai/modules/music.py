@@ -1491,11 +1491,20 @@ async def get_event_of_music(ctx: SekaiHandlerContext, mid: int) -> Dict:
 # ================================ 歌曲MV分类兼容 ================================ #
 
 async def get_music_categories(ctx: SekaiHandlerContext, music: dict) -> list[str] | None:
-    """兼容内嵌分类与独立分类表；None 表示未知，不改写歌曲原始数据。"""
+    """兼容内嵌字符串/对象分类与独立分类表；None 表示未知，不改写歌曲原始数据。"""
     categories = music.get('categories')
     # 旧格式的空列表明确表示无 MV，不能因此请求尚未拆表区服的新接口。
     if isinstance(categories, list) and all(isinstance(item, str) for item in categories):
         return list(dict.fromkeys(categories))
+
+    # CN 的内嵌分类使用对象列表，提取名称即可，避免请求尚不存在的独立表。
+    if isinstance(categories, list) and all(
+        isinstance(item, dict)
+        and isinstance(item.get('musicCategoryName'), str)
+        and item['musicCategoryName']
+        for item in categories
+    ):
+        return list(dict.fromkeys(item['musicCategoryName'] for item in categories))
 
     try:
         # 通过现有管理器更新版本并复用 musicId 索引，不直接读取可能过期的磁盘文件。
