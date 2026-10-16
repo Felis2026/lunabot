@@ -440,8 +440,9 @@ async def save_rankings_to_csv(region: str, event_id: int, save_path: str) -> in
     return len(data)
 
 async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
-    """
-    运行本地预测
+    """运行本地预测子进程，校验结果后返回 ForecastData。
+
+    样本不足或产物不符合活动和档位要求时抛出 GetForecastException。
     """
     cfg = config.get('sk.forecast.local')
 
@@ -450,7 +451,6 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
         p for p in glob.glob(f"{base_dir}/history/*.csv")
         if os.path.isfile(p)
     ])
-    result_csv = f"{base_dir}/forecast/{event_id}_future.csv"
 
     if not history_csvs:
         raise GetForecastException("本地预测缺少历史样本，等待活动结束后自动生成历史数据")
@@ -464,7 +464,8 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
     if event_end - datetime.now() < timedelta(hours=cfg['end_before_hours']):
         raise GetForecastException(f"距离活动结束不足 {cfg['end_before_hours']} 小时，取消本地预测")
 
-    with TempFilePath('.csv') as current_csv:
+    # 独立结果文件在校验成功前不会覆盖有效预测；输入、输出都由本次任务持有。
+    with TempFilePath('.csv') as current_csv, TempFilePath('.csv') as result_csv:
         sample_count = await save_rankings_to_csv(region, event_id, current_csv)
         if sample_count <= 0:
             raise GetForecastException("当前活动榜线样本不足，取消本地预测")
@@ -478,24 +479,36 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
 
         logger.info(f"运行本地预测: {' '.join(args)}")
 
-        proc = await asyncio.create_subprocess_exec(
-            *args,
+        completed = await run_managed_subprocess(
+            *args, process_key=f'sekai-local-forecast:{region}',
+            timeout=float(cfg.get('process_timeout_seconds', 60)),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        stdout, _ = await proc.communicate()
+        stdout = completed.stdout
         output_lines = stdout.decode(errors='replace').splitlines()
         output_text = "\n".join(output_lines)
-        if proc.returncode != 0:
+        if completed.returncode != 0:
             if "Not enough history profiles" in output_text:
                 logger.info("[Forecast] Not enough history profiles to perform forecasting.")
                 raise GetForecastException("本地预测历史样本不足（需要更多往期活动样本）")
             for line in output_lines:
                 logger.info(f"[Forecast] {line}")
-            raise Exception(f"returncode={proc.returncode}")
+            raise Exception(f"returncode={completed.returncode}")
         for line in output_lines:
             logger.info(f"[Forecast] {line}")
         
+        # 核对结果字段、有限数值、活动编号和档位集合。
+        result = await asyncio.to_thread(pd.read_csv, result_csv)
+        required_columns = ['event_id', 'rank', 'timestamp', 'score']
+        if result.empty or not set(required_columns) <= set(result.columns):
+            raise GetForecastException('本地预测结果为空或缺少必要字段')
+        numeric = result[required_columns].apply(pd.to_numeric, errors='raise')
+        if not all(math.isfinite(value) for value in numeric.to_numpy().flat):
+            raise GetForecastException('本地预测结果包含无效数值')
+        if not (numeric['event_id'] == event_id).all() or set(numeric['rank']) != set(cfg['ranks']):
+            raise GetForecastException('本地预测结果的活动或档位与请求不一致')
+        result[required_columns] = numeric
         logger.info(f"本地预测完成")
         
     data = ForecastData(
@@ -505,8 +518,6 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
         forecast_ts=int(time.time()),
     )
 
-    result = pd.read_csv(result_csv)
-    
     for rank in result['rank'].unique():
         rank_data = result[result['rank'] == rank]
         final_score = int(rank_data.iloc[-1]['score'])
@@ -520,9 +531,6 @@ async def run_local_forecast(region: str, event_id: int) -> ForecastData | None:
             final_score=final_score,
             future_rankings=future_rankings,
         )
-
-    if os.path.exists(result_csv):
-        os.remove(result_csv)
 
     data.load_and_update_history()
     return data
