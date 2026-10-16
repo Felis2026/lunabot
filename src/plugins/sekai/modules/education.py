@@ -612,6 +612,22 @@ async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -
     add_watermark(canvas)
     return await canvas.get_img()
 
+# ================================ 区域道具图标路径兼容 ================================ #
+async def get_area_item_icon(ctx: SekaiHandlerContext, asset_name: str) -> Image.Image:
+    """优先复用本地图标，兼容官方缩略图和旧版独立资源包的图片路径。"""
+    paths = [
+        f"thumbnail/areaitem/{asset_name}.png",
+        f"areaitem/{asset_name}/{asset_name}.png",
+    ]
+    # 新树仅提供thumbnail资源；旧道具已有独立包缓存时也不必额外联网取图。
+    local_paths = [path for path in paths if ctx.rip.get_local_asset_cache_path(path)]
+    for path in local_paths + [path for path in paths if path not in local_paths]:
+        icon = await ctx.rip.img(path, default=None)
+        if icon is not None:
+            return icon
+    return UNKNOWN_IMG
+
+
 # 合成区域道具升级材料图片
 async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qid: int, filter: AreaItemFilter) -> Image.Image:
     profile = None
@@ -699,7 +715,7 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
     for item in await ctx.md.area_items.get():
         if item['id'] in item_ids:
             asset_name = item['assetbundleName']
-            area_item_icons[item['id']] = await ctx.rip.img(f"areaitem/{asset_name}/{asset_name}.png")
+            area_item_icons[item['id']] = await get_area_item_icon(ctx, asset_name)
 
     # 统计展示的最低等级
     user_area_item_lower_lv = None
