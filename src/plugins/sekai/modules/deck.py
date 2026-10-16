@@ -2406,7 +2406,7 @@ async def compose_deck_recommend_image(
             options.best_skill_as_leader = False
         else:
             basic_profile = await get_basic_profile(
-                ctx, get_player_bind_id(ctx), 
+                ctx, await get_player_bind_id(ctx),
                 use_cache=False, use_remote_cache=False,
             )
             options.fixed_cards = [basic_profile['userDeck'][f'member{i}'] for i in range(1, 6)]

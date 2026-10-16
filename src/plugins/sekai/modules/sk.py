@@ -943,21 +943,21 @@ async def compose_sks_image(ctx: SekaiHandlerContext, unit: str, event: dict = N
     add_watermark(canvas)
     return await canvas.get_img()
     
-# 从文本获取sk查询参数 (类型，值) 类型: 'name' 'uid' 'rank' 'ranks'
 async def parse_sk_query_params(ctx: SekaiHandlerContext, args: str) -> Tuple[str, Union[str, int, List[int]]]:
+    """解析榜线查询参数，返回 (类型, 值)，类型为 name、uid、rank 或 ranks。"""
     MAX_QUERY_RANKS = 20
 
     # 提取at
     ats = ctx.get_at_qids()
     if ats:
-        uid = get_player_bind_id(ctx, ats[0], check_bind=False)
+        uid = await get_player_bind_id(ctx, ats[0], check_bind=False)
         assert_and_reply(uid, "@的用户未绑定游戏ID")
         return 'uid', uid
     
     args = args.strip()
     if not args:
         # 提取uid（管理员限定）
-        if uid := get_player_bind_id(ctx, check_bind=False):
+        if uid := await get_player_bind_id(ctx, check_bind=False):
             return 'self', uid
     else:
         # 提取单个或多个多个rank

@@ -1,3 +1,5 @@
+from dataclasses import field
+
 from ..utils import *
 from .common import *
 from .asset import (
@@ -39,6 +41,9 @@ class SekaiHandlerContext(HandlerContext):
     uid_arg: str = None
     data_mode_arg: str = None
     explicit_region_prefix: bool = False
+    # 键为 (region, str(qid))，值为 (缓存失效代次, state)，state=None 表示读取失败。
+    # 异步入口准备后供绘图阶段复用，跨服状态通过键中的 region 区分。
+    account_states: dict = field(default_factory=dict)
 
     @classmethod
     def from_region(cls, region: str) -> 'SekaiHandlerContext':

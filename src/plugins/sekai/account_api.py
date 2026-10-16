@@ -1,9 +1,14 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
 
 import httpx
 
@@ -20,6 +25,95 @@ _cache_lock = threading.Lock()
 _state_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _snapshot_cache: dict[str, tuple[float, dict]] = {}
 _blacklist_cache: dict[tuple[str, str, str], tuple[float, dict]] = {}
+_cache_generation = 0
+
+# ================================ 异步调用与写入顺序 ================================ #
+# 读写请求共用并发名额，限制同步账号请求占用的线程数量。
+_request_slots = asyncio.Semaphore(8)
+_write_lock = asyncio.Lock()
+_write_context = ContextVar("sekai_account_write", default=None)
+_read_tasks: dict[tuple, asyncio.Task] = {}
+
+
+@asynccontextmanager
+async def account_write_scope():
+    """串行执行本进程的账号写操作，同一任务中的嵌套调用复用写锁。"""
+    if _write_context.get() is asyncio.current_task():
+        yield
+        return
+    async with _write_lock:
+        token = _write_context.set(asyncio.current_task())
+        try:
+            yield
+        finally:
+            _write_context.reset(token)
+
+
+def serialize_writes(function):
+    """覆盖读取、检查和写入的完整过程，避免绑定上限等检查被并发穿透。"""
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        async with account_write_scope():
+            return await function(*args, **kwargs)
+    return wrapped
+
+
+async def _run_in_thread(function, args, kwargs):
+    """在并发名额内将同步账号函数交给线程执行，并返回结果。
+
+    取消后的线程收尾由调用方通过 shield 管理。
+    """
+    async with _request_slots:
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+
+def _finish_read(key, task):
+    """清理已结束的共享读任务，并取出无人等待时的异常。"""
+    if _read_tasks.get(key) is task:
+        _read_tasks.pop(key, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def call_async(function, *args, **kwargs):
+    """在线程中执行同步账号接口，并传播请求异常。
+
+    同一缓存失效代次中的相同读请求共用任务，各调用者获得独立结果副本。
+    写请求串行执行。调用者取消时，等待写任务及其缓存失效完成后再释放写锁。
+    """
+    if function in (get_state, get_snapshot, get_blacklist_status):
+        bound = inspect.signature(function).bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = tuple(
+            (name, str(value) if name in {'qid', 'target_value'} else value)
+            for name, value in bound.arguments.items()
+        )
+        with _cache_lock:
+            generation = _cache_generation
+        key = (function, arguments, generation)
+        task = _read_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(_run_in_thread(function, args, kwargs))
+            _read_tasks[key] = task
+            task.add_done_callback(lambda finished: _finish_read(key, finished))
+        return copy.deepcopy(await asyncio.shield(task))
+
+    async with account_write_scope():
+        task = asyncio.create_task(_run_in_thread(function, args, kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 写线程可能已被服务端接受，必须等其结束再释放锁，避免后续写入越过它。
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise
 
 
 def _get_base_url() -> str | None:
@@ -62,16 +156,34 @@ def _headers() -> dict[str, str]:
 # ================================ 请求与缓存辅助 ================================ #
 # 统一在这一层整理 HTTP 错误与缓存读写，避免上层业务反复处理相同细节。
 def _request_json(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None) -> dict:
+    """同步请求 Cloud 并返回 JSON 对象，请求或响应异常时抛出 RuntimeError。
+
+    写请求在开始和结束时失效相关账号、黑名单及管理快照缓存。
+    """
     base_url = _get_base_url()
     if not base_url:
         raise RuntimeError("cloud account api is not configured")
 
     url = f"{base_url}{path}"
+    def invalidate_write_cache():
+        """按当前写请求的路径和目标失效缓存，并推进缓存失效代次。"""
+        if method.upper() != "GET":
+            if "/blacklist/" in path:
+                invalidate_blacklist_cache()
+            else:
+                body = json_body or {}
+                invalidate_state_cache(body.get("region"), body.get("qid"))
+            invalidate_snapshot_cache()
+
+    # 请求超时也可能已经完成服务端写入，开始和结束时都失效，旧读不得回填。
+    invalidate_write_cache()
     try:
         with httpx.Client(timeout=_get_timeout(), verify=False) as client:
             response = client.request(method, url, params=params, json=json_body, headers=_headers())
     except Exception as e:
         raise RuntimeError(f"cloud account api request failed: {e}") from e
+    finally:
+        invalidate_write_cache()
 
     try:
         payload = response.json()
@@ -99,13 +211,24 @@ def _get_cached(cache: dict, key):
         return copy.deepcopy(value)
 
 
-def _set_cached(cache: dict, key, value: dict):
+def _set_cached(cache: dict, key, value: dict, generation: int):
+    """仅在失效代次仍匹配时缓存结果副本，丢弃写入前启动的旧读结果。"""
     with _cache_lock:
-        cache[key] = (time.monotonic() + _get_cache_ttl(), copy.deepcopy(value))
+        if generation == _cache_generation:
+            cache[key] = (time.monotonic() + _get_cache_ttl(), copy.deepcopy(value))
+
+
+def _get_cache_generation() -> int:
+    """读取失效代次，用于识别写入前启动的旧读请求。"""
+    with _cache_lock:
+        return _cache_generation
 
 
 def invalidate_state_cache(region: str | None = None, qid: str | None = None):
+    """失效匹配区服和 QQ 的账号缓存，省略两项时清空全部账号缓存。"""
+    global _cache_generation
     with _cache_lock:
+        _cache_generation += 1
         if region is None and qid is None:
             _state_cache.clear()
             return
@@ -116,51 +239,63 @@ def invalidate_state_cache(region: str | None = None, qid: str | None = None):
 
 
 def invalidate_snapshot_cache():
+    """清空管理快照缓存并推进失效代次，阻止旧请求回填。"""
+    global _cache_generation
     with _cache_lock:
+        _cache_generation += 1
         _snapshot_cache.clear()
 
 
 def invalidate_blacklist_cache():
+    """清空黑名单缓存并推进失效代次，阻止旧请求回填。"""
+    global _cache_generation
     with _cache_lock:
+        _cache_generation += 1
         _blacklist_cache.clear()
 
 
 # ================================ 只读接口 ================================ #
 # 单账号状态查询按区服与 qid 做缓存，减少高频指令下对云端的重复请求。
 def get_state(region: str, qid: str | int) -> dict:
+    """同步读取指定区服和 QQ 的账号状态，优先返回有效缓存的独立副本。"""
     qid = str(qid)
     cache_key = (region, qid)
     cached = _get_cached(_state_cache, cache_key)
     if cached is not None:
         return cached
+    generation = _get_cache_generation()
     payload = _request_json("GET", f"/account/sekai/state/{region}/{qid}")
     state = payload.get("state")
     if not isinstance(state, dict):
         raise RuntimeError("cloud account state payload is invalid")
-    _set_cached(_state_cache, cache_key, state)
+    _set_cached(_state_cache, cache_key, state, generation)
     return state
 
 
 def get_snapshot(region: str | None = None) -> dict:
+    """同步读取账号管理快照，region 省略时查询全部区服。"""
     cache_key = region or "*"
     cached = _get_cached(_snapshot_cache, cache_key)
     if cached is not None:
         return cached
+    generation = _get_cache_generation()
     params = {"region": region} if region else None
     payload = _request_json("GET", "/account/sekai/snapshot", params=params)
     snapshot = payload.get("snapshot")
     if not isinstance(snapshot, dict):
         raise RuntimeError("cloud account snapshot payload is invalid")
-    _set_cached(_snapshot_cache, cache_key, snapshot)
+    _set_cached(_snapshot_cache, cache_key, snapshot, generation)
     return snapshot
 
 
 def get_blacklist_status(target_type: str, target_value: str | int, *, region: str | None = None) -> dict:
+    """同步查询 QQ 或游戏 UID 的黑名单状态，返回 active 和 entry 字段。"""
     normalized_value = str(target_value)
     cache_key = (target_type, region or "global", normalized_value)
     cached = _get_cached(_blacklist_cache, cache_key)
     if cached is not None:
         return cached
+    generation = _get_cache_generation()
     params = {
         "target_type": target_type,
         "target_value": normalized_value,
@@ -172,7 +307,7 @@ def get_blacklist_status(target_type: str, target_value: str | int, *, region: s
         "active": bool(payload.get("active")),
         "entry": payload.get("entry"),
     }
-    _set_cached(_blacklist_cache, cache_key, status)
+    _set_cached(_blacklist_cache, cache_key, status, generation)
     return status
 
 

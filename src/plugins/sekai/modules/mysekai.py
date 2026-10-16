@@ -26,6 +26,7 @@ from .profile import (
     process_sensitive_cmd_source,
     get_suite_source_display_name,
     get_user_suite_source_mode,
+    _get_cloud_state,
 )
 from .music import get_music_cover_thumb, is_valid_music
 from .card import get_character_sd_image
@@ -172,18 +173,16 @@ def get_mysekai_source_policy(region: str) -> str:
     return MYSEKAI_SOURCE_POLICY_BY_REGION.get(normalized, "legacy_data_mode")
 
 
-def get_effective_mysekai_fetch_mode(
+async def get_effective_mysekai_fetch_mode(
     ctx: SekaiHandlerContext,
     qid: int | None = None,
     requested_mode: str | None = None,
 ) -> str:
-    """
-    统一计算 MySekai 实际取数 mode。
+    """按区服来源策略计算 MySekai 请求模式。
 
-    设计目的：
-    - CN/JP 已经进入固定来源策略，不再读取旧 data_mode
-    - 显式传入的 mode 也不能突破区服固定策略，避免旧调用链把 latest/default/local/haruki 带回来
-    - 仅未收口区服才保留 legacy data_mode 兼容
+    固定策略优先于 requested_mode，CN 使用 local，JP 使用 haruki。
+    其他策略下先使用显式模式，再读取 qid 对应用户的旧 data_mode 设置。
+    qid 省略时使用命令发起者。
     """
     policy = get_mysekai_source_policy(ctx.region)
     if policy in MYSEKAI_POLICY_FETCH_MODE:
@@ -193,11 +192,11 @@ def get_effective_mysekai_fetch_mode(
     if normalized_mode:
         return normalized_mode
 
-    # 未收口区服才允许继续复用旧 data_mode。
+    # 其他策略继续兼容旧 data_mode 设置。
     from .profile import get_user_data_mode
 
     owner_qid = qid if qid is not None else ctx.user_id
-    return get_user_data_mode(ctx, owner_qid)
+    return await get_user_data_mode(ctx, owner_qid)
 
 
 # ======================= 处理逻辑 ======================= #
@@ -228,7 +227,6 @@ async def get_chara_icon_by_chara_unit_id(ctx: SekaiHandlerContext, cuid: int) -
     cu = await ctx.md.game_character_units.find_by_id(cuid)
     return get_chara_icon_by_chara_id(cid=cu['gameCharacterId'], unit=cu['unit'])
 
-# 获取玩家mysekai抓包数据 返回 (mysekai_info, err_msg)
 async def get_mysekai_info(
     ctx: SekaiHandlerContext, 
     qid: int, 
@@ -236,12 +234,16 @@ async def get_mysekai_info(
     mode=None, 
     filter: list[str]=None, 
 ) -> Tuple[dict, str]:
+    """按区服来源策略读取 MySekai 数据，返回 (数据, 错误提示)。
+
+    获取失败时尝试已有兼容缓存，raise_exc=True 时传播异常。
+    """
     cache_path = None
     uid = None
     try:
         # 获取绑定的玩家id
         try:
-            uid = get_player_bind_id(ctx)
+            uid = await get_player_bind_id(ctx)
         except Exception as e:
             logger.info(f"获取 {qid} {ctx.region} mysekai抓包数据失败: 未绑定游戏账号")
             raise e
@@ -251,12 +253,8 @@ async def get_mysekai_info(
         if not url:
             raise ReplyException(f"暂不支持{get_region_name(ctx.region)}的Mysekai抓包数据查询")
 
-        # ================================ 运行时来源收口 ================================ #
-        # MySekai 现在按区服固定来源策略取数：
-        # - CN 固定 local（Felis Cloud）
-        # - JP 固定 haruki
-        # 这里不能再默认读取旧 data_mode，否则展示层虽然改了，底层仍会被历史值带偏。
-        mode = get_effective_mysekai_fetch_mode(ctx, qid=qid, requested_mode=mode)
+        # 固定来源策略优先，避免旧 data_mode 改变 CN/JP 的请求来源。
+        mode = await get_effective_mysekai_fetch_mode(ctx, qid=qid, requested_mode=mode)
 
         # 尝试下载
         try:
@@ -283,10 +281,8 @@ async def get_mysekai_info(
             logger.info(f"获取 {qid} {ctx.region} {uid} mysekai抓包数据失败: 找不到该玩家")
             raise ReplyException(f"找不到ID为 {uid} 的玩家")
         
-        # 缓存数据（目前已不缓存）
+        # 兼容已有缓存的路径，供异常回退分支读取。
         cache_path = f"{SEKAI_PROFILE_DIR}/mysekai_cache/{ctx.region}/{uid}.json"
-        # if not upload_time_only:
-        #     dump_json(mysekai_info, cache_path)
         logger.info(f"获取 {qid} {ctx.region} {uid} mysekai抓包数据成功，数据已缓存")
 
     except Exception as e:
@@ -304,8 +300,10 @@ async def get_mysekai_info(
             return None, get_exc_desc(e)
     return mysekai_info, ""
 
-# 获取玩家mysekai抓包数据的简单卡片 返回 Frame
 async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, basic_profile: dict, err_msg: str) -> Frame:
+    """生成 MySekai 玩家信息 Frame，准备账号状态后展示头像、ID 和数据来源。"""
+    if mysekai_info:
+        await _get_cloud_state(ctx, ctx.user_id)
     with Frame().set_bg(roundrect_bg()).set_padding(16) as f:
         with HSplit().set_content_align('c').set_item_align('c').set_sep(14):
             if mysekai_info:
@@ -345,8 +343,11 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
                 TextBox(f"获取数据失败:{err_msg}", TextStyle(font=DEFAULT_FONT, size=20, color=RED), line_count=3).set_w(240)
     return f
 
-# 获取玩家mysekai抓包数据+suite数据的简单卡片 返回 Frame
 async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_info: dict, profile: dict, err_msg: str, mode: str = None) -> Frame:
+    """生成合并 MySekai 与 Suite 信息的 Frame，准备账号状态并统一来源模式。"""
+    if profile and mysekai_info:
+        await _get_cloud_state(ctx, ctx.user_id)
+        suite_mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
     with Frame().set_bg(roundrect_bg()).set_padding(16) as f:
         with HSplit().set_content_align('c').set_item_align('c').set_sep(14):
             if profile and mysekai_info:
@@ -360,9 +361,6 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                     source = get_suite_source_display_name(profile.get('source', '?'))
                     if local_source := profile.get('local_source'):
                         source += f"({local_source})"
-                    # Suite 现在对外只展示新三态。
-                    # 这里额外做一次归一化，防止历史调用链把 latest/local/haruki 直接带进卡片头部。
-                    suite_mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
                     update_time = datetime.fromtimestamp(profile['upload_time'] / 1000)
                     update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(update_time, show_original_time=False)})"
                     user_id = process_hide_uid(ctx, game_data['userId'], keep=6)
@@ -839,10 +837,10 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
 
     return await canvas.get_img()
 
-# 合成mysekai资源图片 返回图片列表
 async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_harvested: bool, check_time: bool) -> List[Image.Image]:
+    """绘制玩家 MySekai 资源分布，返回图片列表。"""
     with ProfileTimer("msr.get_basic_profile"):
-        uid = get_player_bind_id(ctx)
+        uid = await get_player_bind_id(ctx)
 
         # 字节服额外验证
         if bd_limit_uid := get_bd_msr_limit_uid(ctx, qid):
@@ -1113,17 +1111,17 @@ async def get_mysekai_fixture_genre_name_and_image(ctx: SekaiHandlerContext, gid
     image = await ctx.rip.img(f"mysekai/icon/category_icon/{asset_name}.png", use_img_cache=True)
     return genre['name'], image
 
-# 合成mysekai家具列表图片
 async def compose_mysekai_fixture_list_image(
     ctx: SekaiHandlerContext, 
     qid: int, 
     show_id: bool, 
     only_craftable: bool, 
 ) -> Image.Image:
+    """按蓝图持有与可制作条件筛选家具，绘制玩家家具列表。"""
     # 获取玩家已获得的蓝图对应的家具ID
     obtained_fids = None
     if qid:
-        uid = get_player_bind_id(ctx)
+        uid = await get_player_bind_id(ctx)
         basic_profile = await get_basic_profile(ctx, uid)
         mysekai_info, mimsg = await get_mysekai_info(ctx, qid, raise_exc=True)
 
@@ -1790,10 +1788,10 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
         cache_key = f"{ctx.region}_pjsk_msg_centered_{mode}_{hashlib.sha256(content).hexdigest()[:16]}"
     return await canvas.get_img(cache_key=cache_key)
 
-# 合成mysekai唱片列表
 async def compose_mysekai_musicrecord_image(ctx: SekaiHandlerContext, qid: int, show_id: bool = False) -> Image.Image:
+    """绘制玩家 MySekai 唱片列表，show_id 控制歌曲编号展示。"""
     mysekai_info, pmsg = await get_mysekai_info(ctx, qid, raise_exc=True)
-    uid = get_player_bind_id(ctx)
+    uid = await get_player_bind_id(ctx)
     basic_profile = await get_basic_profile(ctx, uid)
     user_records = mysekai_info['updatedResources'].get('userMysekaiMusicRecords', [])
 
@@ -1866,7 +1864,6 @@ async def compose_mysekai_musicrecord_image(ctx: SekaiHandlerContext, qid: int, 
     add_watermark(canvas)
     return await canvas.get_img()
 
-# 合成mysekai对话列表图片
 async def compose_mysekai_talk_list_image(
     ctx: SekaiHandlerContext, 
     qid: int, 
@@ -1875,8 +1872,8 @@ async def compose_mysekai_talk_list_image(
     unit: str = None,
     show_all_talks: bool = False,
 ) -> Image.Image:
-    # 获取玩家已获得的蓝图对应的家具ID
-    uid = get_player_bind_id(ctx)
+    """按角色或组合筛选 MySekai 对话，绘制玩家对话列表。"""
+    uid = await get_player_bind_id(ctx)
     basic_profile = await get_basic_profile(ctx, uid)
     mysekai_info, mimsg = await get_mysekai_info(ctx, qid, raise_exc=True)
     assert_and_reply(
@@ -2173,15 +2170,19 @@ def get_bd_msr_limit_uid(ctx: SekaiHandlerContext, qid: int) -> str | None:
         return update_bd_msr_limit_uid(ctx, qid)
     return msr_binds[qid]
 
-# 切换字节服msr限制uid为当前绑定的ID，返回绑定的ID
 async def update_bd_msr_limit_uid(ctx: SekaiHandlerContext, qid: int, force: bool = False):
+    """发起确认操作，将发起者的字节服 MSR 限制账号切换为当前绑定 UID。
+
+    用户确认后写入绑定与一周冷却时间，并发送结果提示。
+    force=True 时跳过当前冷却检查，区服和群订阅限制仍然适用。
+    """
     assert_and_reply(ctx.region in BD_MYSEKAI_REGIONS, "指令对此区服无效")
     assert_and_reply(bd_msr_sub.is_subbed(ctx.region, ctx.group_id), "指令在此群无效")
     qid = str(ctx.user_id)
     next_time = bd_msr_bind_db.get(f"{ctx.region}_next_time.{qid}", 0)
     if not force and next_time > datetime.now().timestamp():
         raise ReplyException(f"请于{datetime.fromtimestamp(next_time).strftime('%m-%d %H:%M:%S')}后再试")
-    uid = get_player_bind_id(ctx)
+    uid = await get_player_bind_id(ctx)
     
     async def do_update(new_ctx: HandlerContext):
         msr_binds: dict[str, str] = bd_msr_bind_db.get(f"{ctx.region}_bind", {})
@@ -2347,7 +2348,7 @@ pjsk_check_mysekai_data.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     cqs = extract_cq_code(ctx.get_msg())
     qid = int(cqs['at'][0]['qq']) if 'at' in cqs else ctx.user_id
-    uid = get_player_bind_id(ctx)
+    uid = await get_player_bind_id(ctx)
 
     msg = f"{process_hide_uid(ctx, uid, keep=6)}({ctx.region.upper()}) Mysekai数据\n"
     status_sources = get_mysekai_status_sources(ctx.region)
@@ -2457,9 +2458,9 @@ async def _(ctx: SekaiHandlerContext):
 
 # ======================= 定时任务 ======================= #
 
-# MSR自动推送 & MSR订阅更新
 @repeat_with_interval(config.item('mysekai.msr_push_interval_seconds'), 'MSR自动推送', logger)
 async def msr_auto_push():
+    """更新上游 MSR 订阅并检查上传时间，向订阅群推送及时更新的数据。"""
     for region in ALL_SERVER_REGIONS:
         region_name = get_region_name(region)
         ctx = SekaiHandlerContext.from_region(region)
@@ -2468,16 +2469,14 @@ async def msr_auto_push():
         if not get_upload_time_url: continue
         if region not in msr_sub.regions: continue
 
-        # ================================ 订阅来源策略收口 ================================ #
-        # 自动推送和上传时间探测也必须与当前 MySekai 真实来源策略一致，
-        # 否则用户侧手动查询与定时任务会各走各的链路，造成“界面看起来正常、订阅却不触发”。
+        # 上传时间探测和实际取数共用区服来源策略，避免检测到其他来源的更新。
         qids = list(set([qid for qid, gid in msr_sub.get_all_gid_uid(region)]))
         uid_modes: list[tuple[int, str]] = []
         for qid in qids:
-            fetch_mode = get_effective_mysekai_fetch_mode(ctx, qid=qid)
-            for i in range(get_player_bind_count(ctx, qid)):
+            fetch_mode = await get_effective_mysekai_fetch_mode(ctx, qid=qid)
+            for i in range(await get_player_bind_count(ctx, qid)):
                 try:
-                    if uid := get_player_bind_id(ctx, qid, index=i):
+                    if uid := await get_player_bind_id(ctx, qid, index=i):
                         uid_modes.append((uid, fetch_mode))
                 except:
                     pass
@@ -2513,11 +2512,11 @@ async def msr_auto_push():
             if not gbl.check_id(gid): continue
             if region in bd_msr_sub.regions and not bd_msr_sub.is_subbed(region, gid): continue
             
-            for i in range(get_player_bind_count(ctx, qid)):
+            for i in range(await get_player_bind_count(ctx, qid)):
                 msr_last_push_time = file_db.get(f"{region}_msr_last_push_time", {})
 
-                uid = get_player_bind_id(ctx, qid, index=i)
-                mode = get_effective_mysekai_fetch_mode(ctx, qid=qid)
+                uid = await get_player_bind_id(ctx, qid, index=i)
+                mode = await get_effective_mysekai_fetch_mode(ctx, qid=qid)
                 if not uid or (uid, mode) not in need_push_uid_modes:
                     continue
 
@@ -2533,12 +2532,13 @@ async def msr_auto_push():
                 tasks.append((gid, qid, uid))
 
         async def push(task):
+            """为单个订阅任务建立用户上下文，获取并推送对应绑定账号的资源图。"""
             gid, qid, uid = task
             user_ctx = SekaiHandlerContext.from_region(region)
             user_ctx.user_id = int(qid)
             user_ctx.group_id = int(gid)
 
-            index = get_player_bind_id_index(ctx, qid, uid)
+            index = await get_player_bind_id_index(ctx, qid, uid)
             if index is None: return
             user_ctx.uid_arg = f"u{index+1}"
             

@@ -2113,8 +2113,8 @@ async def compose_music_brief_list_image(
     add_watermark(canvas)
     return await canvas.get_img()
 
-# 合成歌曲奖励图片
 async def compose_music_rewards_image(ctx: SekaiHandlerContext, qid: int) -> Image.Image:
+    """根据玩家歌曲成就绘制歌曲奖励图片。"""
     profile, err_msg = await get_detailed_profile(
         ctx, 
         qid, 
@@ -2196,7 +2196,7 @@ async def compose_music_rewards_image(ctx: SekaiHandlerContext, qid: int) -> Ima
         
     # 无抓包的模式
     else:
-        profile = await get_basic_profile(ctx, get_player_bind_id(ctx))
+        profile = await get_basic_profile(ctx, await get_player_bind_id(ctx))
         avatar_info = await get_player_avatar_info_by_basic_profile(ctx, profile)
 
         music_num = len(mids)

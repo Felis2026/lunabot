@@ -355,9 +355,9 @@ async def send_masterdata_update_notify(
             continue
 
 
-# 广告奖励推送
 @repeat_with_interval(5, '广告奖励推送', logger)
 async def msr_auto_push():
+    """检查订阅账号的广告奖励更新时间，将新结果推送到对应群。"""
     for region in ALL_SERVER_REGIONS:
         region_name = get_region_name(region)
         ctx = SekaiHandlerContext.from_region(region)
@@ -371,9 +371,9 @@ async def msr_auto_push():
         qids = list(set([qid for qid, gid in ad_result_sub.get_all_gid_uid(region)]))
         uids = set()
         for qid in qids:
-            for i in range(get_player_bind_count(ctx, qid)):
+            for i in range(await get_player_bind_count(ctx, qid)):
                 try:
-                    if uid := get_player_bind_id(ctx, qid, index=i):
+                    if uid := await get_player_bind_id(ctx, qid, index=i):
                         uids.add(uid)
                 except:
                     pass
@@ -398,10 +398,10 @@ async def msr_auto_push():
             if check_in_blacklist(qid): continue
             if not gbl.check_id(gid): continue
 
-            for i in range(get_player_bind_count(ctx, qid)):
+            for i in range(await get_player_bind_count(ctx, qid)):
                 ad_result_pushed_time = file_db.get(f"{region}_ad_result_pushed_time", {})
 
-                uid = get_player_bind_id(ctx, qid, index=i)
+                uid = await get_player_bind_id(ctx, qid, index=i)
                 if not uid or uid not in need_push_uids:
                     continue
 
