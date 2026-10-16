@@ -492,6 +492,7 @@ async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> dict:
     # ================================ 全部区域道具效果 ================================ #
     area_items = collect_user_area_item_effects(profile['userAreas'], await ctx.md.area_item_levels.get())
     multi_unit_bonus = 0.0
+    global_area_bonus = 0.0
 
     # 角色加成 = 区域道具 + 角色等级 + 烤森家具
     chara_bonus = { i : {
@@ -504,8 +505,8 @@ async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> dict:
         if target == 'chara':
             chara_bonus[value]['area_item'] += item['power1BonusRate']
         elif target == 'all':
-            for bonus in chara_bonus.values():
-                bonus['area_item'] += item['power1BonusRate']
+            # 全角色效果在图中单列，避免把它显示成每个角色的专属道具加成。
+            global_area_bonus += item['power1BonusRate']
         elif target == 'multi_unit':
             multi_unit_bonus += item['power1BonusRate']
     for chara in profile['userCharacters']:
@@ -551,7 +552,43 @@ async def get_user_power_bonus(ctx: SekaiHandlerContext, profile: dict) -> dict:
         "unit": unit_bonus,
         "attr": attr_bouns,
         "multi_unit_bonus": multi_unit_bonus,
+        "global_area_bonus": global_area_bonus,
     }
+
+# ================================ 加成信息的当前区服上限 ================================ #
+async def get_power_bonus_display_limits(ctx: SekaiHandlerContext, profile: dict) -> dict:
+    """按本区服MasterData计算图面强调上限，不改写玩家数据或组卡计算规则。"""
+    # ================================ 区域道具与角色等级上限 ================================ #
+    max_levels = {}
+    for row in await ctx.md.area_item_levels.get():
+        item_id = row['areaItemId']
+        max_levels[item_id] = max(max_levels.get(item_id, 0), row['level'])
+    max_ranks = {}
+    for row in await ctx.md.character_ranks.get():
+        cid = row['characterId']
+        if cid not in max_ranks or row['power1BonusRate'] > max_ranks[cid]['power1BonusRate']:
+            max_ranks[cid] = row
+    max_profile = {
+        'userAreas': [{'areaItems': [{'areaItemId': item_id, 'level': level} for item_id, level in max_levels.items()]}],
+        'userCharacters': list(max_ranks.values()),
+    }
+    # ================================ 可选MySekai加成上限 ================================ #
+    # 尚未开放MySekai或未提供该部分抓包的区服，不为文字染色额外要求这些表。
+    if profile.get('userMysekaiGates'):
+        gate_specs = build_mysekai_gate_specs(
+            await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
+        )
+        max_profile['userMysekaiGates'] = [
+            {'mysekaiGateId': gate_id, 'mysekaiGateLevel': gate['max_level']}
+            for gate_id, gate in gate_specs.items() if gate['max_level']
+        ]
+    if profile.get('userMysekaiFixtureGameCharacterPerformanceBonuses'):
+        limit = (await ctx.md.get('mysekaiFixtureGameCharacterPerformanceBonusLimit'))['bonusRateLimit']
+        max_profile['userMysekaiFixtureGameCharacterPerformanceBonuses'] = [
+            {'gameCharacterId': cid, 'totalBonusRate': limit} for cid in range(1, 27)
+        ]
+    return await get_user_power_bonus(ctx, max_profile)
+
 
 # 合成加成详情图片
 async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -> Image.Image:
@@ -565,10 +602,37 @@ async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -
     chara_bonus = bonus['chara']
     unit_bonus = bonus['unit']
     attr_bonus = bonus['attr']
+    limits = await get_power_bonus_display_limits(ctx, profile)
 
     header_h, row_h = 56, 48
     header_style = TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=(25, 25, 25, 255))
     text_style = TextStyle(font=DEFAULT_FONT, size=16, color=(100, 100, 100, 255))
+
+    # ================================ 已满分项强调与大树图标 ================================ #
+    def completed_style(style, value, maximum):
+        # 百分比存在浮点累加误差；上限为零的未开放分项不标记为已满。
+        return style.replace(color=(50, 150, 50)) if maximum > 0 and value >= maximum - 0.0001 else style
+
+    def draw_bonus_parts(values, maxima, category):
+        """分项仍放在原来一行，只对已满的名称染色、数值加粗染色。"""
+        parts = [('角色道具', 'area_item'), ('角色等级', 'rank'), ('烤森玩偶', 'fixture')] if category == 'chara' else [('团体道具', 'area_item'), ('烤森门', 'gate')]
+        with HSplit().set_sep(0).set_content_align('l').set_item_align('l'):
+            for index, (label, key) in enumerate(parts):
+                if index:
+                    TextBox(' + ', text_style)
+                full = maxima[key] > 0 and values[key] >= maxima[key] - 0.0001
+                style = completed_style(text_style, values[key], maxima[key])
+                TextBox(label, style)
+                TextBox(f'{values[key]:.1f}%', style.replace(font=DEFAULT_BOLD_FONT if full else DEFAULT_FONT))
+
+    tree_icon, tree_name = None, None
+    if bonus['global_area_bonus'] or bonus['multi_unit_bonus']:
+        tree_id = next((row['areaItemId'] for row in await ctx.md.area_item_levels.get() if get_area_item_target(row)[0] == 'multi_unit'), None)
+        tree = await ctx.md.area_items.find_by_id(tree_id) if tree_id is not None else None
+        tree_name = tree['name'] if tree else '想いの大樹'
+        tree_icon = await get_area_item_icon(ctx, tree['assetbundleName']) if tree else UNKNOWN_IMG
+        if tree_icon.mode == 'RGBA' and tree_icon.getbbox():
+            tree_icon = tree_icon.crop(tree_icon.getbbox())
 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
@@ -579,11 +643,11 @@ async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -
                 for cids in cid_parts:
                     with Grid(col_count=2).set_content_align('l').set_item_align('l').set_sep(20, 4).set_padding(16):
                         for cid in cids:
-                            with HSplit().set_content_align('l').set_item_align('l').set_sep(4):
-                                ImageBox(get_chara_icon_by_chara_id(cid), size=(None, 40))
-                                TextBox(f"{chara_bonus[cid]['total']:.1f}%", header_style).set_w(100).set_content_align('r').set_overflow('clip')
-                                detail = f"区域道具{chara_bonus[cid]['area_item']:.1f}% + 角色等级{chara_bonus[cid]['rank']:.1f}% + 烤森玩偶{chara_bonus[cid]['fixture']:.1f}%"
-                                TextBox(detail, text_style)
+                            with Frame().set_w(569).set_content_align('l'):
+                                with HSplit().set_content_align('l').set_item_align('l').set_sep(4):
+                                    ImageBox(get_chara_icon_by_chara_id(cid), size=(None, 40))
+                                    TextBox(f"{chara_bonus[cid]['total']:.1f}%", header_style).set_w(100).set_content_align('r').set_overflow('clip')
+                                    draw_bonus_parts(chara_bonus[cid], limits['chara'][cid], 'chara')
                         
                 # 组合加成
                 with Grid(col_count=3).set_content_align('l').set_item_align('l').set_sep(20, 4).set_padding(16):
@@ -591,23 +655,23 @@ async def compose_power_bonus_detail_image(ctx: SekaiHandlerContext, qid: int) -
                         with HSplit().set_content_align('l').set_item_align('l').set_sep(4):
                             ImageBox(get_unit_icon(unit), size=(None, 40))
                             TextBox(f"{unit_bonus[unit]['total']:.1f}%", header_style).set_w(100).set_content_align('r').set_overflow('clip')
-                            detail = f"区域道具{unit_bonus[unit]['area_item']:.1f}% + 烤森门{unit_bonus[unit]['gate']:.1f}%"
-                            TextBox(detail, text_style)
+                            draw_bonus_parts(unit_bonus[unit], limits['unit'][unit], 'unit')
 
                 # 属性加成
                 with Grid(col_count=5).set_content_align('l').set_item_align('l').set_sep(20, 4).set_padding(16):
                     for attr in CARD_ATTRS:
                         with HSplit().set_content_align('l').set_item_align('l').set_sep(4):
                             ImageBox(get_attr_icon(attr), size=(None, 40))
-                            TextBox(f"{attr_bonus[attr]['total']:.1f}%", header_style).set_w(100).set_content_align('r').set_overflow('clip')
-                            # detail = f"区域道具{attr_bonus[attr]['area_item']:.1f}%"
-                            # TextBox(detail, text_style)
+                            TextBox(f"{attr_bonus[attr]['total']:.1f}%", completed_style(header_style, attr_bonus[attr]['total'], limits['attr'][attr]['total'])).set_w(100).set_content_align('r').set_overflow('clip')
 
                 # 条件加成不能并入所有角色的固定合计，实际取舍交给原生内核按队伍计算。
-                if bonus['multi_unit_bonus']:
-                    with VSplit().set_padding(16).set_sep(4):
-                        TextBox(f"混团条件加成 +{bonus['multi_unit_bonus']:.1f}%", header_style)
-                        TextBox("实际生效由编队决定，不与同团额外加成直接相加", text_style)
+                if tree_icon is not None:
+                    with HSplit().set_padding(16).set_sep(28).set_item_align('c').set_content_align('l'):
+                        ImageBox(tree_icon, size=(48, 48), image_size_mode='fit')
+                        TextBox(tree_name, header_style)
+                        tree_style = TextStyle(font=DEFAULT_BOLD_FONT, size=22, color=(70, 70, 70))
+                        TextBox(f"全角色加成 +{bonus['global_area_bonus']:.1f}%", completed_style(tree_style, bonus['global_area_bonus'], limits['global_area_bonus']))
+                        TextBox(f"混团额外 +{bonus['multi_unit_bonus']:.1f}%", completed_style(tree_style, bonus['multi_unit_bonus'], limits['multi_unit_bonus']))
 
     add_watermark(canvas)
     return await canvas.get_img()
