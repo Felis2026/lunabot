@@ -1183,17 +1183,36 @@ def run_official_native_canaries(
 # ================================ staging 与原子发布 ================================ #
 
 def _acquire_build_lock(root: Path, stale_seconds: int = 1800) -> Path:
+    """创建独占构建锁，返回锁文件路径，锁仍被占用时抛出 RulesetBuildError。
+
+    POSIX 通过 PID 存活状态判断占用，确认进程退出后回收旧锁。
+    Windows 或 PID 尚不可解析时，按 stale_seconds 判断是否陈旧。
+    """
     lock_path = root / ".build.lock"
     root.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         try:
+            # 容器内被终止的 Builder 无法执行 finally，确认原 PID 已退出后才释放锁。
+            if os.name != 'nt':
+                owner = int(lock_path.read_text(encoding='utf-8').strip().removeprefix('pid='))
+                try:
+                    os.kill(owner, 0)
+                except ProcessLookupError:
+                    lock_path.unlink()
+                    return _acquire_build_lock(root, stale_seconds)
+                raise RulesetBuildError("已有 preview builder 正在运行")
             if time.time() - lock_path.stat().st_mtime > stale_seconds:
                 lock_path.unlink()
                 return _acquire_build_lock(root, stale_seconds)
         except FileNotFoundError:
             return _acquire_build_lock(root, stale_seconds)
+        except ValueError:
+            # 另一个进程可能刚创建锁、尚未写完 PID；新锁按占用处理。
+            if time.time() - lock_path.stat().st_mtime > stale_seconds:
+                lock_path.unlink()
+                return _acquire_build_lock(root, stale_seconds)
         raise RulesetBuildError("已有 preview builder 正在运行")
     with os.fdopen(fd, "w", encoding="utf-8") as file:
         file.write(f"pid={os.getpid()}\n")
@@ -1273,13 +1292,21 @@ def build_and_publish_ruleset(
     event_allowlist: Iterable[int] = (),
     episode_optional_card_supply_ids: Iterable[int] = (),
     run_canaries: bool = True,
+    publish_pointer: bool = True,
+    staging_id: str | None = None,
 ) -> RulesetBuildResult:
-    """构建、复核并原子发布一份可路由的 preview 规则集。"""
+    """构建并复核 preview 规则集，返回版本目录及活动、卡牌信息。
+
+    来源、版本和策略匹配时直接返回已有产物。
+    新产物在 staging 暂存并复核，staging_id 可指定 UUID 任务目录名。
+    publish_pointer=True 时更新 current.json，False 时由调用方另行发布指针。
+    构建失败时清理本次暂存目录，并向调用方传播异常。
+    """
 
     root = Path(output_root).resolve()
     lock_path = _acquire_build_lock(root)
     staging_parent = root / "staging"
-    staging_dir = staging_parent / uuid.uuid4().hex
+    staging_dir = staging_parent / (uuid.UUID(staging_id).hex if staging_id else uuid.uuid4().hex)
     try:
         expected = tuple(expected_filenames)
         source_paths = {
@@ -1366,7 +1393,8 @@ def build_and_publish_ruleset(
             "scope_fingerprint": scope_fingerprint,
             "version_dir": str(Path("versions") / version_token).replace("\\", "/"),
         }
-        _atomic_write(root / "current.json", _canonical_json_bytes(pointer))
+        if publish_pointer:
+            _atomic_write(root / "current.json", _canonical_json_bytes(pointer))
         return RulesetBuildResult(
             scope_fingerprint=scope_fingerprint,
             version_dir=str(version_dir),

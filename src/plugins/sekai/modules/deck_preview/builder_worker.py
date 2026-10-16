@@ -27,7 +27,11 @@ from src.services.deck_recommender.masterdata_spec import (
     get_optional_deck_masterdata_filenames,
     get_spec_filenames,
 )
-from deck_preview.protocol import publish_result
+from deck_preview.protocol import (
+    publish_result, build_request_identity,
+    calc_source_stat_fingerprint as _calc_source_stat_fingerprint,
+    verify_request_source_fingerprints as _verify_request_source_fingerprints,
+)
 from deck_preview.ruleset import (
     build_and_publish_ruleset,
     run_official_native_canaries,
@@ -210,31 +214,6 @@ def _build_full_sync_payload(
 
 # ================================ 正式CN切回探针 ================================ #
 
-def _calc_source_stat_fingerprint(paths: dict[str, str]) -> str:
-    """复现 Bot 正式同步所用的文件指纹，确保探针与已确认节点针对同一批 CN 文件。"""
-
-    digest = hashlib.md5()
-    for path_text in paths.values():
-        path = Path(path_text)
-        stat = path.stat()
-        digest.update(
-            f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}\n".encode("utf-8")
-        )
-    return digest.hexdigest()
-
-
-def _verify_request_source_fingerprints(request: dict) -> None:
-    """拒绝把 provider 取样之后已经变化的 CN/JP 文件发布成旧身份。"""
-
-    for region in ("cn", "jp"):
-        expected = str(request[f"{region}_source_fingerprint"])
-        actual = _calc_source_stat_fingerprint(request[f"{region}_paths"])
-        if actual != expected:
-            raise RuntimeError(
-                f"{region.upper()} 来源指纹已变化，等待下一轮重新构建"
-            )
-
-
 def _run_official_canaries(
     request: dict,
     expected_filenames: tuple[str, ...],
@@ -363,6 +342,12 @@ def _invalidate_stale_official_canary(
 
 
 def main() -> int:
+    """读取命令行指定的请求文件，构建规则集和同步包并写入结果文件。
+
+    defer_publication=True 时由父进程提交生效指针，结果携带 request_identity。
+    返回 0 表示已写入可消费结果，预览构建错误可随正式探针结果一并返回。
+    外层任务失败返回 1，命令行参数数量错误返回 2。
+    """
     if len(sys.argv) != 3:
         print("usage: builder_worker.py <request.json> <result.json>", file=sys.stderr)
         return 2
@@ -417,6 +402,8 @@ def main() -> int:
                     [],
                 ),
                 run_canaries=bool(request.get("run_canaries", True)),
+                publish_pointer=not request.get('defer_publication', False),
+                staging_id=request.get('job_id'),
             )
         except Exception as exc:
             # 正式切回不能被无关的 JP preview 构建故障拖住；调度器会先消费
@@ -427,6 +414,7 @@ def main() -> int:
             )
             _atomic_write_json(result_path, {
                 "ok": True,
+                "request_identity": build_request_identity(request),
                 "result": {
                     "official_canary": official_canary,
                     "preview_error": {
@@ -444,8 +432,11 @@ def main() -> int:
         result_data["sync_metadata"] = sync_metadata
         result_data["official_canary"] = official_canary
         # payload、manifest 和 canary 都完成后才让非 owner 节点看见这一版本。
-        publish_result(request["output_root"], request, result_data)
-        _atomic_write_json(result_path, {"ok": True, "result": result_data})
+        if not request.get('defer_publication', False):
+            publish_result(request["output_root"], request, result_data)
+        _atomic_write_json(result_path, {
+            "ok": True, "request_identity": build_request_identity(request), "result": result_data,
+        })
         return 0
     except BaseException as exc:
         _atomic_write_json(result_path, {

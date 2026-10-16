@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ from ....utils import (
     compress_zstd,
     get_client_session,
     get_exc_desc,
+    run_managed_subprocess,
 )
 from ...common import config, logger
 
@@ -23,6 +25,10 @@ from .protocol import (
     PreviewRuntimeState,
     PreviewStatus,
     load_published_result,
+    build_request_identity,
+    prepare_published_result,
+    commit_published_result,
+    verify_request_source_fingerprints,
 )
 from .router import OfficialActivationStore
 
@@ -314,6 +320,10 @@ class PreviewManager:
         self._state.message = message
 
     async def _run_once(self) -> None:
+        """执行一轮来源检查、规则集构建和节点同步，按结果更新预览状态。
+
+        刷新期间继续提供已就绪版本，构建失败按来源退避，活动满足条件时切回正式数据。
+        """
         async with self._lock:
             previous_ready_state: PreviewRuntimeState | None = None
             try:
@@ -381,9 +391,15 @@ class PreviewManager:
                     PreviewStatus.BUILDING,
                     "正在构建并校验预演规则",
                 )
-                result = await self._run_builder(source["builder_request"])
+                try:
+                    result = await self._run_builder(source["builder_request"])
+                except Exception:
+                    # 超时、启动失败与构建错误共用来源退避，不在每轮调度中重复启动。
+                    self._failed_source_signature = source_signature
+                    self._failed_source_retry_at = time.monotonic() + FAILED_SOURCE_RETRY_SECONDS
+                    raise
 
-                # ================================ 正式活动粘性切回 ================================ #
+                # 已满足正式条件的活动登记切回状态，避免后续再次进入预览。
                 # 闭包、正式节点指纹和子进程原生计算三者全部确认后才先落盘再切路由。
                 official_canary = result.get("official_canary", {})
                 confirmed_official_ids = {
@@ -548,9 +564,14 @@ class PreviewManager:
         ])
         return sorted({url for url in results if url})
 
-    # ================================ Builder子进程 ================================ #
+    # Builder 子进程。
 
     async def _run_builder(self, request: dict[str, Any]) -> dict[str, Any]:
+        """获取与请求匹配的构建结果，owner 节点构建并提交，其他节点读取已发布结果。
+
+        owner 在复核来源和任务身份后提交生效指针，退出前清理本次任务文件。
+        执行失败向调用方传播异常，取消时等待子进程和文件清理完成。
+        """
         if not bool(_config_get("deck.cn_jp_preview.builder_owner", True)):
             # 多 Bot 部署必须给非 owner 节点挂载同一发布目录；这里严格校验
             # 来源、策略、manifest 与 payload，绝不自行构建或消费旧版本。
@@ -560,12 +581,14 @@ class PreviewManager:
                 request,
             )
 
+        # 每次任务使用独立输入、结果和暂存目录。
         output_root = Path(request["output_root"]).resolve()
         jobs_dir = output_root / "jobs"
         job_id = uuid.uuid4().hex
         request_path = jobs_dir / f"{job_id}.request.json"
         result_path = jobs_dir / f"{job_id}.result.json"
-        await asyncio.to_thread(_atomic_write_json, request_path, request)
+        self._builder_job_id = job_id
+        worker_request = {**request, 'defer_publication': True, 'job_id': job_id}
 
         worker_path = Path(__file__).with_name("builder_worker.py").resolve()
         kwargs: dict[str, Any] = {}
@@ -576,26 +599,26 @@ class PreviewManager:
             )
         else:
             kwargs["preexec_fn"] = _lower_posix_process_priority
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(worker_path),
-            str(request_path),
-            str(result_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs,
-        )
+        # 写入请求后限时等待构建结果，再核对响应身份。
+        write_task = asyncio.create_task(asyncio.to_thread(_atomic_write_json, request_path, worker_request))
         try:
-            stdout, stderr = await process.communicate()
+            await asyncio.shield(write_task)
+            completed = await run_managed_subprocess(
+                sys.executable, str(worker_path), str(request_path), str(result_path),
+                process_key=f'sekai-preview-builder:{output_root}',
+                timeout=float(_config_get('deck.cn_jp_preview.builder_timeout_seconds', 300)),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs,
+            )
+            stdout, stderr = completed.stdout, completed.stderr
             if not result_path.is_file():
                 detail = stderr.decode("utf-8", errors="replace")[-2000:]
                 raise RuntimeError(
-                    f"preview builder 未生成结果 rc={process.returncode}: {detail}"
+                    f"preview builder 未生成结果 rc={completed.returncode}: {detail}"
                 )
             response = await asyncio.to_thread(
                 lambda: json.loads(result_path.read_text(encoding="utf-8"))
             )
-            if process.returncode != 0 or not response.get("ok"):
+            if completed.returncode != 0 or not response.get("ok"):
                 raise RuntimeError(
                     response.get("error")
                     or stderr.decode("utf-8", errors="replace")[-2000:]
@@ -605,13 +628,35 @@ class PreviewManager:
                     "preview builder: "
                     + stdout.decode("utf-8", errors="replace")[-1000:]
                 )
-            return response["result"]
+            if response.get('request_identity') != build_request_identity(request):
+                raise RuntimeError('preview builder 返回了不同请求的结果')
+            result = response['result']
+            # 最终发布前再次核对来源与任务有效性。
+            if not result.get('preview_error'):
+                descriptor = await asyncio.to_thread(prepare_published_result, str(output_root), request, result)
+                # 大文件校验留在线程中；最终提交前只复核来源 stat 与任务身份。
+                verify_request_source_fingerprints(request)
+                if self._builder_job_id != job_id or asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
+                commit_published_result(str(output_root), descriptor)
+            return result
         finally:
+            # 输入写入与清理不能竞速，否则取消后后台线程可能重新留下请求文件。
+            while not write_task.done():
+                try:
+                    await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    continue
+            write_task.result()
             for path in (request_path, result_path):
                 try:
                     path.unlink()
                 except FileNotFoundError:
                     pass
+            # staging_id 来自本次 UUID，递归清理仅限解析后仍在发布根目录内的任务目录。
+            staging_path = (output_root / 'staging' / job_id).resolve()
+            if output_root in staging_path.parents and staging_path.is_dir():
+                await asyncio.to_thread(shutil.rmtree, staging_path, True)
 
     # ================================ Preview节点同步 ================================ #
 

@@ -52,6 +52,7 @@ import aiohttp
 import random
 import shutil
 import subprocess
+import signal
 import re
 import math
 import io
@@ -369,6 +370,113 @@ _pending_startup_tasks: List[Any] = []
 
 STARTUP_TASK_MIN_DELAY = global_config.get('startup_task_delay_seconds.min')
 STARTUP_TASK_MAX_DELAY = global_config.get('startup_task_delay_seconds.max')
+
+# ================================ 受控子进程 ================================ #
+# 仅保存尚未回收的任务槽位；异常进程未确认退出时，同键任务不能再次启动。
+_managed_subprocesses: dict[str, dict] = {}
+
+
+async def _signal_process_group(process, force: bool):
+    """向任务进程组发送终止信号，force=True 时请求强制结束。
+
+    POSIX 使用 killpg，Windows 在父进程仍运行时使用 taskkill /T 终止进程树。
+    """
+    try:
+        if os.name == 'nt':
+            if process.returncode is None:
+                arguments = ['taskkill', '/PID', str(process.pid), '/T']
+                if force:
+                    arguments.append('/F')
+                killer = await asyncio.create_subprocess_exec(
+                    *arguments, stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                try:
+                    await asyncio.wait_for(killer.wait(), 2)
+                except asyncio.TimeoutError:
+                    killer.kill()
+                    await killer.wait()
+        else:
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+async def _finish_managed_subprocess(key, slot, spawn, succeeded):
+    """接收启动结果并清理进程，无法确认回收时保留槽位阻止同键任务启动。"""
+    try:
+        process = await spawn
+    except BaseException:
+        if _managed_subprocesses.get(key) is slot:
+            _managed_subprocesses.pop(key)
+        return
+    slot['process'] = process
+    reader = slot.get('reader')
+    if reader is None:
+        reader = slot['reader'] = asyncio.create_task(process.communicate())
+    try:
+        if not succeeded:
+            await _signal_process_group(process, False)
+            try:
+                await asyncio.wait_for(asyncio.shield(reader), 5)
+            except Exception:
+                await _signal_process_group(process, True)
+                await asyncio.wait_for(asyncio.shield(reader), 2)
+            if process.returncode is None:
+                await asyncio.wait_for(process.wait(), 2)
+    finally:
+        if reader.done():
+            if not reader.cancelled():
+                reader.exception()
+            if process.returncode is not None and _managed_subprocesses.get(key) is slot:
+                _managed_subprocesses.pop(key)
+
+
+async def run_managed_subprocess(*arguments, process_key: str, timeout: float, **kwargs):
+    """启动受控子进程并返回 CompletedProcess，按 process_key 限制任务重叠。
+
+    timeout 限制 communicate() 等待输出的秒数，进程启动和退出清理耗时另计。
+    超时或取消后先等待清理，再传播异常；清理失败时可传播清理异常。
+    同键任务尚未回收时抛出 RuntimeError，非法时限抛出 ValueError。
+    """
+    # 同键进程及输出读取均完成后才允许复用槽位。
+    if not math.isfinite(float(timeout)) or timeout <= 0:
+        raise ValueError('子进程超时必须是大于 0 的有限秒数')
+    existing = _managed_subprocesses.get(process_key)
+    if existing is not None:
+        process, reader = existing.get('process'), existing.get('reader')
+        if process is None or process.returncode is None or reader is None or not reader.done():
+            raise RuntimeError(f'上一子进程尚未回收: {process_key}')
+    slot = {}
+    _managed_subprocesses[process_key] = slot
+    if os.name == 'nt':
+        kwargs['creationflags'] = kwargs.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs['start_new_session'] = True
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*arguments, **kwargs))
+    succeeded = False
+    # 启动进程后限时等待输出。
+    try:
+        # 启动交接也受保护，避免取消恰好发生在进程创建完成、句柄尚未返回时。
+        process = await asyncio.shield(spawn)
+        slot['process'] = process
+        reader = slot['reader'] = asyncio.create_task(process.communicate())
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(reader), timeout)
+        succeeded = True
+        return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+    finally:
+        # 清理任务独立运行，重复取消仍需等待其完成。
+        cleanup = asyncio.create_task(_finish_managed_subprocess(process_key, slot, spawn, succeeded))
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
 
 async def run_in_pool(func, *args, pool=None):
     if pool is None:

@@ -168,12 +168,33 @@ def _resolve_path(root: Path, value: str, label: str) -> Path:
 
 # ================================ 原子发布与消费 ================================ #
 
-def publish_result(
+def calc_source_stat_fingerprint(paths: Mapping[str, str]) -> str:
+    """按传入顺序计算文件名、大小和纳秒修改时间的 MD5 指纹。"""
+    digest = hashlib.md5()
+    for path_text in paths.values():
+        path = Path(path_text)
+        stat = path.stat()
+        digest.update(f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}\n".encode('utf-8'))
+    return digest.hexdigest()
+
+
+def verify_request_source_fingerprints(request: Mapping[str, Any]) -> None:
+    """核对 CN/JP 来源文件指纹，发生变化时抛出 PublishedPreviewError。"""
+    for region in ('cn', 'jp'):
+        if calc_source_stat_fingerprint(request[f'{region}_paths']) != str(request[f'{region}_source_fingerprint']):
+            raise PublishedPreviewError(f'{region.upper()} 来源指纹已变化，等待下一轮重新构建')
+
+
+def prepare_published_result(
     output_root: str,
     request: Mapping[str, Any],
     result: Mapping[str, Any],
-) -> None:
-    """在 payload 已完整落盘后发布轻量描述符，供只读 Bot 副本消费。"""
+) -> dict[str, Any]:
+    """同步准备发布描述符，包含请求身份、相对路径和 payload 的 SHA256。
+
+    本函数仅读取产物，执行线程由调用方选择。
+    文件缺失或路径越界时抛出 PublishedPreviewError。
+    """
 
     root = Path(output_root).resolve()
     payload_path = Path(str(result["sync_payload_path"])).resolve()
@@ -193,7 +214,26 @@ def publish_result(
         "payload_sha256": _sha256_file(payload_path),
         "result": descriptor_result,
     }
-    _atomic_write_json(root / "published.json", descriptor)
+    return descriptor
+
+
+def commit_published_result(output_root: str, descriptor: Mapping[str, Any]) -> None:
+    """同步依次原子写入 current.json 和 published.json。
+
+    调用方须先确认请求身份、来源和任务仍有效，本函数直接提交描述符。
+    """
+    root = Path(output_root).resolve()
+    result = descriptor['result']
+    _atomic_write_json(root / 'current.json', {
+        'scope_fingerprint': result['scope_fingerprint'],
+        'version_dir': result['version_dir'],
+    })
+    _atomic_write_json(root / 'published.json', descriptor)
+
+
+def publish_result(output_root: str, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+    """同步准备发布描述符并写入生效指针。"""
+    commit_published_result(output_root, prepare_published_result(output_root, request, result))
 
 
 def load_published_result(
