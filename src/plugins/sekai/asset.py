@@ -1477,10 +1477,9 @@ class StaticImageRes:
         self.lock = threading.Lock()
 
     def get(self, path: str, size: Tuple[int, int] = None) -> Image.Image:
-        """
-        基于基础目录获取指定路径的图片资源
-        当图片在本地更新时，会自动重新加载
-        指定size时会缩放图片到指定大小
+        """读取基础目录下的图片资源，返回独立图片副本。
+
+        本地文件更新后自动重新加载，指定 size 时缩放到对应尺寸。
         """
         fullpath = pjoin(self.dir, path)
         if not osp.exists(fullpath):
@@ -1492,10 +1491,11 @@ class StaticImageRes:
                 if mtime != time:
                     self.images[path] = (open_image(fullpath).convert('RGBA'), mtime)
                 img, time = self.images[path]
-                if size:
-                    img = resize_by_optional_size(img, size)
-                self.images[path] = (img, time) 
-                return self.images[path][0]
+            # 缓存始终保存原图；缩放在锁外生成结果，同尺寸或原尺寸也返回独立副本。
+            if size:
+                resized = resize_by_optional_size(img, size)
+                return resized.copy() if resized is img else resized
+            return img.copy()
         except:
             raise FileNotFoundError(f"读取静态图片资源 {fullpath} 失败")
 
