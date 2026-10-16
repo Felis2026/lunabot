@@ -1747,6 +1747,17 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
                     TextBox("当前仅按 JP 服务器的升级材料要求预览", notice_style)
                     TextBox("以 CN 服务器开放后的实际要求为准", notice_style)
 
+            # ================================ CN普通查询预览指引 ================================ #
+            if ctx.region == 'cn' and not preview:
+                guide_text = "可使用 /msg 预览  查看后续等级材料"
+                guide_style = TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK)
+                if profile:
+                    guide_column = next(item for item in header.items[0].items if isinstance(item, VSplit))
+                    with guide_column:
+                        TextBox(guide_text, guide_style)
+                else:
+                    TextBox(guide_text, guide_style).set_bg(roundrect_bg()).set_padding(16)
+
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_bg(roundrect_bg()).set_padding(8):
                 for gid, lv_materials in gate_materials.items():
                     gate_icon = await get_mysekai_gate_icon(ctx, gate_specs[gid])
@@ -1785,7 +1796,9 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
         content = json.dumps(gate_materials, sort_keys=True, separators=(',', ':')).encode('utf-8')
         # 数字居中后不能复用旧卡面；预览模式单独缓存，避免国服追平日服后混用说明。
         mode = 'preview' if preview else 'normal'
-        cache_key = f"{ctx.region}_pjsk_msg_centered_{mode}_{hashlib.sha256(content).hexdigest()[:16]}"
+        # 仅更新新增指引的CN普通图缓存；JP和已有预览图继续复用原缓存。
+        layout = 'centered_guide' if ctx.region == 'cn' and not preview else 'centered'
+        cache_key = f"{ctx.region}_pjsk_msg_{layout}_{mode}_{hashlib.sha256(content).hexdigest()[:16]}"
     return await canvas.get_img(cache_key=cache_key)
 
 async def compose_mysekai_musicrecord_image(ctx: SekaiHandlerContext, qid: int, show_id: bool = False) -> Image.Image:
