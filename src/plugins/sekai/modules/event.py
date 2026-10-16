@@ -937,6 +937,43 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
     h = 1024
     w = min(int(h * 1.6), event_bg.size[0] * h // event_bg.size[1] if event_bg else int(h * 1.6))
     bg = ImageBg(event_bg, blur=False) if event_bg else SEKAI_BLUE_BG
+
+    # ================================ WL章节日程与右栏尺寸 ================================ #
+    async def draw_chapter_schedule():
+        """在时间面板内展示角色日程，状态只改变颜色，保持各行字重和对齐一致。"""
+        with VSplit().set_padding(0).set_margin(0).set_sep(2).set_item_align('l').set_content_align('l'):
+            for chapter in wl_chapters:
+                current = chapter['start_time'] <= now < chapter['end_time']
+                ended = now >= chapter['end_time']
+                color = (50, 150, 50) if current else (125, 125, 125) if ended else (70, 70, 70)
+                style = TextStyle(font=DEFAULT_FONT, size=16, color=color)
+                chara = await ctx.md.game_characters.find_by_id(chapter['wl_cid'])
+                name = chara.get('firstName', '') + chara.get('givenName', '')
+                dates = chapter['start_time'].strftime('%m/%d %H:%M') + ' — ' + chapter['end_time'].strftime('%m/%d %H:%M')
+                with HSplit().set_padding(0).set_margin(0).set_sep(6).set_item_align('c').set_content_align('l'):
+                    ImageBox(get_chara_icon_by_chara_id(chapter['wl_cid']), size=(22, 22)).set_margin(0)
+                    TextBox(name, style).set_w(86).set_margin(0)
+                    TextBox(dates, style).set_margin(0)
+
+    def fit_wl_sidebar(sidebar):
+        """统一WL右栏宽度；六章节等较长页面只收紧空隙与Logo，卡图和字号不缩小。"""
+        def invalidate_size(widget):
+            widget._calc_w = widget._calc_h = None
+            for child in getattr(widget, 'items', []):
+                invalidate_size(child)
+
+        sidebar.set_w(512)
+        for item in sidebar.items[1:]:
+            item.set_w(480)
+        for gap, padding, panel_padding, logo_height in [(16, 16, 16, 150), (10, 12, 12, 120), (10, 12, 12, 100), (8, 12, 8, 72)]:
+            sidebar.set_sep(gap).set_padding(padding)
+            sidebar.items[0].set_h(logo_height)
+            for item in sidebar.items[1:]:
+                item.set_padding((12 if panel_padding < 12 else panel_padding, panel_padding))
+            # 绘图组件会缓存测量结果；收紧布局后必须重新测量，避免用旧高度判断溢出。
+            invalidate_size(sidebar)
+            if sidebar._get_self_size()[1] <= h - BG_PADDING * 2:
+                break
     
     async def draw(w, h):
         with Canvas(bg=bg, w=w, h=h).set_padding(BG_PADDING).set_content_align('r') as canvas:
@@ -946,7 +983,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                     chara_img = chara_img.crop((get_left_transparent_width(chara_img), 0, chara_img.width, chara_img.height))
                     ImageBox(chara_img, size=(None, int(h * 0.9)), use_alphablend=True).set_offset((0, BG_PADDING))
 
-            with VSplit().set_padding(16).set_sep(16).set_item_align('t').set_content_align('t').set_item_bg(roundrect_bg()):
+            with VSplit().set_padding(16).set_sep(16).set_item_align('t').set_content_align('t').set_item_bg(roundrect_bg()) as sidebar:
                 # logo
                 ImageBox(detail.event_logo, size=(None, 150)).set_omit_parent_bg(True)
 
@@ -1014,6 +1051,9 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                             Spacer(w=progress_w+border*2, h=progress_h+border*2).set_bg(RoundRectBg((75, 75, 75, 255), 4))
                             Spacer(w=int(progress_w * progress), h=progress_h).set_bg(RoundRectBg((255, 255, 255, 255), 4)).set_offset((border, border))
 
+                    if detail.etype == 'world_bloom' and len(wl_chapters) > 1:
+                        await draw_chapter_schedule()
+
                 # 活动卡片
                 if detail.event_cards:
                     with HSplit().set_padding(16).set_sep(16).set_item_align('c').set_content_align('c'):
@@ -1043,6 +1083,8 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                                 for cid in bonus_cids:
                                     ImageBox(get_chara_icon_by_chara_id(cid), size=(None, 40))
 
+        if detail.etype == 'world_bloom':
+            fit_wl_sidebar(sidebar)
         add_watermark(canvas)
         return await canvas.get_img()
 
