@@ -235,6 +235,10 @@ class WorkerContext:
     thread_pool: ThreadPoolExecutor = None
     worker_num: int = 0
     restart_lock = threading.Lock()
+    # 取消后等待 100 毫秒，接收并丢弃即将完成的旧结果，以便复用 Worker。
+    CANCEL_GRACE_SECONDS = 0.1
+    # 队列读取每隔最多 50 毫秒检查停止信号，结果到达时立即返回。
+    RESULT_POLL_SECONDS = 0.05
 
     @staticmethod
     def worker_loop(worker: Worker, task_queue: Queue, result_queue: Queue):
@@ -308,6 +312,7 @@ class WorkerContext:
 
     @staticmethod
     def _stop_process(process: Any | None, *, worker_id: int):
+        """终止并回收旧 Worker 进程，强制结束后仍未退出或清理失败时抛出异常。"""
         if process is None:
             return
         try:
@@ -319,10 +324,13 @@ class WorkerContext:
                     log(f"[worker-{worker_id}] terminate 未结束，强制 kill pid={process.pid}")
                     process.kill()
                     process.join(timeout=1.0)
+                if process.is_alive():
+                    raise RuntimeError(f"Worker {worker_id} 旧子进程尚未退出")
             else:
                 process.join(timeout=0)
         except Exception as e:
             error(f"[worker-{worker_id}] 清理旧子进程失败:", get_exc_desc(e))
+            raise
         finally:
             try:
                 process.close()
@@ -407,33 +415,89 @@ class WorkerContext:
                     current = cls.all_workers.get(ctx.worker.worker_id, ctx.worker)
                     cls.available_workers.put_nowait(current)
 
+    # 结果接收与取消恢复。
+    @classmethod
+    def _read_result(cls, result_queue, timeout: float, stop: threading.Event):
+        """阻塞接收结果，超时抛出 Empty，收到停止信号时返回 None。"""
+        deadline = time.monotonic() + timeout
+        while not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Empty
+            try:
+                return result_queue.get(True, min(cls.RESULT_POLL_SECONDS, remaining))
+            except Empty:
+                continue
+            except (OSError, ValueError, EOFError):
+                if not stop.is_set():
+                    raise
+        return None
+
+    async def _recover_result(self, reader, stop, worker_id, process, task_queue, result_queue, cancelled):
+        """清理旧结果读取任务，并恢复可用的 Worker。
+
+        取消时先短暂等待旧结果，及时收到则复用当前进程。
+        超时或接收失败时隔离旧槽位，重建进程并等待旧读取线程退出。
+        恢复失败时保持槽位隔离并抛出 RuntimeError。
+        """
+        if cancelled:
+            try:
+                await asyncio.wait_for(asyncio.shield(reader), self.CANCEL_GRACE_SECONDS)
+                return
+            except Exception:
+                pass
+        stop.set()
+        self.worker = None
+        try:
+            worker = await asyncio.to_thread(
+                self._restart_worker, worker_id,
+                expected_process=process, expected_task_queue=task_queue,
+                expected_result_queue=result_queue,
+            )
+            # 旧接收线程确认退出后才能复用槽位，避免取消积累占满线程池。
+            await asyncio.gather(reader, return_exceptions=True)
+            self.worker = worker
+        except Exception as error:
+            await asyncio.gather(reader, return_exceptions=True)
+            raise RuntimeError(f"Worker恢复失败，已隔离对应槽位: {get_exc_desc(error)}") from error
+
     async def _get_result(self):
+        """异步等待当前任务结果，取消、超时或队列异常时先完成恢复。
+
+        取消向调用方传播 CancelledError，其余接收或恢复失败抛出 RuntimeError。
+        """
         worker_id = self.worker.worker_id
         result_queue = self.result_queues[worker_id]
         task_queue = self.task_queues[worker_id]
         process = self.all_processes.get(worker_id)
+        stop = threading.Event()
+        reader = asyncio.get_running_loop().run_in_executor(
+            self.thread_pool, self._read_result, result_queue, self.task_timeout, stop,
+        )
         try:
-            # 不能用 asyncio.wait_for 包住无超时的 Queue.get：协程取消后，
-            # 底层线程仍会永久阻塞，重复超时会把线程池耗尽。
-            return await asyncio.get_event_loop().run_in_executor(
-                self.thread_pool,
-                result_queue.get,
-                True,
-                self.task_timeout,
-            )
-        except Empty:
+            return await asyncio.shield(reader)
+        except (asyncio.CancelledError, Empty, OSError, ValueError, EOFError) as error:
+            cancelled = isinstance(error, asyncio.CancelledError)
+            recovery = asyncio.create_task(self._recover_result(
+                reader, stop, worker_id, process, task_queue, result_queue, cancelled,
+            ))
+            # 重复取消只能影响调用结果，不能中断清理或提前将 Worker 放回可用池。
+            while not recovery.done():
+                try:
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
             try:
-                self.worker = self._restart_worker(
-                    worker_id,
-                    expected_process=process,
-                    expected_task_queue=task_queue,
-                    expected_result_queue=result_queue,
-                )
-            except Exception as e:
-                # 重启失败时宁可临时损失一个 worker，也不能把已超时的坏 worker 放回池里。
-                self.worker = None
-                raise RuntimeError(f"Worker任务超时，且重启对应子进程失败: {get_exc_desc(e)}") from e
-            raise RuntimeError("Worker任务超时，已重启对应子进程")
+                recovery.result()
+            except Exception as recovery_error:
+                if not cancelled:
+                    raise
+                log(f'取消后的 Worker 恢复失败，槽位保持隔离: {get_exc_desc(recovery_error)}')
+            if cancelled:
+                raise asyncio.CancelledError
+            raise RuntimeError("Worker任务超时或结果接收失败，已重启对应子进程") from error
 
     async def cache_userdata(self, userdata_bytes: bytes) -> dict:
         self.task_queues[self.worker.worker_id].put(('cache_userdata', (userdata_bytes,), {},))
