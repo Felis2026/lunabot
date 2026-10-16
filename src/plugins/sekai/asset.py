@@ -1,6 +1,7 @@
 from ..utils import *
 from .common import *
 import threading
+import time
 
 asset_config = Config('sekai.asset')
 ASSET_DEBUG_CFG = asset_config.item('debug')
@@ -15,10 +16,13 @@ MASTER_DB_PATCH_DIR = f"{SEKAI_ASSET_DIR}/masterdata_patch/"
 COSTUME3DS_ASSET_PATCH_VERSION = 2
 DEFAULT_INDEX_KEYS = ['id']
 DEFAULT_SORT_KEYS = []
+# 连续失败后由后续访问触发重试，等待间隔依次为 30、120、300 秒，此后按 300 秒封顶。
+MASTERDATA_RETRY_SECONDS = (30, 120, 300)
+_masterdata_cache_metadata_lock = asyncio.Lock()
 
 # 运行期缓存：按区服缓存 costume3ds 资源名补丁，避免重复读取和重复生成。
 _costume3ds_asset_patch_cache: Dict[str, Dict[int, str]] = {}
-_costume3ds_asset_patch_meta: Dict[str, Tuple[str, str, int]] = {}
+_costume3ds_asset_patch_meta: Dict[str, tuple] = {}
 _costume3ds_asset_patch_lock = threading.Lock()
 
 def get_multi_keys(data: dict, keys: List[Any]):
@@ -39,22 +43,32 @@ def get_masterdata_cache_path(region: str, name: str) -> str:
 def get_masterdata_patch_path(region: str, name: str) -> str:
     return pjoin(MASTER_DB_PATCH_DIR, region, f"{name}.json")
 
-def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
-    # 为 compact 区服生成 costume3ds 的资源名补丁：
-    # 缺失名称沿用 JP 同 id 补全；数字名称按部位转换，并用 JP 实际资源名验证。
+def build_costume3ds_assetbundle_patch(
+    region: str,
+    region_costume3ds=None,
+    jp_costume3ds=None,
+) -> Dict[int, str]:
+    """生成 compact 区服的衣装资源名补丁，返回衣装 ID 到资源名的映射。
+
+    优先使用传入的候选数据，省略时读取对应区服的缓存文件。
+    缺失名称按 JP 同 ID 补全，数字名称按部位转换并以 JP 资源名验证。
+    所需数据文件缺失时返回空字典。
+    """
     region_path = get_masterdata_cache_path(region, "costume3ds")
     jp_path = get_masterdata_cache_path("jp", "costume3ds")
-    if not os.path.exists(region_path):
+    if region_costume3ds is None and not os.path.exists(region_path):
         logger.warning(f"MasterData [{region}.costume3ds] 补丁生成失败: 区服数据不存在")
         return {}
-    if not os.path.exists(jp_path):
+    if jp_costume3ds is None and not os.path.exists(jp_path):
         logger.warning(f"MasterData [{region}.costume3ds] 补丁生成失败: JP 数据不存在")
         return {}
 
-    region_costume3ds = load_json(region_path)
-    jp_costume3ds = load_json(jp_path)
+    if region_costume3ds is None:
+        region_costume3ds = load_json(region_path)
+    if jp_costume3ds is None:
+        jp_costume3ds = load_json(jp_path)
 
-    # ================================ JP资源名参照 ================================ #
+    # 按 ID 和部位建立 JP 资源名参照。
     jp_asset_map: Dict[int, str] = {}
     jp_asset_names_by_part: set[tuple[str, str]] = set()
     for item in jp_costume3ds:
@@ -63,7 +77,7 @@ def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
             jp_asset_map[item["id"]] = asset_name
             jp_asset_names_by_part.add((asset_name, item.get("partType")))
 
-    # ================================ 缺失与数字资源名补丁 ================================ #
+    # 分别补全缺失名称和经过验证的纯数字名称。
     patch: Dict[int, str] = {}
     missing_count = 0
     missing_patched_count = 0
@@ -94,27 +108,53 @@ def build_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
     )
     return patch
 
-def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
-    # 按区服版本 + JP 版本 + 规则版本加载补丁；规则升级也必须淘汰旧 sidecar，
-    # 否则数据版本不变时会继续命中只补全缺失名称的旧补丁。
-    region_version = get_masterdata_cache_version(region, "costume3ds")
-    jp_version = get_masterdata_cache_version("jp", "costume3ds")
-    current_meta = (region_version, jp_version, COSTUME3DS_ASSET_PATCH_VERSION)
+def load_costume3ds_assetbundle_patch(
+    region: str,
+    region_costume3ds=None,
+    region_version: str | None = None,
+) -> Dict[int, str]:
+    """加载或生成衣装资源名补丁，返回按区服共享的缓存映射。
 
+    传入候选数据时直接基于候选内容重建，JP 参照优先使用内存快照。
+    省略候选数据时，按数据版本、规则版本和来源身份复用内存或 sidecar 缓存。
+    新补丁会尝试保存到 sidecar，保存失败时仍返回生成结果。
+    """
+    candidate_supplied = region_costume3ds is not None
+    region_version = region_version or get_masterdata_cache_version(region, "costume3ds")
+    jp_snapshot = MasterDataManager.get("costume3ds")._snapshots.get("jp")
+    jp_costume3ds = jp_snapshot[0] if jp_snapshot else None
+    jp_version = jp_snapshot[3] if jp_snapshot else get_masterdata_cache_version("jp", "costume3ds")
+    # 候选转换先于原始表落盘，必须直接使用候选内容，不能回读上一版文件。
+    # 内存参照用对象身份区分，磁盘参照用文件状态识别同版本号的内容替换。
+    def source_identity(source_region, data):
+        """以对象身份或文件大小和修改时间标识参照来源，文件缺失时返回 missing。"""
+        if data is not None:
+            return f"memory:{id(data)}"
+        try:
+            stat = os.stat(get_masterdata_cache_path(source_region, "costume3ds"))
+            return f"file:{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            return "missing"
+
+    identities = (source_identity(region, region_costume3ds), source_identity("jp", jp_costume3ds))
+    current_meta = (region_version, jp_version, COSTUME3DS_ASSET_PATCH_VERSION, *identities)
+
+    # 复用补丁前核对来源身份与规则版本，避免同版本数据替换后继续使用旧结果。
     with _costume3ds_asset_patch_lock:
-        if _costume3ds_asset_patch_meta.get(region) == current_meta:
+        if not candidate_supplied and _costume3ds_asset_patch_meta.get(region) == current_meta:
             return _costume3ds_asset_patch_cache.get(region, {})
 
         patch_path = get_masterdata_patch_path(region, "costume3ds_assetbundle_patch")
         patch: Dict[int, str] | None = None
 
-        if os.path.exists(patch_path):
+        if not candidate_supplied and os.path.exists(patch_path):
             try:
                 patch_data = load_json(patch_path)
                 if (
                     patch_data.get("region_version") == region_version
                     and patch_data.get("jp_version") == jp_version
                     and patch_data.get("patch_version") == COSTUME3DS_ASSET_PATCH_VERSION
+                    and patch_data.get("source_identities") == list(identities)
                 ):
                     patch = {
                         int(costume3d_id): asset_name
@@ -125,22 +165,28 @@ def load_costume3ds_assetbundle_patch(region: str) -> Dict[int, str]:
                 logger.warning(f"MasterData [{region}.costume3ds] 读取补丁缓存失败: {get_exc_desc(e)}")
 
         if patch is None:
-            patch = build_costume3ds_assetbundle_patch(region)
-            dump_json({
-                "region_version": region_version,
-                "jp_version": jp_version,
-                "patch_version": COSTUME3DS_ASSET_PATCH_VERSION,
-                "assetbundle_map": {str(costume3d_id): asset_name for costume3d_id, asset_name in patch.items()},
-            }, patch_path, indent=False)
+            patch = build_costume3ds_assetbundle_patch(region, region_costume3ds, jp_costume3ds)
+            try:
+                dump_json({
+                    "region_version": region_version,
+                    "jp_version": jp_version,
+                    "patch_version": COSTUME3DS_ASSET_PATCH_VERSION,
+                    "source_identities": list(identities),
+                    "assetbundle_map": {str(costume3d_id): asset_name for costume3d_id, asset_name in patch.items()},
+                }, patch_path, indent=False)
+            except Exception as exc:
+                # sidecar 是可重建缓存，写失败不能撤掉已经算好的资源名补丁。
+                logger.warning(f"MasterData [{region}.costume3ds] 保存补丁缓存失败: {get_exc_desc(exc)}")
 
         _costume3ds_asset_patch_cache[region] = patch
         _costume3ds_asset_patch_meta[region] = current_meta
         return patch
 
 def make_costume3ds_map_fn(region: str):
-    def costume3ds_map_fn(costume3ds: List[Dict[str, Any]]):
-        # 第一步：把 compact 数据中的 _assetbundleName 统一归一化到 assetbundleName。
-        # 第二步：对缺失或纯数字资源名，应用已经验证的 sidecar 补丁。
+    """创建指定区服的衣装转换函数，转换时会原地修改记录并可能生成 sidecar。"""
+    def costume3ds_map_fn(costume3ds: List[Dict[str, Any]], *, version: str | None = None):
+        """原地统一资源名字段并应用补丁，返回传入的衣装列表。"""
+        # 先统一资源名字段，再按缺失和纯数字名称的数量判断是否需要补丁。
         normalized_count = 0
         missing_count = 0
         numeric_count = 0
@@ -157,7 +203,7 @@ def make_costume3ds_map_fn(region: str):
         if missing_count == 0 and numeric_count == 0:
             return costume3ds
 
-        patch = load_costume3ds_assetbundle_patch(region)
+        patch = load_costume3ds_assetbundle_patch(region, costume3ds, version)
         patched_count = 0
         numeric_patched_count = 0
         for item in costume3ds:
@@ -224,11 +270,28 @@ class RegionMasterDbManager:
         self.latest_source = None
         self.version_update_interval = version_update_interval
         self.version_update_time = None
+        self._update_task: asyncio.Task | None = None
 
+    # 同一区服的版本刷新合并为一个共享任务。
     async def update(self):
-        """
-        更新所有MasterDB的版本信息
-        """
+        """同一区服共享正在执行的版本刷新；单个等待者取消不终止其他等待者。"""
+        task = self._update_task
+        if task is None:
+            # 创建与登记之间没有 await，并发调用在同一事件循环中只会创建一个任务。
+            task = asyncio.create_task(self._update_sources())
+            self._update_task = task
+            task.add_done_callback(self._finish_update)
+        await asyncio.shield(task)
+
+    def _finish_update(self, task: asyncio.Task):
+        """刷新结束后释放在途任务，并收取无人等待时的异常，允许后续正常重试。"""
+        if self._update_task is task:
+            self._update_task = None
+        if not task.cancelled():
+            task.exception()
+
+    async def _update_sources(self):
+        """刷新各数据源版本，选择最新来源并在版本变化时启动更新回调。"""
         # logger.info(f"开始更新 {self.region} 的 {len(self.sources)} 个 MasterDB 的版本信息")
         last_version = self.latest_source.version if self.latest_source else DEFAULT_VERSION
         last_asset_version = self.latest_source.asset_version if self.latest_source else DEFAULT_VERSION
@@ -304,6 +367,17 @@ class MasterDataManager:
         self._set_sort_keys(DEFAULT_SORT_KEYS)
         self.sorted_data: Dict[str, Dict[str, List[Any]]] = {}          # sorted_data[region][key] = [item1, item2, ...]
         self.lock = asyncio.Lock()
+        # 内存更新可先于文件保存完成，文件版本和签名单独记录已就绪的磁盘内容。
+        self.file_version: Dict[str, str] = {}
+        self._file_signatures: dict[str, tuple[int, int]] = {}
+        # 快照依次保存转换后数据、索引、排序结果和版本。
+        self._snapshots: dict[str, tuple] = {}
+        # raw_data 为 None 表示原始文件已保存，只剩版本与文件凭据需要登记。
+        self._pending_cache: dict[str, dict] = {}
+        # 按区服和阶段记录目标版本、连续失败次数及单调时钟重试时间。
+        self._retry_state: dict[tuple[str, str], tuple[str, int, float]] = {}
+        self._cache_checked: set[str] = set()
+        self._update_tasks: dict[str, asyncio.Task] = {}
 
     def _set_index_keys(self, index_keys: Union[str, List[str], Dict[str, List[str]]]):
         if isinstance(index_keys, str):
@@ -323,105 +397,154 @@ class MasterDataManager:
         create_folder(pjoin(MASTER_DB_CACHE_DIR, region))
         return pjoin(MASTER_DB_CACHE_DIR, region, f"{self.name}.json")
 
-    def _build_indexed_data(self, region: str):
-        try:
-            if self.data.get(region, None) is None:
-                logger.warning(f"MasterData [{region}.{self.name}] 构建索引发生在数据加载前")
-                return
-            if not self.data[region] or not isinstance(self.data[region], list):
-                return
-            logger.debug(f"MasterData [{region}.{self.name}] 开始构建索引")
-            self.indexed_data[region] = {}
-            for key in self.index_keys.get(region, []):
-                ind = {}
-                for item in self.data[region]:
-                    if key not in item: 
-                        continue
-                    k = item[key]
-                    ind.setdefault(k, []).append(item)
-                if ind:
-                    self.indexed_data[region][key] = ind
-            logger.debug(f"MasterData [{region}.{self.name}] 构建索引成功")
-        except:
-            logger.print_exc(f"MasterData [{region}.{self.name}] 构建索引失败")
+    # 候选数据准备与内存切换。
 
-    def _build_sorted_data(self, region: str):
-        try:
-            if self.data.get(region, None) is None:
-                logger.warning(f"MasterData [{region}.{self.name}] 构建排序发生在数据加载前")
-                return
-            if not self.data[region] or not isinstance(self.data[region], list):
-                return
-            logger.debug(f"MasterData [{region}.{self.name}] 开始构建排序")
-            self.sorted_data[region] = {}
+    def _prepare_candidate(self, region: str, raw_data, version: str):
+        """转换候选数据并建立索引和排序结果，保持当前生效数据不变。
+
+        返回 (转换后数据, 索引, 排序结果, 版本)，转换结果为 None 时抛出 ValueError。
+        """
+        map_fn = self.map_fn.get('all', self.map_fn.get(region))
+        data = raw_data
+        if map_fn:
+            # 部分映射会原地修改记录；磁盘及待保存状态必须仍持有上游原始格式。
+            data = deepcopy(raw_data)
+            if self.name == "costume3ds" and region in COMPACT_DATA_REGIONS:
+                data = map_fn(data, version=version)
+            else:
+                data = map_fn(data)
+        if data is None:
+            raise ValueError("MasterData 转换结果为空对象")
+        indexed, sorted_data = {}, {}
+        if isinstance(data, list):
+            for key in self.index_keys.get(region, []):
+                index = {}
+                for item in data:
+                    if key in item:
+                        index.setdefault(item[key], []).append(item)
+                indexed[key] = index
             for key in self.sort_keys.get(region, []):
-                sorted_list = sorted(self.data[region], key=lambda x: x.get(key))
-                if sorted_list:
-                    self.sorted_data[region][key] = sorted_list
-            logger.debug(f"MasterData [{region}.{self.name}] 构建排序成功")
-        except:
-            logger.print_exc(f"MasterData [{region}.{self.name}] 构建排序失败")
+                sorted_data[key] = sorted(data, key=lambda item: item.get(key))
+        return data, indexed, sorted_data, version
+
+    def _publish_candidate(self, region: str, snapshot: tuple):
+        """整体切换指定区服的数据、索引、排序结果和内存版本。"""
+        # 赋值之间没有 await，同一事件循环中的读取不会遇到半更新状态。
+        # 线程中的参照读取使用单个快照引用。
+        self._snapshots[region] = snapshot
+        self.data[region], self.indexed_data[region], self.sorted_data[region], self.version[region] = snapshot
+
+    def _retry_allowed(self, region: str, stage: str, version: str) -> bool:
+        """判断指定阶段和目标版本是否已到重试时间，版本变化时立即允许尝试。"""
+        failure = self._retry_state.get((region, stage))
+        return failure is None or failure[0] != version or time.monotonic() >= failure[2]
+
+    def _record_failure(self, region: str, stage: str, version: str, exc: Exception):
+        """每个区服、阶段只保留当前版本的退避状态，等待下一次访问触发重试。"""
+        previous = self._retry_state.get((region, stage))
+        count = previous[1] + 1 if previous and previous[0] == version else 1
+        delay = MASTERDATA_RETRY_SECONDS[min(count - 1, len(MASTERDATA_RETRY_SECONDS) - 1)]
+        self._retry_state[region, stage] = (version, count, time.monotonic() + delay)
+        logger.warning(
+            f"MasterData [{region}.{self.name}] {stage}失败，{delay}秒后允许重试: {get_exc_desc(exc)}"
+        )
 
     async def _load_from_cache(self, region: str):
-        """
-        从缓存加载数据
+        """读取缓存并准备完整快照，发布内存数据和已就绪文件状态。
+
+        文件凭据缺失或不匹配时仍加载缓存，但版本标为未确认。
+        后续来源检查可在同一次访问中触发重新下载。
         """
         cache_path = self.get_cache_path(region)
-        assert os.path.exists(cache_path), "缓存不存在"
         versions = file_db.get_copy("master_data_cache_versions", {}).get(region, {})
-        assert self.name in versions, "缓存版本无效"
-        self.version[region] = versions[self.name]
-        self.data[region] = await aload_json(cache_path)
-        logger.info(f"MasterData [{region}.{self.name}] 从本地加载成功")
-        map_fn = self.map_fn.get('all', self.map_fn.get(region))
-        if map_fn:
-            self.data[region] = await run_in_pool(map_fn, self.data[region])
-            logger.info(f"MasterData [{region}.{self.name}] 映射函数执行完成")
-        await run_in_pool(self._build_indexed_data, region)
-        await run_in_pool(self._build_sorted_data, region)
+        receipt = file_db.get_copy("master_data_cache_files", {}).get(region, {}).get(self.name, {})
+
+        def load_candidate():
+            """读取稳定的缓存文件，核对版本凭据并返回候选快照和文件签名。"""
+            before = os.stat(cache_path)
+            raw_data = load_json(cache_path)
+            after = os.stat(cache_path)
+            signature = (after.st_size, after.st_mtime_ns)
+            if signature != (before.st_size, before.st_mtime_ns):
+                raise RuntimeError("MasterData 文件在读取期间发生变化")
+            recorded_version = versions.get(self.name, DEFAULT_VERSION)
+            confirmed = (
+                receipt.get("version") == recorded_version
+                and signature == (receipt.get("size"), receipt.get("mtime_ns"))
+            )
+            version = recorded_version if confirmed else DEFAULT_VERSION
+            return self._prepare_candidate(region, raw_data, version), signature
+
+        snapshot, signature = await run_in_pool(load_candidate)
+        self._publish_candidate(region, snapshot)
+        self.file_version[region] = snapshot[3]
+        self._file_signatures[region] = signature
+        logger.info(f"MasterData [{region}.{self.name}] 本地数据已加载，确认版本 {snapshot[3]}")
+
+    # 原始文件保存与版本确认。
+
+    async def _persist_pending_cache(self, region: str):
+        """保存待处理的原始文件和版本凭据，成功后清除待保存状态。
+
+        原始文件保存成功后即可供文件读取方使用，版本凭据另行登记。
+        保存失败时记录重试时间，保留已生效的内存数据和未完成步骤。
+        """
+        pending = self._pending_cache.get(region)
+        if pending is None or not self._retry_allowed(region, "保存", pending["version"]):
+            return
+        version = pending["version"]
+        try:
+            if pending["raw_data"] is not None:
+                def save_raw():
+                    """原子保存上游原始数据，返回文件大小和纳秒修改时间。"""
+                    path = self.get_cache_path(region)
+                    dump_json(pending["raw_data"], path)
+                    stat = os.stat(path)
+                    return stat.st_size, stat.st_mtime_ns
+
+                signature = await run_in_pool(save_raw)
+                self.file_version[region] = version
+                self._file_signatures[region] = signature
+                pending["signature"] = signature
+                pending["raw_data"] = None
+
+            # 不同表同时完成下载时必须合并最新登记，避免整份版本字典相互覆盖。
+            async with _masterdata_cache_metadata_lock:
+                versions = file_db.get_copy("master_data_cache_versions", {})
+                receipts = file_db.get_copy("master_data_cache_files", {})
+                versions.setdefault(region, {})[self.name] = version
+                size, mtime_ns = pending["signature"]
+                receipts.setdefault(region, {})[self.name] = {
+                    "version": version, "size": size, "mtime_ns": mtime_ns,
+                }
+                await run_in_pool(file_db.set_many_checked, {
+                    "master_data_cache_versions": versions,
+                    "master_data_cache_files": receipts,
+                })
+            self._pending_cache.pop(region, None)
+            self._retry_state.pop((region, "保存"), None)
+            logger.info(f"MasterData [{region}.{self.name}] 文件与版本已保存: {version}")
+        except Exception as exc:
+            self._record_failure(region, "保存", version, exc)
 
     async def _download_from_db(self, region: str, source: RegionMasterDbSource):
-        """
-        从远程数据源更新数据
-        """
-        cache_path = self.get_cache_path(region)
-        if not source.base_url.endswith("/"):
-            source.base_url += "/"
-        url = f"{source.base_url}{self.name}.json"
-
-        # 下载数据
+        """下载并更新内存中的 MasterData，登记待保存文件并执行更新回调。"""
+        # 固定本次下载对应的版本，避免来源刷新后给候选数据标记其他版本。
+        version = str(source.version)
+        base_url = source.base_url.rstrip('/') + '/'
+        url = f"{base_url}{self.name}.json"
         download_fn = self.download_fn.get('all', self.download_fn.get(region))
         timeout = asset_config.get('default_masterdata_download_timeout')
-        async def _download():
-            if not download_fn:
-                self.data[region] = await download_json(url)
-            else:
-                self.data[region] = await download_fn(source.base_url)
-        try:
-            await asyncio.wait_for(_download(), timeout)
-        except asyncio.TimeoutError:
-            logger.warning(f"下载 MasterData [{region}.{self.name}] 超时")
-            return
-        self.version[region] = source.version
+        request = download_fn(base_url) if download_fn else download_json(url)
+        raw_data = await asyncio.wait_for(request, timeout)
+        snapshot = await run_in_pool(self._prepare_candidate, region, raw_data, version)
+        self._publish_candidate(region, snapshot)
+        self._pending_cache[region] = {"version": version, "raw_data": raw_data}
+        self._retry_state.pop((region, "更新"), None)
+        logger.info(f"MasterData [{region}.{self.name}] 内存数据已生效: {version}")
 
-        # 缓存到本地
-        versions = file_db.get("master_data_cache_versions", {})
-        if region not in versions:
-            versions[region] = {}
-        versions[region][self.name] = self.version[region]
-        file_db.set("master_data_cache_versions", versions)
-        await adump_json(self.data[region], cache_path)
-        logger.info(f"MasterData [{region}.{self.name}] 更新成功")
-
-        # 执行映射函数
-        map_fn = self.map_fn.get('all', self.map_fn.get(region))
-        if map_fn:
-            self.data[region] = await run_in_pool(map_fn, self.data[region])
-            logger.info(f"MasterData [{region}.{self.name}] 映射函数执行完成")
-        await run_in_pool(self._build_indexed_data, region)
-        await run_in_pool(self._build_sorted_data, region)
-
-        # 执行更新后回调
+        # 数据切换后执行派生回调，回调失败时保留已生效数据。
+        # 文件保存重试跳过这些回调。
         for name, hook, regions in self.update_hooks:
             if regions != 'all' and region not in regions:
                 continue
@@ -434,22 +557,80 @@ class MasterDataManager:
             except Exception as e:
                 logger.print_exc(f"MasterData [{region}.{self.name}] 更新后回调 [{name}] 执行失败")
 
-    async def _update_before_get(self, region: str):
+    # 访问触发的更新、保存重试与并发合并。
+
+    async def _refresh(self, region: str, source=None):
+        """按需加载缓存、更新来源数据并尝试保存待处理文件。
+
+        刷新过程由共享任务持有锁，调用方通过 shield 隔离等待者取消。
+        更新失败时继续提供已有内存数据，无可用数据时抛出异常。
+        """
         async with self.lock:
-            # 从缓存加载
-            if self.data.get(region) is None:
-                try: 
+            if region not in self._cache_checked:
+                self._cache_checked.add(region)
+                try:
                     await self._load_from_cache(region)
-                except Exception as e:
-                    logger.warning(f"MasterData [{region}.{self.name}] 从本地缓存加载失败: {e}")
-            # 检查是否更新
-            db_mgr = RegionMasterDbManager.get(region)
-            source = await db_mgr.get_latest_source()
-            if get_version_order(self.version.get(region, DEFAULT_VERSION)) < get_version_order(source.version):
-                await self._download_from_db(region, source)
-            # 检查是否存在，如果仍然不存在则报错
+                except Exception as exc:
+                    logger.warning(f"MasterData [{region}.{self.name}] 本地缓存加载失败: {get_exc_desc(exc)}")
+            if source is None and self._retry_allowed(region, "版本检查", DEFAULT_VERSION):
+                try:
+                    source = await RegionMasterDbManager.get(region).get_latest_source()
+                    self._retry_state.pop((region, "版本检查"), None)
+                except Exception as exc:
+                    self._record_failure(region, "版本检查", DEFAULT_VERSION, exc)
+            if source is not None:
+                version = str(source.version)
+                outdated = get_version_order(self.version.get(region, DEFAULT_VERSION)) < get_version_order(version)
+                if (outdated or region not in self.data) and self._retry_allowed(region, "更新", version):
+                    try:
+                        await self._download_from_db(region, source)
+                    except Exception as exc:
+                        self._record_failure(region, "更新", version, exc)
+            await self._persist_pending_cache(region)
             if self.data.get(region) is None:
                 raise Exception(f"获取 MasterData [{region}.{self.name}] 的数据失败")
+
+    def _finish_refresh(self, region: str, task: asyncio.Task):
+        """收取无人等待时的异常，并释放已完成的共享任务。"""
+        if self._update_tasks.get(region) is task:
+            self._update_tasks.pop(region, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _update_before_get(self, region: str):
+        """准备读取所需数据，将同一区服的更新请求合并到共享任务。
+
+        已有数据且处于失败等待期时直接复用。等待者取消后共享刷新继续执行。
+        无可用数据且本轮无法更新时抛出异常。
+        """
+        task = self._update_tasks.get(region)
+        source = None
+        if task is None and region in self._cache_checked:
+            if self._retry_allowed(region, "版本检查", DEFAULT_VERSION):
+                try:
+                    source = await RegionMasterDbManager.get(region).get_latest_source()
+                    self._retry_state.pop((region, "版本检查"), None)
+                except Exception as exc:
+                    self._record_failure(region, "版本检查", DEFAULT_VERSION, exc)
+            version = str(source.version) if source is not None else DEFAULT_VERSION
+            needs_update = (
+                source is not None
+                and (region not in self.data or get_version_order(self.version[region]) < get_version_order(version))
+                and self._retry_allowed(region, "更新", version)
+            )
+            pending = self._pending_cache.get(region)
+            needs_save = pending is not None and self._retry_allowed(region, "保存", pending["version"])
+            if not needs_update and not needs_save:
+                if region not in self.data:
+                    raise Exception(f"获取 MasterData [{region}.{self.name}] 的数据失败")
+                return
+        # 来源检查可能让出事件循环，创建前必须再次检查是否已有同键任务。
+        task = self._update_tasks.get(region)
+        if task is None:
+            task = asyncio.create_task(self._refresh(region, source))
+            self._update_tasks[region] = task
+            task.add_done_callback(lambda completed: self._finish_refresh(region, completed))
+        await asyncio.shield(task)
 
     async def get_data(self, region: str):
         """
@@ -459,11 +640,17 @@ class MasterDataManager:
         return self.data[region]
     
     async def get_path(self, region: str):
-        """
-        获取数据文件路径
+        """返回签名已确认的可读数据文件路径。
+
+        内存与文件可以处于不同版本。首次更新若仅内存可用、文件尚未就绪，
+        或文件已被外部替换，则抛出文件访问异常或 RuntimeError。
         """
         await self._update_before_get(region)
-        return self.get_cache_path(region)
+        path = self.get_cache_path(region)
+        stat = os.stat(path)
+        if (stat.st_size, stat.st_mtime_ns) != self._file_signatures.get(region):
+            raise RuntimeError(f"MasterData [{region}.{self.name}] 没有已确认可读的文件")
+        return path
     
     async def get_indexed(self, region: str, key: str) -> Dict[str, Any]:
         """
@@ -490,7 +677,7 @@ class MasterDataManager:
         """
         注册更新后回调
         """
-        cls.get(name).update_hooks.append((hook_name, regions, hook))
+        cls.get(name).update_hooks.append((hook_name, hook, regions))
 
     @classmethod
     def updated_hook(cls, name: str, hook_name: str, regions='all'):

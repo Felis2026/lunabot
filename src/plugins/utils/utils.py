@@ -57,6 +57,7 @@ import math
 import io
 import time
 import zstandard
+import threading
 
 import faulthandler
 faulthandler.enable()
@@ -885,6 +886,7 @@ class FileDB:
         self.data = {}
         self.logger = logger
         self.loaded = False
+        self._save_lock = threading.RLock()
 
     def __hash__(self) -> int:
         return hash(self.path)
@@ -941,16 +943,42 @@ class FileDB:
         self._ensure_load()
         return self.data.keys()
 
-    def save(self):
+    # 普通保存和确认保存共用写锁。
+
+    def save(self, *, raise_on_error: bool = False):
+        """同步保存内存数据到文件。
+
+        默认遇到写锁忙时登记待保存并返回，存储异常仅记录日志。
+        raise_on_error=True 时等待写锁并传播存储异常，应在线程中调用。
         """
-        - 保存数据到文件，在修改后会被自动调用，一般不需要手动调用
-        """
+        # 普通保存遇锁忙时留待下轮，避免事件循环等待后台磁盘写入。
+        if not self._save_lock.acquire(blocking=raise_on_error):
+            FileDB._updated_dbs.add(self)
+            return
         try:
-            self._ensure_load()
-            dump_json(self.data, self.path)
-            self.logger.debug(f'保存数据库 {self.path}')
-        except:
-            self.logger.print_exc(f'保存数据库 {self.path} 失败')
+            try:
+                self._ensure_load()
+                dump_json(self.data, self.path)
+                self.logger.debug(f'保存数据库 {self.path}')
+            except Exception:
+                self.logger.print_exc(f'保存数据库 {self.path} 失败')
+                if raise_on_error:
+                    raise
+        finally:
+            self._save_lock.release()
+
+    def set_many_checked(self, values: dict[str, Any]):
+        """更新多个键并同步确认保存，支持点号分隔的多层键。
+
+        保存前已修改内存，失败时传播异常并保留内存修改和待保存登记。
+        调用期间可能等待写锁和磁盘，应在线程中执行。
+        """
+        with self._save_lock:
+            for key, value in values.items():
+                parent, last_key = self._get_last_dict_and_key(key, create_path=True)
+                parent[last_key] = value
+            FileDB._updated_dbs.add(self)
+            self.save(raise_on_error=True)
 
     def get(self, key: str, default: Any=None) -> Any:
         """
@@ -1000,12 +1028,12 @@ class FileDB:
 
     @classmethod
     def save_all_changed(cls):
-        """
-        - 保存所有修改过的数据库
-        """
-        for db in list(cls._updated_dbs):
+        """尝试保存当前待处理的数据库，写锁忙的数据库继续保留待保存登记。"""
+        pending = list(cls._updated_dbs)
+        # 遇忙的保存会重新登记，不能在循环末尾把这些新登记一并清掉。
+        cls._updated_dbs.difference_update(pending)
+        for db in pending:
             db.save()
-        cls._updated_dbs.clear()
 
 
 @repeat_with_interval(FILE_DB_SAVE_INTERVAL_CFG, '保存文件数据库', utils_logger)

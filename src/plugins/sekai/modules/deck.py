@@ -3658,6 +3658,25 @@ def calc_deckrec_masterdata_fingerprint(masterdata_paths: List[str]) -> str:
     return digest.hexdigest()
 
 
+def get_deckrec_masterdata_file_version(
+    region: str,
+    paths: List[str],
+    fingerprint: str,
+) -> str:
+    """根据已就绪文件返回组卡版本标签。
+
+    文件版本统一且已确认时返回该版本，否则返回 cache:<fingerprint>。
+    调用方须先准备 paths，并传入这些文件对应的 fingerprint。
+    """
+    versions = {
+        MasterDataManager.get(os.path.splitext(os.path.basename(path))[0]).file_version.get(region, DEFAULT_VERSION)
+        for path in paths
+    }
+    if len(versions) == 1 and DEFAULT_VERSION not in versions:
+        return versions.pop()
+    return f"cache:{fingerprint}"
+
+
 # ================================ Preview来源与正式切回核验 ================================ #
 
 async def _validate_cn_event_rules_for_cutover(
@@ -3874,18 +3893,14 @@ async def _get_official_loaded_servers(
 
 
 async def provide_preview_builder_source() -> dict:
-    """
-    等待资源管理器异步准备 CN/JP 路径，并组装一次性 builder 请求。
+    """准备 CN/JP 数据文件并返回 Builder 请求与正式切回候选。
 
-    大 JSON 读取、哈希、合并、canary 与压缩全部留给 builder 子进程。
+    资源管理器负责下载、加载和转换 MasterData，相关文件处理在线程池执行。
+    Builder 子进程负责冻结来源快照、内容哈希、规则合并、原生校验和打包。
     """
 
     cn_ctx = SekaiHandlerContext.from_region("cn")
     jp_ctx = SekaiHandlerContext.from_region("jp")
-    cn_version, jp_version = await asyncio.gather(
-        cn_ctx.md.get_version(),
-        jp_ctx.md.get_version(),
-    )
     cn_paths, jp_paths = await asyncio.gather(
         get_deckrec_masterdata_path_map(
             cn_ctx,
@@ -3916,40 +3931,12 @@ async def provide_preview_builder_source() -> dict:
     current_jp_fingerprint = calc_deckrec_masterdata_fingerprint(
         list(jp_paths.values())
     )
-    current_manifest = preview_manager.get_state().manifest
-
-    # ================================ 缓存版本号兜底 ================================ #
-    # 资源源暂时不可达时，WebMasterData 仍可能从完整本地缓存提供全部文件，
-    # 但 get_version() 会返回 0.0.0.0。版本号只作可读标签，真正的数据身份由
-    # 逐文件哈希和来源指纹保证，因此这里改用稳定的缓存指纹，不能用裸 assert
-    # 把可用缓存误判为初始化失败。
-    def effective_version(
-        region: str,
-        version: Any,
-        source_fingerprint: str,
-    ) -> str:
-        version_text = str(version)
-        if version_text != DEFAULT_VERSION:
-            return version_text
-        fallback = f"cache:{source_fingerprint}"
-        if current_manifest.get(
-            f"{region}_masterdata_version"
-        ) != fallback:
-            logger.warning(
-                f"{region.upper()} MasterData 版本源暂不可用，"
-                f"preview 使用本地缓存指纹 {source_fingerprint[:8]}"
-            )
-        return fallback
-
-    cn_version_text = effective_version(
-        "cn",
-        cn_version,
-        current_cn_fingerprint,
+    # 正式组卡与预览共用文件版本规则，来源最新版本不能代替实际就绪内容。
+    cn_version_text = get_deckrec_masterdata_file_version(
+        "cn", list(cn_paths.values()), current_cn_fingerprint,
     )
-    jp_version_text = effective_version(
-        "jp",
-        jp_version,
-        current_jp_fingerprint,
+    jp_version_text = get_deckrec_masterdata_file_version(
+        "jp", list(jp_paths.values()), current_jp_fingerprint,
     )
 
     # 触发 WebJson 的异步下载/磁盘兜底，builder 只读取已经稳定落盘的缓存。
@@ -4006,7 +3993,7 @@ async def provide_preview_builder_source() -> dict:
         "run_canaries": True,
     }
 
-    # ================================ 正式活动粘性激活候选 ================================ #
+    # 为满足正式规则的活动准备切回候选。
     builder_request["cn_source_fingerprint"] = current_cn_fingerprint
     builder_request["jp_source_fingerprint"] = current_jp_fingerprint
     acked_servers: list[str] | None = None
@@ -4093,13 +4080,16 @@ preview_manager.configure(provide_preview_builder_source)
 
 @repeat_with_interval(DECKREC_DATA_UPDATE_INTERVAL_CFG, "组卡数据更新", logger)
 async def deckrec_update_data():
+    """按区服检查组卡节点数据，按需同步已就绪的 MasterData 和 MusicMeta。"""
     for region in ALL_SERVER_REGIONS:
         try:
             ctx = SekaiHandlerContext.from_region(region)
 
-            current_masterdata_version = await ctx.md.get_version()
             masterdata_paths = await get_deckrec_masterdata_paths(ctx)
             masterdata_fingerprint = calc_deckrec_masterdata_fingerprint(masterdata_paths)
+            current_masterdata_version = get_deckrec_masterdata_file_version(
+                ctx.region, masterdata_paths, masterdata_fingerprint,
+            )
             current_musicmetas_update_ts = await musicmetas_json.get_update_time()
             logger.debug(
                 f"组卡 {region} 当前 masterdata 版本: {current_masterdata_version} "
@@ -4108,6 +4098,10 @@ async def deckrec_update_data():
             )
 
             async def construct_payload(with_masterdata: bool, with_musicmetas: bool) -> bytes:
+                """构造携带文件版本和指纹的同步包，按参数附加数据文件。
+
+                MasterData 文件在打包前后发生变化时抛出 RuntimeError，交由下轮重试。
+                """
                 payloads = []
 
                 data = { 
@@ -4120,10 +4114,15 @@ async def deckrec_update_data():
 
                 if with_masterdata:
                     logger.info(f"为自动组卡加载 {ctx.region} masterdata")
+                    if calc_deckrec_masterdata_fingerprint(masterdata_paths) != masterdata_fingerprint:
+                        raise RuntimeError("MasterData 文件已更新，等待下一轮重新同步")
                     for path in masterdata_paths:
                         with open(path, 'rb') as f:
                             add_payload_segment(payloads, os.path.basename(path).encode('utf-8'))
                             add_payload_segment(payloads, f.read())
+                    # 文件路径会被原子替换；打包期间发生更新时不能给混合内容贴旧指纹。
+                    if calc_deckrec_masterdata_fingerprint(masterdata_paths) != masterdata_fingerprint:
+                        raise RuntimeError("MasterData 文件在打包期间更新，等待下一轮重新同步")
 
                 if with_musicmetas:
                     logger.info(f"为自动组卡加载 {ctx.region} musicmetas")
