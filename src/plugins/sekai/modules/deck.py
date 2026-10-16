@@ -1,4 +1,5 @@
 from copy import deepcopy
+from decimal import Decimal
 
 from ...utils import *
 from ..common import *
@@ -214,23 +215,27 @@ DEFAULT_TEAMMATE_SCOREUP = 200
 # - 周回数
 # 不额外扩展新的独立模式。
 def parse_war_prepare_number(s: str) -> int:
+    """解析备战 PT 数值，e/E 与亿均表示一亿，允许小数和数字分隔符。"""
     s = s.strip().lower().replace(',', '').replace('_', '')
-    if s.endswith('k'):
-        return int(float(s[:-1]) * 1000)
-    if s.endswith('w'):
-        return int(float(s[:-1]) * 10000)
-    if s.endswith('e'):
-        return int(float(s[:-1]) * 100000000)
-    if s.endswith('万'):
-        return int(float(s[:-1]) * 10000)
+    # 十进制换算保持整数 PT，避免 0.29 亿被二进制浮点截断为 28,999,999。
+    # 长单位先匹配，百万同时以万结尾，必须在万之前处理。
     if s.endswith('百万'):
-        return int(float(s[:-2]) * 1000000)
+        return int(Decimal(s[:-2]) * 1000000)
+    if s.endswith('k'):
+        return int(Decimal(s[:-1]) * 1000)
+    if s.endswith('w'):
+        return int(Decimal(s[:-1]) * 10000)
+    if s.endswith('e'):
+        return int(Decimal(s[:-1]) * 100000000)
+    if s.endswith('万'):
+        return int(Decimal(s[:-1]) * 10000)
     if s.endswith('亿'):
-        return int(float(s[:-1]) * 100000000)
-    return int(float(s))
+        return int(Decimal(s[:-1]) * 100000000)
+    return int(Decimal(s))
 
 
 def extract_war_prepare_options(args: str) -> tuple[dict, str]:
+    """提取备战、周回与当前/目标 PT，返回 (参数字典, 剩余文本)。"""
     ret = {}
 
     for keyword in WAR_PREPARE_KEYWORDS:
@@ -246,12 +251,14 @@ def extract_war_prepare_options(args: str) -> tuple[dict, str]:
             raise ReplyException("周回数必须大于0")
         args = args.replace(round_match.group(0), "", 1).strip()
 
+    # 当前与目标 PT 共用单位规则，字母单位在提取层统一忽略大小写。
+    number_pattern = r'[0-9][0-9,._]*(?:\.\d+)?(?:百万|亿|万|k|w|e)?'
     pt_patterns = (
-        ('current_pt', r'(?:现在|今|现)\s*([0-9][0-9,._]*(?:\.\d+)?(?:k|w|e|万|百万|亿)?)'),
-        ('target_pt', r'目标\s*([0-9][0-9,._]*(?:\.\d+)?(?:k|w|e|万|百万|亿)?)'),
+        ('current_pt', rf'(?:现在|今|现)\s*({number_pattern})'),
+        ('target_pt', rf'目标\s*({number_pattern})'),
     )
     for key, pattern in pt_patterns:
-        match = re.search(pattern, args)
+        match = re.search(pattern, args, flags=re.IGNORECASE)
         if not match:
             continue
         try:
@@ -2241,7 +2248,6 @@ async def recommend_challenge_music(
     return None
 
 
-# 合成自动组卡图片
 async def compose_deck_recommend_image(
     ctx: SekaiHandlerContext, 
     qid: int,
@@ -2250,7 +2256,11 @@ async def compose_deck_recommend_image(
     additional: dict,
     preview_resolution: Optional[PreviewEventResolution] = None,
 ) -> Image.Image:
-    # ---------------------------- 判断组卡类型方便后续处理 ---------------------------- #
+    """获取玩家数据并执行组卡，计算备战信息后绘制推荐结果。
+
+    preview_resolution 指定预览活动及规则来源，省略时使用当前区服正式规则。
+    """
+    # 判断组卡类型。
 
     NO_MUSIC_TYPES = ["bonus", "wl_bonus", "mysekai"]
 
@@ -2307,11 +2317,11 @@ async def compose_deck_recommend_image(
         assert_and_reply(additional.get('boost') is not None, "备战模式必须指定火耗参数，例如\"5火\"")
         assert_and_reply(
             additional.get('target_pt') is not None,
-            "你还没有输入目标PT！例：目标300万/300w（请以1或万为单位，方便程序解析）",
+            "你还没有输入目标PT！例如：目标300万、目标300w、目标1e、目标1E、目标1亿",
         )
         assert_and_reply(not additional.get('music_compare', False), "备战模式暂不支持和歌曲比较同时使用")
 
-    # ---------------------------- 处理额外参数 ---------------------------- #
+    # 处理额外参数。
             
     # 是否是顶配租卡
     use_max_profile = additional.get('max_profile', False)
@@ -2347,7 +2357,7 @@ async def compose_deck_recommend_image(
                 strict=False,
                 raise_exc=True, ignore_hide=True)
 
-            # ================================ Suite 核心字段兜底 ================================ #
+            # 补全组卡所需的 Suite 核心字段。
             # 组卡后续会大量依赖 `userGamedata.userId`、`userCards`、`userDecks` 等核心字段。
             # 即使上游 OAuth / Public-API 某次结构波动，至少也要在这里抛出可读错误，
             # 不能直接落成 KeyError 让用户完全看不懂发生了什么。
@@ -2420,7 +2430,7 @@ async def compose_deck_recommend_image(
                     # suite中没有该卡，提示需要抓包更新
                     raise ReplyException(f"当前卡组中的卡牌 {bp_card['cardId']} 不在Suite数据中，请更新抓包数据")
 
-    # ================================ 固定未来卡与全当期候选 ================================ #
+    # 准备固定未来卡与全当期候选。
     # 必须在 CN 过滤/当前队伍处理完成后注入，而且先复制列表，避免临时卡污染
     # 用于头像和玩家信息绘制的原始 Suite 对象。
     if preview_resolution is not None or additional.get('all_event_cards'):
@@ -2544,7 +2554,7 @@ async def compose_deck_recommend_image(
             )
         }
 
-    # ================================ 终章目标与牌子模拟 ================================ #
+    # 设置终章目标与牌子模拟参数。
     # 终章的支援和额外加成都跟队长角色绑定，因此要先把目标角色固化，再决定后续裁卡池策略。
     final_chapter_target_cid = await apply_final_chapter_target_character(rule_ctx, options, use_current_deck)
 
@@ -2568,7 +2578,7 @@ async def compose_deck_recommend_image(
         options.event_id,
     )
 
-    # ================================ 终章下发参数纠偏 ================================ #
+    # 按终章规则修正下发参数。
     # 终章在 MasterData 里只有 finale 章节，没有“按角色拆开的 worldBloom chapter”。
     # 因此这里不能再把目标角色继续塞进 world_bloom_character_id 下发给后端，
     # 否则服务端会误走“按章节找角色”的分支并直接报 chapter not found。
@@ -2693,7 +2703,7 @@ async def compose_deck_recommend_image(
         })
         
 
-    # ---------------------------- 调用组卡服务 ---------------------------- #
+    # 调用组卡服务。
 
     options.region = ctx.region
     log_options(ctx, uid, options)
@@ -2724,7 +2734,7 @@ async def compose_deck_recommend_image(
         # 正常组卡
         all_options = [options]
 
-    # ================================ 组卡后端路由 ================================ #
+    # 选择组卡后端。
     servers_override = None
     if preview_resolution is not None:
         preview_state = preview_manager.get_state()
@@ -2808,7 +2818,7 @@ async def compose_deck_recommend_image(
             )
             raise ReplyException("预演结果安全校验失败，本次结果已作废") from exc
 
-    # ---------------------------- 绘图数据获取 ---------------------------- #
+    # 准备绘图数据。
 
     if not music_compare:
         # 获取一般情况音乐标题和封面
@@ -2821,7 +2831,7 @@ async def compose_deck_recommend_image(
             music_title += f" ({options.music_diff.upper()})"
             music_cover = await get_music_cover_thumb(jp_ctx, options.music_id)
 
-    # ================================ 备战结果计算 ================================ #
+    # 计算备战结果。
     # 这一块直接复用公式：基于当前最优活动PT结果，继续估算
     # 单局PT、时速、局数、预计时间和火耗。
     war_prepare_info = None
@@ -2928,7 +2938,7 @@ async def compose_deck_recommend_image(
     # 获取卡组卡牌缩略图
     draw_eventbonus = recommend_type in ["bonus", "wl_bonus"]
 
-    # ================================ 结果卡牌元数据 ================================ #
+    # 准备结果卡牌的元数据。
     # Preview 后端能返回显式固定的 JP 未实装卡。后续缩略图和角色判断必须复用
     # JP 元数据，不能重新去 CN cards 表查询并把合法的 None 当成字典使用。
     result_card_masterdata_cache: dict[int, dict] = {}
@@ -3020,7 +3030,7 @@ async def compose_deck_recommend_image(
             _, high_score, _, _ = challenge_live_info.get(chara_id, (None, 0, None, None))
             challenge_score_dlt.append(deck.score - high_score)
 
-    # ---------------------------- 绘图 ---------------------------- #
+    # 绘制结果。
         
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_padding(16):
@@ -3206,7 +3216,7 @@ async def compose_deck_recommend_image(
                 # 表格
                 gh, vsp, voffset = 120, 12, 18
 
-                # ================================ 备战信息展示 ================================ #
+                # 展示备战信息。
                 # 作为组卡结果前的附加信息块展示，不改动原有组卡表格结构。
                 if war_prepare_info is not None:
                     rounds_text = (
