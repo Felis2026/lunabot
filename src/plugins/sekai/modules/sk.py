@@ -37,6 +37,7 @@ from src.services.event_tracker.final_cutoff import (
     load_final_cutoff_snapshot,
     save_final_cutoff_snapshot,
     should_replace_final_cutoff_snapshot,
+    is_overall_only_finale,
 )
 from .wl_args import (
     extract_wl_chapter_selector,
@@ -211,8 +212,11 @@ def get_wl_handler_args(ctx: SekaiHandlerContext) -> str:
     return normalize_wl_args(ctx.get_args())
 
 
-# 从参数获取带有wl_id的wl_event，返回 (wl_event, args)，未指定章节则默认查询当前章节
 async def extract_wl_event(ctx: SekaiHandlerContext, args: str) -> Tuple[dict, str]:
+    """解析实时榜线的章节参数，返回 (章节活动, 剩余文本)。
+
+    未指定章节时查询当前章节，历史 WL 轮次参数通过 ReplyException 引导至历史榜线。
+    """
     args = normalize_wl_args(args)
 
     # wl1/wl2 从现在起只表示第几次 WL 活动；实时榜线指令没有历史活动选择能力，
@@ -276,6 +280,11 @@ async def extract_wl_event(ctx: SekaiHandlerContext, args: str) -> Tuple[dict, s
         chapter = available_chapters[0]
         selector_desc = "当前章节"
 
+    remaining_args = remove_matched_text(args_without_wl, chapter_arg)
+    remaining_args = remove_matched_text(remaining_args, role_arg)
+    if is_overall_only_finale(event, chapters):
+        return event.copy(), remaining_args
+
     base_event_id = event['id']
     event = event.copy()
     event['id'] = chapter['chapterNo'] * 1000 + base_event_id
@@ -287,9 +296,6 @@ async def extract_wl_event(ctx: SekaiHandlerContext, args: str) -> Tuple[dict, s
     event['isSupplemental'] = chapter.get('isSupplemental', False)
     event['wl_cid'] = chapter.get('gameCharacterId', None)
 
-    remaining_args = args_without_wl
-    remaining_args = remove_matched_text(remaining_args, chapter_arg)
-    remaining_args = remove_matched_text(remaining_args, role_arg)
     logger.info(f"查询WL活动章节: selector={selector_desc} wl_id={event['id']}")
     return event, remaining_args
 
@@ -337,8 +343,22 @@ def find_next_ranking(ranks: List[Ranking], rank: int) -> Optional[Ranking]:
             most_next = r
     return most_next
 
-# 从榜线数据解析Rankings
+# ================================ 榜单身份归一化 ================================ #
+async def normalize_ranking_event_id(ctx: SekaiHandlerContext, event_id: int) -> int:
+    """将仅使用总榜的终章编号转换为活动编号，其余编号原样返回。"""
+    if event_id >= 1000:
+        chapter = find_by(await get_wl_events(ctx, event_id % 1000), 'id', event_id)
+        if chapter and chapter.get('ranking_uses_overall'):
+            return event_id % 1000
+    return event_id
+
+
 async def parse_rankings(ctx: SekaiHandlerContext, event_id: int, data: dict) -> List[Ranking]:
+    """解析总榜或角色章节榜数据，返回合并的 Ranking 列表。
+
+    仅使用总榜的终章按活动总榜解析，角色章节缺少对应榜线时抛出 ReplyException。
+    """
+    event_id = await normalize_ranking_event_id(ctx, event_id)
     data_top100 = data.get('top100', {})
     data_border = data.get('border', {})
     assert data_top100, "获取榜线Top100数据失败"
@@ -352,9 +372,11 @@ async def parse_rankings(ctx: SekaiHandlerContext, event_id: int, data: dict) ->
     # WL活动
     else:
         cid = await get_wl_chapter_cid(ctx, event_id)
+        assert_and_reply(cid is not None, f'章节榜 {event_id} 没有对应角色')
         top100_rankings = find_by(data_top100.get('userWorldBloomChapterRankings', []), 'gameCharacterId', cid)
-        top100 = [Ranking.from_sk(item) for item in top100_rankings['rankings']]
         border_rankings = find_by(data_border.get('userWorldBloomChapterRankingBorders', []), 'gameCharacterId', cid)
+        assert_and_reply(top100_rankings and border_rankings, f'章节榜 {event_id} 响应缺少角色 {cid} 的榜线数据')
+        top100 = [Ranking.from_sk(item) for item in top100_rankings['rankings']]
         border = [Ranking.from_sk(item) for item in border_rankings['borderRankings'] if item['rank'] != 100]
 
     for item in top100:
@@ -411,8 +433,12 @@ async def request_ranking_data(ctx: SekaiHandlerContext, event_id: int) -> dict:
                      f"榜线接口返回格式不正确: {formatted_url}")
     return data
   
-# 获取最新榜线记录
 async def get_latest_ranking(ctx: SekaiHandlerContext, event_id: int, query_ranks: List[int] = ALL_RANKS) -> List[Ranking]:
+    """读取指定档位的最新榜线，优先使用缓存和本地数据库，缺少记录时请求 API。
+
+    缓存按数据库修改时间复用，仅使用总榜的终章编号先归一化。
+    """
+    event_id = await normalize_ranking_event_id(ctx, event_id)
     # 从缓存中获取
     db_mtime = query_update_time(ctx.region, event_id)
     rankings = latest_rankings_cache.get(ctx.region, {}).get(event_id, None)
@@ -1872,7 +1898,7 @@ async def _(ctx: SekaiHandlerContext):
     args = normalize_wl_args(ctx.get_args())
 
     turn_selector = extract_wl_turn_selector(args)
-    # ================================ WL轮次活动定位 ================================ #
+    # 按 WL 轮次定位活动。
     # 历史榜线必须落到唯一活动；角色既用于定位其第 N 次 WL，也继续选择对应章节。
     if turn_selector:
         args = remove_matched_text(args, turn_selector.matched_text)
@@ -1980,6 +2006,11 @@ async def _(ctx: SekaiHandlerContext):
             f"活动{ctx.region.upper()}-{base_event_id}没有{selector_text}",
         )
         selected_chapter_no = selected_event["chapterNo"]
+
+    # 显式终章/章节1与总榜读取同一份归档，不复制数据或伪造章节快照。
+    if selected_event.get('ranking_uses_overall'):
+        selected_event = event
+        selected_chapter_no = None
 
     try:
         snapshot = load_final_cutoff_snapshot(
@@ -2205,6 +2236,8 @@ async def finalize_cutoff_snapshot(
     已有 complete 快照保持冻结，未确认期间原始 SQLite 必须继续保留。
     """
 
+    if tracked_event.get('ranking_uses_overall'):
+        return None
     tracking_id = tracked_event["id"]
     chapter_no = tracked_event.get("chapterNo")
     existing_snapshot = load_final_cutoff_snapshot(
@@ -2323,11 +2356,11 @@ async def resolve_tracked_ranking_event(
 
 @repeat_with_interval(300, '确认最终榜线', logger)
 async def finalize_pending_cutoff_snapshots():
-    """
-    每 5 分钟扫描本地确认样本并固化已稳定榜线。
+    """每 5 分钟扫描本地确认样本并固化已稳定榜线。
 
-    这里只读取 SQLite，不会请求任何上游；独立于 6 小时备份周期，确保第三个
-    30 分钟样本落盘后能及时生成最终快照。
+    使用 SQLite 中的样本确认结果，活动元数据由资源管理器获取。
+    ranking_uses_overall 章节复用总榜归档，跳过独立章节快照。
+    本任务独立于 6 小时备份周期，完整样本稳定后即可生成最终快照。
     """
 
     for region in ALL_SERVER_REGIONS:
@@ -2335,6 +2368,9 @@ async def finalize_pending_cutoff_snapshots():
         db_pattern = SEKAI_DATA_DIR + f"/db/sk_{region}/*_ranking.db"
         for db_file in glob.glob(db_pattern):
             try:
+                _, _, event, tracked_event = await resolve_tracked_ranking_event(ctx, db_file)
+                if tracked_event.get('ranking_uses_overall'):
+                    continue
                 tracking_id = int(Path(db_file).stem.split('_')[0])
                 if not await query_stable_final_cutoff_sample(
                     ctx.region,
@@ -2343,10 +2379,6 @@ async def finalize_pending_cutoff_snapshots():
                     get_final_cutoff_stable_sample_count(),
                 ):
                     continue
-                _, _, event, tracked_event = await resolve_tracked_ranking_event(
-                    ctx,
-                    db_file,
-                )
                 await finalize_cutoff_snapshot(ctx, event, tracked_event)
             except Exception as exc:
                 logger.warning(
@@ -2421,6 +2453,7 @@ def create_verified_ranking_zip(
 
 @repeat_with_interval(SK_COMPRESS_INTERVAL_CFG, '备份榜线数据', logger)
 async def compress_ranking_data():
+    """按区服处理过期榜线数据库，在最终快照满足条件后归档。"""
     # 压缩过期榜线数据库
     for region in ALL_SERVER_REGIONS:
         ctx = SekaiHandlerContext.from_region(region)
@@ -2438,6 +2471,8 @@ async def compress_ranking_data():
                     event,
                     tracked_event,
                 ) = await resolve_tracked_ranking_event(ctx, db_file)
+                if tracked_event.get('ranking_uses_overall'):
+                    continue
                 event_id = int(event["id"])
                 end_time = datetime.fromtimestamp(tracked_event['aggregateAt'] / 1000 + 1)
 

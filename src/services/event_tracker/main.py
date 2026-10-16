@@ -13,6 +13,7 @@ from .sql import (
 from .final_cutoff import (
     get_expected_final_cutoff_ranks,
     get_final_cutoff_sample_slot,
+    is_overall_only_finale,
 )
 from aiohttp import ClientConnectionError, ClientResponseError
 from tenacity import retry, retry_if_exception, wait_fixed, stop_after_attempt
@@ -120,7 +121,10 @@ def get_current_event(region: str, fallback: Optional[str] = None) -> dict:
     return prev_event or next_event
 
 def parse_rankings(region: str, event_id: int, data: dict) -> tuple[list[Ranking], list[Ranking]]:
-    """从榜线数据解析Rankings，返回top100, border"""
+    """解析榜线响应，分别返回 Top100 和 Border 的 Ranking 列表。
+
+    角色章节缺少角色 ID 或对应榜线数据时抛出 ValueError。
+    """
     data_top100 = data.get('top100', {})
     data_border = data.get('border', {})
     assert data_top100, "获取榜线Top100数据失败"
@@ -136,9 +140,13 @@ def parse_rankings(region: str, event_id: int, data: dict) -> tuple[list[Ranking
     # WL活动
     else:
         cid = get_wl_chapter_cid(region, event_id)
+        if cid is None:
+            raise ValueError(f'章节榜 {event_id} 没有对应角色，不应安排独立角色榜采集')
         top100_rankings = find_by(data_top100.get('userWorldBloomChapterRankings', []), 'gameCharacterId', cid)
-        top100 = [Ranking.from_sk(item, now) for item in top100_rankings['rankings']]
         border_rankings = find_by(data_border.get('userWorldBloomChapterRankingBorders', []), 'gameCharacterId', cid)
+        if not top100_rankings or not border_rankings:
+            raise ValueError(f'章节榜 {event_id} 响应缺少角色 {cid} 的 Top100 或 Border 数据')
+        top100 = [Ranking.from_sk(item, now) for item in top100_rankings['rankings']]
         border = [Ranking.from_sk(item, now) for item in border_rankings['borderRankings'] if item['rank'] != 100]
 
     for item in top100:
@@ -168,7 +176,10 @@ def build_split_ranking_urls(formatted_url: str) -> Optional[tuple[str, str]]:
     return None
 
 def get_wl_events(region: str, event_id: int) -> list[dict]:
-    """获取event_id对应的所有wl_event（时间顺序），如果不是wl则返回空列表"""
+    """按时间顺序返回活动的 WL 章节，无章节时返回空列表。
+
+    每项包含章节类型、角色及结束时间，ranking_uses_overall 标记该章节复用总榜。
+    """
     event = mds.get(region, 'events').find_by_id(event_id)
     chapters = mds.get(region, 'worldBlooms').find_by('eventId', event['id'], mode='all')
     if not chapters:
@@ -185,6 +196,7 @@ def get_wl_events(region: str, event_id: int) -> list[dict]:
         wl_event['worldBloomChapterType'] = chapter.get('worldBloomChapterType', 'game_character')
         wl_event['isSupplemental'] = chapter.get('isSupplemental', False)
         wl_event['wl_cid'] = chapter.get('gameCharacterId', None)
+        wl_event['ranking_uses_overall'] = is_overall_only_finale(event, chapters)
         wl_events.append(wl_event)
     return sorted(wl_events, key=lambda x: x['startAt'])
 
@@ -369,10 +381,14 @@ class EventTracker:
         """
         为总榜或章节榜生成本轮更新计划。
 
-        活动中及结榜后 10 分钟沿用原采集精度；之后只在固定 30 分钟槽
-        首次到达时校验完整榜线，三个连续槽稳定后立即停止后续请求。
+        活动中及结榜后 10 分钟保持活动采集精度，之后仅在每个固定 30 分钟槽
+        首次到达时校验完整榜线，三个连续槽稳定后停止后续请求。
+        ranking_uses_overall 章节复用总榜计划，跳过独立章节采集。
         """
 
+        # 无独立角色榜的单终章只采集总榜，避免额外占用结榜确认槽。
+        if tracked_event.get('ranking_uses_overall'):
+            return None
         start_time = datetime.fromtimestamp(tracked_event['startAt'] / 1000)
         event_id = int(tracked_event['id'])
         if now < start_time:

@@ -10,6 +10,24 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# ================================ 终章榜单身份 ================================ #
+
+def is_overall_only_finale(event: Mapping[str, Any], chapters: Iterable[Mapping[str, Any]]) -> bool:
+    """判断活动是否只有一个无角色终章，且该章节可复用总榜。"""
+    chapters = list(chapters)
+    if len(chapters) != 1:
+        return False
+    chapter = chapters[0]
+    if chapter.get('worldBloomChapterType') != 'finale' or chapter.get('gameCharacterId') not in (None, 0):
+        return False
+    # 要求活动与章节的起止时间均存在且完全一致。
+    return (
+        event.get('startAt') is not None and event.get('aggregateAt') is not None
+        and chapter.get('chapterStartAt') == event['startAt']
+        and chapter.get('aggregateAt') == event['aggregateAt']
+    )
+
+
 # ================================ 受支持档位 ================================ #
 
 FINAL_CUTOFF_SUPPORTED_RANKS = (

@@ -19,6 +19,7 @@ from .wl_args import (
     extract_wl_turn_selector,
     remove_matched_text,
 )
+from src.services.event_tracker.final_cutoff import is_overall_only_finale
 
 QUERY_SINGLE_EVENT_HELP = """
 【查单个活动格式】
@@ -228,8 +229,11 @@ async def get_wl_chapter_cid(ctx: SekaiHandlerContext, wl_id: int) -> Optional[i
     cid = chapter.get('gameCharacterId', None)
     return cid
 
-# 获取event_id对应的所有wl_event（时间顺序），如果不是wl则返回空列表
 async def get_wl_events(ctx: SekaiHandlerContext, event_id: int) -> List[dict]:
+    """按时间顺序返回活动的 WL 章节，无章节时返回空列表。
+
+    每项包含章节类型、角色及结束时间，ranking_uses_overall 标记该章节复用总榜。
+    """
     event = await ctx.md.events.find_by_id(event_id)
     chapters = await ctx.md.world_blooms.find_by('eventId', event['id'], mode='all')
     if not chapters:
@@ -246,6 +250,7 @@ async def get_wl_events(ctx: SekaiHandlerContext, event_id: int) -> List[dict]:
         wl_event['worldBloomChapterType'] = chapter.get('worldBloomChapterType', 'game_character')
         wl_event['isSupplemental'] = chapter.get('isSupplemental', False)
         wl_event['wl_cid'] = chapter.get('gameCharacterId', None)
+        wl_event['ranking_uses_overall'] = is_overall_only_finale(event, chapters)
         wl_events.append(wl_event)
     return sorted(wl_events, key=lambda x: x['startAt'])
 
