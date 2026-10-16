@@ -23,6 +23,7 @@ import csv
 import io
 import math
 from PIL import ImageOps
+from urllib.parse import urlsplit
 
 
 music_group_sub = SekaiGroupSubHelper("music", "新曲通知", ALL_SERVER_REGIONS)
@@ -336,8 +337,8 @@ class SyncMusicAliasConfig:
         return cls(**(Config('sekai.music_alias_sync').get_all()))
 
 
-# 通过haruki api，同步歌曲别名
 async def sync_music_alias():
+    """分批同步 Haruki 歌曲别名，保留失败曲目的本地记录并汇总各类结果。"""
     cfg = SyncMusicAliasConfig.get()
     mids = []
     for region in cfg.regions:
@@ -348,11 +349,11 @@ async def sync_music_alias():
     alias_db = MusicAliasDB.get_instance()
     alias_db.backup()
 
-    # ================================ 新旧别名接口兼容 ================================ #
-    # 旧 public-api 直接返回 {"music_id", "aliases"}；
-    # 新 neo public bot v2 返回 {"status","message","data":{"aliases":[...]}}。
-    # 这里统一抽成一个解析函数，迁移期间两边都能读，避免切接口时整批同步直接失败。
     def extract_aliases_from_sync_payload(payload: dict, mid: int) -> list[str]:
+        """从新旧接口响应提取别名列表，结构或歌曲编号不匹配时抛出异常。
+
+        旧接口直接返回 aliases，新接口将其放在 data.aliases 中。
+        """
         if not isinstance(payload, dict):
             raise Exception("别名接口返回格式错误")
 
@@ -371,11 +372,15 @@ async def sync_music_alias():
 
         raise Exception("别名接口缺少 aliases 字段")
 
-    async def sync(mid: int) -> bool:
+    # 单曲同步结果分别计入变更、未变、未收录和失败数量。
+    async def sync(mid: int) -> str:
+        """同步单曲别名并返回变更、未变、未收录或失败状态。
+
+        仅用有效别名列表更新本地记录，请求失败时保留已有内容。
+        """
         try:
             url = cfg.url.format(mid=mid)
             data = await download_json(url)
-            await asyncio.sleep(cfg.sync_batch_interval)  
             aliases = extract_aliases_from_sync_payload(data, mid)
             # 排除韩语别名
             aliases = [a for a in aliases if not any('\uac00' <= c <= '\ud7af' for c in a)]
@@ -385,12 +390,29 @@ async def sync_music_alias():
                 if added: log_msg += f"，添加 {len(added)} 条: {added}"
                 if removed: log_msg += f"，删除 {len(removed)} 条: {removed}"
                 logger.info(log_msg)
-                return True
-            return False
+                return 'changed'
+            return 'unchanged'
+        except HttpError as error:
+            # v2 的 Alias not found 仅表示该曲未收录；普通 404 可能是地址失效，仍算失败。
+            # 两者都沿用本地记录，不能把错误响应当成空别名覆盖已有内容。
+            if (error.status_code == 404
+                    and urlsplit(url).path.rstrip('/') == f'/api/bot/v2/pjsk/alias/music/{mid}'
+                    and str(error.message).strip().lower() == 'alias not found'):
+                return 'unlisted'
+            logger.warning(f"同步歌曲 {mid} 的别名失败: {get_exc_desc(error)}")
+            return 'failed'
         except Exception as e:
             logger.warning(f"同步歌曲 {mid} 的别名失败: {get_exc_desc(e)}")
-    updated_num = sum(await batch_gather(*[sync(mid) for mid in mids], batch_size=cfg.sync_batch_size))
-    logger.info(f"别名同步完成，{updated_num} 首歌曲的别名发生变更")
+            return 'failed'
+        finally:
+            # 失败曲目也保留批次间隔，避免上游异常时连续快速请求。
+            await asyncio.sleep(cfg.sync_batch_interval)
+
+    results = await batch_gather(*[sync(mid) for mid in mids], batch_size=cfg.sync_batch_size)
+    logger.info(
+        f"别名同步完成，{results.count('changed')} 首变更，{results.count('unchanged')} 首未变，"
+        f"{results.count('unlisted')} 首上游未收录，{results.count('failed')} 首失败"
+    )
     
 
 # ======================= 搜索歌曲 ======================= #
