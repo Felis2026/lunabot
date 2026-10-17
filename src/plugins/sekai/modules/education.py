@@ -385,6 +385,21 @@ UNIT_SEKAI_AREA_IDS = {
 
 # ======================= 处理逻辑 ======================= #
 
+def get_education_progress_color(progress: float) -> tuple:
+    """按当前奖励或普通任务上限的完成比例返回进度条颜色。"""
+    if progress >= 1:
+        return (100, 255, 100, 255)
+    if progress > 0.8:
+        return (255, 255, 100, 255)
+    if progress > 0.6:
+        return (255, 200, 100, 255)
+    if progress > 0.4:
+        return (255, 150, 100, 255)
+    if progress > 0.2:
+        return (255, 100, 100, 255)
+    return (255, 50, 50, 255)
+
+
 # 获取玩家挑战live信息，返回（rank, score, remain_jewel, remain_fragment）
 async def get_user_challenge_live_info(ctx: SekaiHandlerContext, profile: dict) -> Dict[int, Tuple[int, int, int, int]]:
     challenge_info = {}
@@ -460,12 +475,8 @@ async def compose_challenge_live_detail_image(ctx: SekaiHandlerContext, qid: int
                             total_w, total_h, border = w4, 14, 2
                             progress_w = int((total_w - border * 2) * progress)
                             progress_h = total_h - border * 2
-                            color = (255, 50, 50, 255)
-                            if x > 250_0000:    color = (100, 255, 100, 255)
-                            elif x > 200_0000:  color = (255, 255, 100, 255)
-                            elif x > 150_0000:  color = (255, 200, 100, 255)
-                            elif x > 100_0000:  color = (255, 150, 100, 255)
-                            elif x > 50_0000:   color = (255, 100, 100, 255)
+                            # 奖励最高分档已由本区服奖励表确定，扩档后完成色自动跟随。
+                            color = get_education_progress_color(progress)
                             if progress > 0:
                                 Spacer(w=total_w, h=total_h).set_bg(RoundRectBg(fill=(100, 100, 100, 255), radius=total_h//2))
                                 Spacer(w=progress_w, h=progress_h).set_bg(RoundRectBg(fill=color, radius=(total_h-border)//2)).set_offset((border, border))
@@ -1163,12 +1174,8 @@ async def compose_leader_count_image(ctx: SekaiHandlerContext, qid: int) -> Imag
                             total_w, total_h, border = w5, 14, 2
                             progress_w = int((total_w - border * 2) * progress)
                             progress_h = total_h - border * 2
-                            color = (255, 50, 50, 255)
-                            if x > 50000:    color = (100, 255, 100, 255)
-                            elif x > 40000:  color = (255, 255, 100, 255)
-                            elif x > 30000:  color = (255, 200, 100, 255)
-                            elif x > 20000:  color = (255, 150, 100, 255)
-                            elif x > 10000:  color = (255, 100, 100, 255)
+                            # 完成色跟随普通任务的实际上限，后续扩档时无需调整固定次数。
+                            color = get_education_progress_color(progress)
                             if progress > 0:
                                 Spacer(w=total_w, h=total_h).set_bg(RoundRectBg(fill=(100, 100, 100, 255), radius=total_h//2))
                                 Spacer(w=progress_w, h=progress_h).set_bg(RoundRectBg(fill=color, radius=(total_h-border)//2)).set_offset((border, border))
