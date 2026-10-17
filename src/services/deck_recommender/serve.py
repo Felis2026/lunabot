@@ -865,6 +865,7 @@ async def recommend_endpoint(request: Request):
                 "alg": options["algorithm"],
                 "cost_time": result["cost_time"],
                 "wait_time": wait_time,
+                "support_limits": result.get("support_limits", {}),
             }
 
         return await asyncio.gather(*[

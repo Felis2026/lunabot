@@ -62,6 +62,20 @@ the CN contents for these tables. This does not enable finale previews.
 `eventTotalPowerLimits` is not consumed by the current native kernel; its WL3
 336000 cap is implemented in native code.
 
+## WL Support Limits
+
+Each recommendation response may include `support_limits`, keyed by chapter
+character ID (or each deck's leader for finales). It contains the maximum bonus
+of each card, maximum skill levels, and the full support capacity's total bonus
+using all released cards at maximum mastery and skill. This activity-wide upper
+bound includes cards that may already appear in a recommended front row.
+
+Each worker keeps at most 32 entries in an LRU cache. MasterData reloads clear
+the cache; upcoming card releases expire affected entries. Computation runs in
+the existing worker process and uses the native single-card API without a new
+recommendation search. A failed limit calculation leaves the recommendation
+available with an empty `support_limits` field.
+
 ## Manual run
 
 1. Install the repository requirements.

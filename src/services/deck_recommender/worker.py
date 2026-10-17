@@ -10,6 +10,7 @@ from sekai_deck_recommend_cpp import (
     DeckRecommendUserData,
 )
 from hashlib import md5
+from collections import OrderedDict
 import multiprocessing as mp
 from multiprocessing import Queue, Process
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,7 @@ class Worker:
         self.musicmetas_update_ts: dict[str, int] = {}
         self.musicmetas_path: dict[str, str] = {}
         self.userdata_cache: list[tuple[str, DeckRecommendUserData]] = []
+        self.support_limits_cache = OrderedDict()
         self.inited = True
 
     def _deckrec_options_to_str(self, userdata_hash: str, options: DeckRecommendOptions) -> str:
@@ -96,6 +98,7 @@ class Worker:
             if not os.path.isdir(local_md_dir):
                 raise FileNotFoundError(f"MasterData目录不存在: {local_md_dir}")
             self.recommender.update_masterdata(local_md_dir, region)
+            self.support_limits_cache.clear()
             self.masterdata_version[region] = masterdata_version
             self.masterdata_fingerprint[region] = masterdata_fingerprint
             self.masterdata_path[region] = local_md_dir
@@ -176,6 +179,93 @@ class Worker:
                 'message': get_exc_desc(e),
             }
     
+    # ================================ WL后排加成上限 ================================ #
+
+    def get_support_limits(self, options: DeckRecommendOptions, character_id: int, count: int) -> dict:
+        """按已加载的活动规则计算全卡满养成的后排上限，返回只读的共享缓存结果。"""
+        region = options.region
+        option_data = options.to_dict()
+        selectors = {
+            name: option_data[name]
+            for name in ('event_id', 'event_unit', 'world_bloom_event_turn', 'world_bloom_finale_turn')
+            if option_data.get(name) is not None
+        }
+        key = (region, tuple(selectors.items()), character_id, count)
+        now = time.time() * 1000
+        cached = self.support_limits_cache.get(key)
+        if cached is not None and now < cached[0]:
+            self.support_limits_cache.move_to_end(key)
+            return cached[1]
+
+        directory = self.masterdata_path[region]
+        cards = load_json(pjoin(directory, 'cards.json'))
+        rarities = {row['cardRarityType']: row for row in load_json(pjoin(directory, 'cardRarities.json'))}
+        published = [card for card in cards if card.get('releaseAt', 0) <= now]
+        max_skills = {
+            str(card['id']): rarities[card['cardRarityType']]['maxSkillLevel']
+            for card in published
+        }
+        userdata = DeckRecommendUserData()
+        userdata.load_from_bytes(dumps_json({
+            'userGamedata': {}, 'userAreas': [], 'userCharacters': [], 'userHonors': [],
+            'userDecks': [], 'userMysekaiCanvases': [], 'userMysekaiGates': [],
+            'userMysekaiFixtureGameCharacterPerformanceBonuses': [],
+            'userCards': [
+                {
+                    'cardId': card['id'], 'level': rarities[card['cardRarityType']]['maxLevel'],
+                    'masterRank': 5, 'skillLevel': max_skills[str(card['id'])],
+                    'specialTrainingStatus': 'none', 'defaultImage': 'original', 'episodes': [],
+                }
+                for card in published
+            ],
+        }, indent=False).encode('utf-8'))
+        cap_options = DeckRecommendOptions.from_dict({
+            **selectors, 'region': region, 'world_bloom_character_id': character_id,
+            'support_master_max': True, 'support_skill_max': True,
+        })
+        cap_options.user_data = userdata
+        support_cards = self.recommender.get_world_bloom_support_cards(cap_options)
+        # 上限使用活动规定的后排容量；玩家缺卡时也应显示完整容量的理论上限。
+        result = {
+            'upper': sum(card.bonus for card in support_cards[:count]),
+            'card_maxima': {str(card.card_id): card.bonus for card in support_cards},
+            'max_skills': max_skills,
+        }
+        # 每个 Worker 串行处理任务，同键只计算一次。MasterData 重载时清空，卡牌开放时过期。
+        expires_at = min((card['releaseAt'] for card in cards if card.get('releaseAt', 0) > now), default=float('inf'))
+        self.support_limits_cache[key] = (expires_at, result)
+        self.support_limits_cache.move_to_end(key)
+        while len(self.support_limits_cache) > 32:
+            self.support_limits_cache.popitem(last=False)
+        return result
+
+    def get_result_support_limits(self, options: DeckRecommendOptions, result: DeckRecommendResult) -> dict:
+        """为实际有后排的队伍补充上限，终章分别使用每套队长的角色规则。"""
+        decks = [deck for deck in result.decks if getattr(deck, 'support_deck_cards', [])]
+        if not decks:
+            return {}
+        cards = {}
+        if not options.world_bloom_character_id:
+            directory = self.masterdata_path[options.region]
+            cards = {card['id']: card for card in load_json(pjoin(directory, 'cards.json'))}
+        # 容量与原生库 MasterData::getWorldBloomEventTurn 保持一致：真实活动以 140、180 分轮。
+        event_id = options.event_id
+        if event_id:
+            turn = (event_id // 100000) % 10 + 1 if event_id > 1000 else (1 if event_id <= 140 else 2 if event_id <= 180 else 3)
+        else:
+            turn = options.world_bloom_finale_turn or options.world_bloom_event_turn
+        count = {1: 12, 2: 20, 3: 25}.get(turn)
+        if count is None:
+            return {}
+        limits = {}
+        for deck in decks:
+            character_id = options.world_bloom_character_id or cards[deck.cards[0].card_id]['characterId']
+            if str(character_id) not in limits:
+                limits[str(character_id)] = self.get_support_limits(options, character_id, count)
+        return limits
+
+    # ================================ 组卡任务 ================================ #
+
     def recommend(self, region: str, options: dict, userdata_hash: str) -> dict:
         self.init()
         seq = self.deckrec_seq_top
@@ -209,6 +299,12 @@ class Worker:
             res = self.recommender.recommend(options)
             cost_time = datetime.now() - start_time
 
+            support_limits = {}
+            try:
+                support_limits = self.get_result_support_limits(options, res)
+            except Exception as exc:
+                self.error('WL后排上限暂不可用:', get_exc_desc(exc))
+
             self.log(f"组卡任务#{seq}完成，耗时 {cost_time.total_seconds():.3f} 秒")
 
             return {
@@ -217,6 +313,7 @@ class Worker:
                 'cost_time': cost_time.total_seconds(),
                 'worker_id': self.worker_id,
                 'loaded_fingerprint': self.masterdata_fingerprint.get(region),
+                'support_limits': support_limits,
             }
         except BaseException as e:
             self.error(f"组卡任务#{seq}失败:", get_exc_desc(e))

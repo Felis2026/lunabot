@@ -1952,8 +1952,12 @@ async def do_deck_recommend_batch(
     options_list: list[DeckRecommendOptions],
     user_data: bytes,
     servers_override: Optional[list[dict]] = None,
+    support_limits: Optional[dict] = None,
 ) -> list[Tuple[DeckRecommendResult, List[str], Dict[str, Tuple[timedelta, timedelta]]]]:
-    """批量请求同一后端，返回各组队伍、算法来源和计算及等待耗时。"""
+    """批量请求同一后端，返回各组队伍、算法来源和计算及等待耗时。
+
+    support_limits 用于接收后端附带的 WL 后排上限，旧后端缺少此字段时保持空字典。
+    """
     # 获取组卡后端相关信息
     servers = (
         servers_override
@@ -2049,6 +2053,9 @@ async def do_deck_recommend_batch(
         raise ReplyException(f"请求所有可用的组卡服务失败:\n" + error_text.strip())
 
     # 结果归类整理
+    if support_limits is not None:
+        for response in result_list:
+            support_limits.update(response.get('support_limits', {}))
     result_dict = {}
     for original_index, result in zip(original_indices, result_list):
         result_dict.setdefault(original_index, []).append(result)
@@ -2338,6 +2345,293 @@ async def get_current_mysekai_deck(
 
 
 # ================================ 组卡结果绘制 ================================ #
+# ================================ 组卡标签与WL后排 ================================ #
+
+def make_deck_info_label(text: str, color=(50, 50, 50)) -> TextBox:
+    """按字形高度居中组卡小标签，保持标签底板与行高。"""
+    label = TextBox(text, TextStyle(font=DEFAULT_FONT, size=12, color=color))
+    font = get_font(DEFAULT_FONT, 12)
+    _, top, _, bottom = font.getbbox(label.text, anchor='ls')
+    # TextBox 的基线按中文字高定位，拉丁字形需要单独对齐到字号行框。
+    target_top = (label.style.size - (bottom - top) + 1) // 2
+    return label.set_text_offset((0, target_top - get_font_std_size(font)[1] - top))
+
+
+def make_deck_skill_label(level: int, color=(50, 50, 50)) -> TextBox:
+    return make_deck_info_label(f"SLv.{level}", color)
+
+
+def deck_completed_color(current: float, maximum: Optional[float], normal=(70, 70, 70)):
+    """已达到有效正数上限的数值使用完成色。"""
+    return (50, 150, 50) if maximum is not None and maximum > 0 and current >= maximum - 0.0001 else normal
+
+
+def get_deck_card_display_key(card) -> tuple:
+    """区分同卡在不同技能、专精和活动加成状态下的显示上限。"""
+    return (card.card_id, card.default_image, card.skill_level, card.master_rank, card.event_bonus_rate)
+
+
+def is_deck_simulated_event(options) -> bool:
+    """识别缺少真实活动ID的团属性或WL模拟组卡。"""
+    return not options.event_id and any(getattr(options, name, None) for name in (
+        'event_unit', 'event_attr', 'world_bloom_event_turn', 'world_bloom_finale_turn',
+    ))
+
+
+def get_deck_skill_score_up_maximum(skill: Optional[dict], max_skill_level: int, score_up_limit: Optional[float] = None) -> Optional[float]:
+    """读取选定技能的满级效果上限；缺少档位或出现未知效果时返回 None。"""
+    if not skill or not max_skill_level or not skill.get('skillEffects'):
+        return None
+    base, rank_bonus, enhance_bonus, reference_bonus, unit_bonus = 0.0, 0.0, 0.0, 0.0, 0.0
+    for effect in skill['skillEffects']:
+        kind = effect.get('skillEffectType')
+        if kind in ('life_recovery', 'judgment_up'):
+            continue
+        if kind not in ('score_up', 'score_up_condition_life', 'score_up_keep',
+                        'score_up_character_rank', 'other_member_score_up_reference_rate', 'score_up_unit_count'):
+            return None
+        detail = next((row for row in effect.get('skillEffectDetails', []) if row.get('level') == max_skill_level), None)
+        if detail is None:
+            return None
+        value = float(detail['activateEffectValue'])
+        if not math.isfinite(value) or value < 0:
+            return None
+        if kind in ('score_up', 'score_up_condition_life', 'score_up_keep'):
+            base = max(base, value)
+            if enhance := effect.get('skillEnhance'):
+                if enhance.get('skillEnhanceType') != 'sub_unit_score_up':
+                    return None
+                # 原生库的同团五人奖励为五份额外加成，四人时为三份。
+                enhance_bonus = max(enhance_bonus, 5 * float(enhance['activateEffectValue']))
+        elif kind == 'score_up_character_rank':
+            rank_bonus = max(rank_bonus, value)
+        elif kind == 'other_member_score_up_reference_rate':
+            if 'activateEffectValue2' not in detail:
+                return None
+            reference_bonus = max(reference_bonus, float(detail['activateEffectValue2']))
+        elif kind == 'score_up_unit_count':
+            unit_bonus = max(unit_bonus, value)
+    # 条件技能分别取其理论最强档；实际队伍是否满足条件由内核返回的当前值体现。
+    maximum = base + rank_bonus + max(enhance_bonus, reference_bonus, unit_bonus)
+    if score_up_limit is not None:
+        maximum = min(maximum, score_up_limit)
+    return maximum if math.isfinite(maximum) and maximum > 0 else None
+
+
+# ================================ 前排活动加成上限 ================================ #
+
+async def get_deck_event_bonus_limits(ctx, options, is_finale: bool, assumed_card_ids=()) -> dict:
+    """按已开放卡池求活动前排加成上限，终章分别返回队长与队员的最高值。"""
+    if not options.event_id:
+        return {}
+    bonus_rows, event_cards, rank_rows, units, cards = await asyncio.gather(
+        ctx.md.event_deck_bonuses.find_by('eventId', options.event_id, mode='all'),
+        ctx.md.event_cards.find_by('eventId', options.event_id, mode='all'),
+        ctx.md.event_rarity_bonus_rates.get(),
+        ctx.md.game_character_units.get(),
+        ctx.md.cards.get(),
+    )
+    if not bonus_rows:
+        return {}
+
+    # 加成条件先按角色归组；属性与 V 家支援团仍须逐卡匹配，不能直接相加各表最大值。
+    unit_map = {row['id']: row for row in units}
+    character_bonuses = {}
+    for row in bonus_rows:
+        unit = unit_map[row['gameCharacterUnitId']] if row.get('gameCharacterUnitId') else None
+        character_id = unit['gameCharacterId'] if unit else 0
+        character_bonuses.setdefault(character_id, []).append((unit, row))
+    rank_maxima = {}
+    for row in rank_rows:
+        rarity = row['cardRarityType']
+        rank_maxima[rarity] = max(rank_maxima.get(rarity, 0), row['bonusRate'])
+    event_card_map = {row['cardId']: row for row in event_cards}
+
+    honor_maxima, limited_bonus_enabled = {}, True
+    if is_finale:
+        honor_rows, count_limits = await asyncio.gather(
+            ctx.md.event_honor_bonuses.find_by('eventId', options.event_id, mode='all'),
+            ctx.md.event_card_bonus_limits.find_by('eventId', options.event_id, mode='all'),
+        )
+        if not honor_rows:
+            return {}
+        # 同角色的终章排名称号互斥，与顶配档案的称号收敛规则一致，最高档只取一枚。
+        for row in honor_rows:
+            character_id = row['leaderGameCharacterId']
+            honor_maxima[character_id] = max(honor_maxima.get(character_id, 0), row['bonusRate'])
+        if count_limits:
+            limited_bonus_enabled = count_limits[0]['memberCountLimit'] > 0
+
+    maxima, now = {'leader': 0.0, 'member': 0.0}, datetime.now().timestamp() * 1000
+    for card in cards:
+        if card.get('releaseAt', 0) > now and card['id'] not in assumed_card_ids:
+            continue
+        rarity = card['cardRarityType']
+        if rarity not in rank_maxima:
+            return {}
+        character_id = card['characterId']
+        base = 0.0
+        for unit, row in character_bonuses.get(0, []) + character_bonuses.get(character_id, []):
+            if row.get('cardAttr') and row['cardAttr'] != card['attr']:
+                continue
+            if unit and character_id >= 21 and card['supportUnit'] not in ('none', unit['unit']):
+                continue
+            base = max(base, row['bonusRate'])
+        event_card = event_card_map.get(card['id'], {})
+        bonus = base + rank_maxima[rarity]
+        if limited_bonus_enabled:
+            bonus += event_card.get('bonusRate', 0)
+        maxima['member'] = max(maxima['member'], bonus)
+        if is_finale:
+            # 牌子和队长奖励只计入队长上限；两档都要求完整奖励，不随玩家缺卡或名额耗尽下调。
+            bonus += honor_maxima.get(character_id, 0) + event_card.get('leaderBonusRate', 0)
+        maxima['leader'] = max(maxima['leader'], bonus)
+    return {role: value for role, value in maxima.items() if value > 0 and math.isfinite(value)}
+
+
+async def get_deck_card_display_limits(ctx, rule_ctx, decks, options, is_finale, resolve_card, assumed_card_ids=()) -> dict:
+    """为结果前排准备满技能、技能效果和活动单卡上限，仅读取 MasterData。"""
+    rarity_specs, skill_maxima, result = {}, {}, {}
+    jp_ctx = SekaiHandlerContext.from_region('jp')
+    simulated_event = is_deck_simulated_event(options)
+    score_up_limit, skill_rules_known = None, not simulated_event
+    if is_finale and not simulated_event:
+        if options.event_id == 180 or getattr(options, 'world_bloom_finale_turn', None):
+            # 与原生库的旧终章及模拟终章回退一致，140 是额外加分值。
+            score_up_limit = 140.0
+        else:
+            limits = await rule_ctx.md.event_skill_score_up_limits.find_by('eventId', options.event_id, mode='all')
+            skill_rules_known = len(limits) == 1
+            if skill_rules_known:
+                # 当前原生库将 scoreUpRateLimit 直接作为额外加分上限。
+                score_up_limit = max(0.0, float(limits[0]['scoreUpRateLimit']))
+
+    event_bonus_limits = {}
+    if not simulated_event and any(card.event_bonus_rate > 0 for deck in decks for card in deck.cards):
+        try:
+            event_bonus_limits = await get_deck_event_bonus_limits(rule_ctx, options, is_finale, assumed_card_ids)
+        except Exception as exc:
+            logger.warning(f"前排活动加成上限暂不可用: {get_exc_desc(exc)}")
+
+    for deck in decks:
+        for card in deck.cards:
+            key = get_deck_card_display_key(card)
+            if key in result:
+                continue
+            card_ctx = jp_ctx if card.card_id in assumed_card_ids else ctx
+            master_card = await resolve_card(card.card_id)
+            if card_ctx.region not in rarity_specs:
+                rarity_specs[card_ctx.region] = {
+                    row['cardRarityType']: row for row in await card_ctx.md.card_rarities.get()
+                }
+            rarity = master_card['cardRarityType']
+            max_level = rarity_specs[card_ctx.region].get(rarity, {}).get('maxSkillLevel')
+            values = {'skill_level': max_level}
+            if max_level and skill_rules_known:
+                # after_training 表示已解锁觉醒；双技能实际采用花前或花后以结果卡面为准。
+                skill_id = master_card.get('specialTrainingSkillId') if card.default_image == 'special_training' else None
+                skill_id = skill_id or master_card.get('skillId')
+                skill_key = (card_ctx.region, skill_id, max_level, score_up_limit)
+                if skill_key not in skill_maxima:
+                    skill = await card_ctx.md.skills.find_by_id(skill_id) if skill_id else None
+                    skill_maxima[skill_key] = get_deck_skill_score_up_maximum(skill, max_level, score_up_limit)
+                values['skill_score_up'] = skill_maxima[skill_key]
+            if card.event_bonus_rate > 0 and not simulated_event:
+                values['event_bonus_rate'] = event_bonus_limits.get('member')
+                values['leader_event_bonus_rate'] = event_bonus_limits.get('leader')
+            result[key] = values
+    return result
+
+
+def get_support_card_image_key(card) -> tuple:
+    """以图片中的养成状态区分后排缩略图。"""
+    return (card.card_id, card.default_image, card.level, card.master_rank, card.after_training)
+
+
+def draw_wl_support_deck(deck, thumbnails: dict, limits: dict, front_start: int, colorize_bonus: bool = True):
+    """绘制当前结果的后排，右侧空位显示当前加成与全卡上限。"""
+    cards = list(getattr(deck, 'support_deck_cards', []))
+    if not cards:
+        return
+    columns = (len(cards) + 1) // 2 if len(cards) > 12 else len(cards)
+    compact = len(cards) > 20
+    cell_width, cell_gap = (56, 4) if compact else (60, 6)
+    offset = max(0, front_start - 6 - (cell_width - 52) // 2)
+
+    def draw_summary():
+        """在右侧空位显示支援加成、活动理论上限和进度条。"""
+        current = deck.support_deck_bonus_rate
+        upper = limits.get('upper')
+        width = 48 if compact else 112
+        bar_width = 44 if compact else 108
+        color = deck_completed_color(current, upper if colorize_bonus else None, normal=(50, 50, 50))
+
+        def draw_current():
+            return TextBox(f'{current:g}%', TextStyle(
+                font=DEFAULT_BOLD_FONT, size=11 if compact else 17, color=color)).set_padding(0)
+
+        def draw_maximum():
+            return TextBox(f'/ {upper:g}%', TextStyle(
+                font=DEFAULT_FONT, size=11, color=(75, 75, 75))).set_padding(0)
+
+        def draw_bar():
+            """按当前值与活动理论上限绘制进度，满值使用完成色。"""
+            if upper is None or upper <= 0:
+                return
+            ratio = min(1, max(0, current / upper))
+            fill_width = max(1, round(bar_width * ratio)) if ratio else 0
+            fill = (50, 150, 50, 220) if colorize_bonus and current >= upper - 0.0001 else (80, 120, 165, 210)
+            with Frame().set_size((bar_width, 3)).set_padding(0).set_content_align('l'):
+                Spacer(w=bar_width, h=3).set_bg(RoundRectBg((255, 255, 255, 110), 1))
+                if fill_width:
+                    Spacer(w=fill_width, h=3).set_bg(RoundRectBg(fill, 1))
+
+        # WL3 继续占一格，52px 框与上排卡图共用左右边缘。
+        with Frame().set_size((56 if compact else 124, 80)).set_content_align('c'):
+            with VSplit().set_w(52 if compact else 124).set_h(80).set_content_align('c').set_item_align('c').set_sep(4).set_padding((2, 6) if compact else 6).set_bg(
+                RoundRectBg((255, 255, 255, 24), 6, stroke=(255, 255, 255, 56), stroke_width=1)):
+                title = TextBox('支援加成', TextStyle(
+                    font=DEFAULT_BOLD_FONT, size=11 if compact else 12, color=(55, 55, 55))) \
+                    .set_w(width).set_padding((0, 1)).set_content_align('c')
+                font = title._get_pil_font()
+                _, top, _, bottom = font.getbbox(title.text, anchor='ls')
+                target_top = (title.style.size - (bottom - top) + 1) // 2
+                title.set_text_offset((0, target_top - get_font_std_size(font)[1] - top))
+                if compact:
+                    draw_current()
+                    draw_bar()
+                    if upper is not None:
+                        draw_maximum()
+                else:
+                    with HSplit().set_content_align('rb').set_item_align('b').set_sep(3).set_padding(0):
+                        draw_current()
+                        if upper is not None:
+                            draw_maximum()
+                    draw_bar()
+
+    with HSplit().set_content_align('l').set_item_align('c').set_sep(0).set_padding(0):
+        if offset:
+            Spacer(w=offset, h=1)
+        with VSplit().set_content_align('lt').set_item_align('lt').set_sep(4).set_padding((6, 5)):
+            for start in range(0, len(cards), columns):
+                with HSplit().set_content_align('l').set_item_align('t').set_sep(cell_gap).set_padding(0):
+                    for card in cards[start:start + columns]:
+                        with VSplit().set_content_align('c').set_item_align('c').set_sep(1).set_w(cell_width):
+                            ImageBox(thumbnails[get_support_card_image_key(card)], size=(52, 52))
+                            make_deck_skill_label(card.skill_level, deck_completed_color(
+                                card.skill_level, limits.get('max_skills', {}).get(str(card.card_id)))) \
+                                .set_bg(RoundRectBg((255, 255, 255, 150), 2))
+                            TextBox(f"{card.bonus:g}%", TextStyle(font=DEFAULT_BOLD_FONT, size=13, color=deck_completed_color(
+                                card.bonus, limits.get('card_maxima', {}).get(str(card.card_id)) if colorize_bonus else None)))
+                    if compact and start > 0:
+                        draw_summary()
+        if not compact:
+            Spacer(w=16, h=1)
+            draw_summary()
+
+
+# ================================ 组卡页面 ================================ #
+
 async def compose_deck_recommend_image(
     ctx: SekaiHandlerContext, 
     qid: int,
@@ -2359,6 +2653,7 @@ async def compose_deck_recommend_image(
     rule_ctx = jp_ctx if is_preview else ctx
     is_finale = preview_resolution.is_finale if is_preview else await is_final_chapter_event(rule_ctx, options.event_id)
     is_wl = bool(options.world_bloom_character_id or is_finale)
+    simulated_event = is_deck_simulated_event(options)
     if is_finale and options.event_id != 180:
         try:
             finale_turn = (preview_resolution.world_bloom_turn if is_preview else None) or get_world_bloom_finale_turn(
@@ -2878,11 +3173,13 @@ async def compose_deck_recommend_image(
     cost_times, wait_times = {}, {}
     result_decks = []
     result_algs = []
+    support_limits = {}
     batch_results = await do_deck_recommend_batch(
         ctx,
         all_options,
         user_data,
         servers_override=servers_override,
+        support_limits=support_limits,
     )
     # 每个角色整组取优，保留获选歌曲的队伍、算法来源和分数对应关系。
     selected_indices = (
@@ -3164,6 +3461,47 @@ async def compose_deck_recommend_image(
     card_imgs = await asyncio.gather(*card_imgs)
     card_imgs = { key : img for key, img in zip(card_keys, card_imgs) }
 
+    # ================================ WL后排图片与满值标记 ================================ #
+
+    support_card_ids = {}
+    for deck in result_decks:
+        for card in getattr(deck, 'support_deck_cards', []):
+            support_card_ids.setdefault(get_support_card_image_key(card), card)
+    async def get_support_thumbnail(card):
+        """按后排实际养成状态读取缩略图，缺图时使用通用占位图。"""
+        assumed = bool(assumed_cards_context and card.card_id in assumed_cards_context.assumed_card_ids)
+        card_ctx = jp_ctx if assumed else ctx
+        master_card = await _get_result_card_masterdata(card.card_id)
+        try:
+            return await get_card_full_thumbnail(card_ctx, master_card, pcard={
+                'cardId': card.card_id, 'level': card.level, 'masterRank': card.master_rank,
+                'defaultImage': card.default_image,
+                'specialTrainingStatus': 'done' if card.after_training else 'none',
+            })
+        except Exception:
+            return UNKNOWN_IMG
+    support_images = await asyncio.gather(*(get_support_thumbnail(card) for card in support_card_ids.values()))
+    support_thumbnails = dict(zip(support_card_ids, support_images))
+
+    # ================================ 前排满值标记 ================================ #
+
+    front_card_limits = {}
+    try:
+        front_card_limits = await get_deck_card_display_limits(
+            ctx, rule_ctx, thumbnail_decks, options, is_finale, _get_result_card_masterdata,
+            assumed_cards_context.assumed_card_ids if assumed_cards_context else (),
+        )
+    except Exception as exc:
+        # 满值资料缺失时使用普通字色，已算出的队伍仍可继续绘制。
+        logger.warning(f"组卡满值标记资料暂不可用: {get_exc_desc(exc)}")
+
+    async def get_result_support_limits(deck):
+        """普通章节按章节角色取上限，终章按当前结果队长角色取上限。"""
+        character_id = options.world_bloom_character_id
+        if not character_id and deck.cards:
+            character_id = (await _get_result_card_masterdata(deck.cards[0].card_id))['characterId']
+        return support_limits.get(str(character_id), {})
+
     # 获取挑战live额外分数信息
     challenge_score_dlt = []
     if recommend_type in ["challenge", "challenge_all"]:
@@ -3424,9 +3762,9 @@ async def compose_deck_recommend_image(
                                     prep_pair("🚀", "时速:", format_wan_number(war_prepare_info['hourly_pt']))
                                     prep_pair("🔋", "预计火耗:", str(war_prepare_info['total_boost_cost']))
 
-                async def draw_result_table(result_decks, result_algs, table_title=None, is_current_table=False):
+                async def draw_result_table(result_decks, result_algs, table_title=None, is_current_table=False, show_header=True, bare=False, row_music_diffs=None):
                     """共用卡组各列的绘制过程，烤森双表使用一致的列宽。"""
-                    with VSplit().set_content_align('l' if table_title else 'c').set_item_align('l' if table_title else 'c').set_sep(6 if table_title else 16).set_padding(16).set_bg(roundrect_bg()) as result_table:
+                    with VSplit().set_content_align('l' if table_title else 'c').set_item_align('l' if table_title else 'c').set_sep(6 if table_title else 16).set_padding(0 if bare else 16).set_bg(None if bare else roundrect_bg()) as result_table:
                         if table_title:
                             TextBox(table_title, TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=(50, 50, 50)))
                         if len(result_decks) > 0:
@@ -3462,10 +3800,10 @@ async def compose_deck_recommend_image(
                                 # 歌曲比较添加额外歌曲列
                                 if music_compare:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                        if not is_current_table:
+                                        if not is_current_table and show_header:
                                             TextBox("歌曲", th_style2).set_h(36 if table_title else gh // 2).set_content_align('c')
                                             Spacer(h=6)
-                                        for (mid, diff, marg), deck in zip(music_diffs_to_compare, result_decks):
+                                        for (mid, diff, marg), deck in zip(row_music_diffs if row_music_diffs is not None else music_diffs_to_compare, result_decks):
                                             music = await jp_ctx.md.musics.find_by_id(mid)
                                             music_title = music['title'] + f" ({diff.upper()})"
                                             with VSplit().set_content_align('c').set_item_align('c').set_sep(8).set_padding(0).set_h(gh):
@@ -3479,7 +3817,7 @@ async def compose_deck_recommend_image(
                                 # 分数
                                 if recommend_type not in ["bonus", "wl_bonus"]:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                        if not is_current_table:
+                                        if not is_current_table and show_header:
                                             target_score = options.target == "score"
                                             text = score_name + th_main_sign if target_score else score_name
                                             style = th_style1 if target_score else th_style2
@@ -3514,12 +3852,12 @@ async def compose_deck_recommend_image(
 
                                 # 卡片
                                 with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                    if not is_current_table:
+                                    if not is_current_table and show_header:
                                         TextBox("卡组", th_style2).set_h(36 if table_title else gh // 2).set_content_align('c')
                                         Spacer(h=6)
                                     for deck in result_decks:
                                         with HSplit().set_content_align('c').set_item_align('c').set_sep(8).set_padding(0):
-                                            for card in deck.cards:
+                                            for card_index, card in enumerate(deck.cards):
                                                 card_id = card.card_id
                                                 character_id = (
                                                     await _get_result_card_masterdata(card_id)
@@ -3544,17 +3882,24 @@ async def compose_deck_recommend_image(
                                                                     .set_offset((-32, 65))
 
                                                     info_bg = RoundRectBg((255, 255, 255, 150), 2)
+                                                    display_limits = front_card_limits.get(get_deck_card_display_key(card), {})
                                                     with HSplit().set_content_align('c').set_item_align('c').set_sep(3).set_padding(0):
-                                                        TextBox(f"SLv.{slv}", TextStyle(font=DEFAULT_FONT, size=12, color=(50, 50, 50))).set_bg(info_bg)
-                                                        TextBox(f"↑{sup}%", TextStyle(font=DEFAULT_FONT, size=12, color=(50, 50, 50))).set_bg(info_bg)
+                                                        make_deck_skill_label(slv, deck_completed_color(
+                                                            slv, display_limits.get('skill_level'), normal=(50, 50, 50))).set_bg(info_bg)
+                                                        make_deck_info_label(f"↑{sup}%", deck_completed_color(
+                                                            card.skill_score_up, display_limits.get('skill_score_up'), normal=(50, 50, 50))).set_bg(info_bg)
 
                                                     with HSplit().set_content_align('c').set_item_align('c').set_sep(3).set_padding(0):
                                                         show_event_bonus = event_bonus > 0
                                                         if show_event_bonus:
                                                             event_bonus_str = f"+{event_bonus:.1f}%" if int(event_bonus) != event_bonus else f"+{int(event_bonus)}%"
-                                                            TextBox(event_bonus_str, TextStyle(font=DEFAULT_FONT, size=12, color=(50, 50, 50))).set_bg(info_bg)
+                                                            bonus_limit = display_limits.get('leader_event_bonus_rate' if is_finale and card_index == 0 else 'event_bonus_rate')
+                                                            bonus_color = deck_completed_color(event_bonus, bonus_limit, normal=(50, 50, 50))
+                                                            TextBox(event_bonus_str, TextStyle(font=DEFAULT_FONT, size=12, color=bonus_color)).set_bg(info_bg)
                                                         read_fg, read_bg = (50, 150, 50, 255), (255, 255, 255, 255)
                                                         noread_fg, noread_bg = (150, 50, 50, 255), (255, 255, 255, 255)
+                                                        if simulated_event:
+                                                            read_fg = noread_fg = (50, 50, 50, 255)
                                                         none_fg, none_bg = (255, 255, 255, 255), (255, 255, 255, 255)
                                                         ep1_fg = none_fg if ep1_read is None else (read_fg if ep1_read else noread_fg)
                                                         ep1_bg = none_bg if ep1_read is None else (read_bg if ep1_read else noread_bg)
@@ -3566,7 +3911,7 @@ async def compose_deck_recommend_image(
                                 # 加成
                                 if recommend_type not in ["challenge", "challenge_all", "no_event"]:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                        if not is_current_table:
+                                        if not is_current_table and show_header:
                                             TextBox("加成", th_style2).set_h(36 if table_title else gh // 2).set_content_align('c')
                                             Spacer(h=6)
                                         for deck in result_decks:
@@ -3585,7 +3930,7 @@ async def compose_deck_recommend_image(
                                 # 实效
                                 if options.live_type in ['multi', 'cheerful']:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                        if not is_current_table:
+                                        if not is_current_table and show_header:
                                             target_skill = options.target == "skill"
                                             text = "实效" + th_main_sign if target_skill else "实效"
                                             style = th_style1 if target_skill else th_style2
@@ -3602,7 +3947,7 @@ async def compose_deck_recommend_image(
                                 # 综合力和算法
                                 if recommend_type not in ["bonus", "wl_bonus"]:
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
-                                        if not is_current_table:
+                                        if not is_current_table and show_header:
                                             target_power = options.target == "power"
                                             text = "综合力" + th_main_sign if target_power else "综合力"
                                             style = th_style1 if target_power else th_style2
@@ -3628,6 +3973,26 @@ async def compose_deck_recommend_image(
                 if current_mysekai_deck is not None:
                     await draw_result_table([current_mysekai_deck], [''], '当前队伍', True)
                     await draw_result_table(result_decks, result_algs, '推荐卡组')
+                elif is_wl and any(getattr(deck, 'support_deck_cards', []) for deck in result_decks):
+                    # ================================ WL前后排结果 ================================ #
+                    # 每套前排紧接自身后排；整页共用表头和列宽，后排卡图左缘对齐前排。
+                    with VSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_padding(16).set_bg(roundrect_bg()):
+                        column_widths = None
+                        for index, (deck, algorithm) in enumerate(zip(result_decks, result_algs)):
+                            with VSplit().set_content_align('lt').set_item_align('lt').set_sep(6).set_padding(0):
+                                table = await draw_result_table(
+                                    [deck], [algorithm], show_header=index == 0, bare=True,
+                                    row_music_diffs=[music_diffs_to_compare[index]] if music_compare else None,
+                                )
+                                columns = next(child for child in table.items if isinstance(child, HSplit)).items
+                                if column_widths is None:
+                                    column_widths = [column._get_self_size()[0] for column in columns]
+                                for column, width in zip(columns, column_widths):
+                                    column.set_w(width)
+                                card_column = int(music_compare) + int(recommend_type != 'wl_bonus')
+                                front_start = sum(column_widths[:card_column]) + 16 * card_column + columns[card_column].hpadding
+                                draw_wl_support_deck(deck, support_thumbnails, await get_result_support_limits(deck), front_start,
+                                                     colorize_bonus=not simulated_event)
                 else:
                     await draw_result_table(result_decks, result_algs)
 
