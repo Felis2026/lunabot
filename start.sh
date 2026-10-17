@@ -142,7 +142,7 @@ if [ "${DECKREC_PREVIEW_EXTERNAL:-0}" != "1" ] && [ "${DECKREC_PREVIEW_LOCAL_ENA
     start_optional_service "Deck Recommender Preview" env \
         DECKREC_HOST="${DECKREC_PREVIEW_HOST:-127.0.0.1}" \
         DECKREC_PORT="${DECKREC_PREVIEW_PORT:-45557}" \
-        DECKREC_WORKER_NUM="${DECKREC_PREVIEW_WORKER_NUM:-1}" \
+        DECKREC_WORKER_NUM="${DECKREC_PREVIEW_WORKER_NUM:-4}" \
         DECKREC_DATA_DIR="${DECKREC_PREVIEW_DATA_DIR:-data/sekai/deckrec-preview}" \
         DECKREC_INSTANCE_ROLE=preview \
         DECKREC_DATA_SCOPE=cn_jp_preview_v1 \
