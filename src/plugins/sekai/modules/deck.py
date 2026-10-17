@@ -24,7 +24,7 @@ from .profile import (
     get_card_full_thumbnail,
 )
 from .education import get_user_challenge_live_info
-from .card import get_unit_by_card_id, has_after_training
+from .card import get_character_sd_image, get_unit_by_card_id, has_after_training
 from .music import (
     search_music,
     MusicSearchOptions, 
@@ -1932,13 +1932,28 @@ def log_options(ctx: SekaiHandlerContext, user_id: int, options: DeckRecommendOp
     log += f"fixed_cards={options.fixed_cards}"
     logger.info(log)
 
-# 自动组卡实现（批量提交），每批会发送到同一个后端，返回 [Tuple[结果，结果算法来源，Dict[算法: Tuple[耗时，等待时间]]], ...]
+# ================================ 组卡结果排序与后端调用 ================================ #
+def get_deck_target_key(deck: RecommendDeck, options: DeckRecommendOptions):
+    """按组卡目标生成队伍排序键。"""
+    if options.live_type == "mysekai":
+        return (deck.mysekai_event_point, deck.total_power)
+    if options.target == "score":
+        return (deck.score, deck.multi_live_score_up)
+    if options.target == "power":
+        return deck.total_power
+    if options.target == "skill":
+        return deck.multi_live_score_up
+    if options.target == "bonus":
+        return (-deck.event_bonus_rate, deck.score)
+
+
 async def do_deck_recommend_batch(
     ctx: SekaiHandlerContext, 
     options_list: list[DeckRecommendOptions],
     user_data: bytes,
     servers_override: Optional[list[dict]] = None,
 ) -> list[Tuple[DeckRecommendResult, List[str], Dict[str, Tuple[timedelta, timedelta]]]]:
+    """批量请求同一后端，返回各组队伍、算法来源和计算及等待耗时。"""
     # 获取组卡后端相关信息
     servers = (
         servers_override
@@ -2060,19 +2075,8 @@ async def do_deck_recommend_batch(
                     decks.append(deck)
                 elif alg not in deck_src_alg[deck_hash]:
                     deck_src_alg[deck_hash].append(alg)
-        def key_func(deck: RecommendDeck):
-            if options.live_type == "mysekai":
-                return (deck.mysekai_event_point, deck.total_power)
-            elif options.target == "score":
-                return (deck.score, deck.multi_live_score_up)
-            elif options.target == "power":
-                return deck.total_power
-            elif options.target == "skill":
-                return deck.multi_live_score_up
-            elif options.target == "bonus":
-                return (-deck.event_bonus_rate, deck.score)
         limit = options.limit if options.target != "bonus" else options.limit * len(options.target_bonus_list)
-        decks = sorted(decks, key=key_func, reverse=True)[:limit]
+        decks = sorted(decks, key=lambda deck: get_deck_target_key(deck, options), reverse=True)[:limit]
         src_algs = ["+".join(deck_src_alg[get_deck_hash(deck, preserve_order)]) for deck in decks]
         res = DeckRecommendResult()
         # 加成组卡的队伍按照加成排序
@@ -2196,56 +2200,95 @@ async def construct_max_profile(ctx: SekaiHandlerContext, max_area_item_level: i
 
     return p
 
-# 根据用户数据推荐挑战组卡歌曲
+# ================================ 挑战组卡自动选曲 ================================ #
+async def recommend_challenge_musics(
+    ctx: SekaiHandlerContext,
+    profile: dict | None,
+) -> list[tuple[int, str]]:
+    """按FC记录选择首个达标档位，返回该档位中已开放的候选歌曲。"""
+    if not config.get('deck.challenge_music_auto_recommend.enabled'):
+        return []
+    if not profile or not profile.get('userMusicResults'):
+        return []
+
+    # 同一谱面的不同游玩模式只计一次，AP记录也计入FC。
+    cleared_charts = set()
+    for result in profile['userMusicResults']:
+        if result.get('fullComboFlg') or result.get('fullPerfectFlg'):
+            for field in ('musicDifficultyType', 'musicDifficulty'):
+                if diff := result.get(field):
+                    cleared_charts.add((result['musicId'], diff))
+    fc_count: dict[str, dict[int, int]] = {}
+    for music in await get_valid_musics(ctx, leak=False):
+        mid = music['id']
+        levels = (await get_music_diff_info(ctx, mid)).level
+        for diff in DIFF_COLORS:
+            if (level := levels.get(diff)) and (mid, diff) in cleared_charts:
+                count = fc_count.setdefault(diff, {})
+                count[level] = count.get(level, 0) + 1
+
+    candidates = []
+    selected_requirements = None
+    for rule in config.get('deck.challenge_music_auto_recommend.rules'):
+        requirements = rule['fc_requires']
+        if selected_requirements is not None and requirements != selected_requirements:
+            continue
+        mid, diff = rule['music']
+        if not await is_valid_music(ctx, mid, leak=False, diff=diff):
+            continue
+        for req_key, req_count in requirements.items():
+            req_diff, req_level = req_key.split('_')
+            # 门槛表示该等级及以上的FC数，等级上限由当前谱面数据决定。
+            count = sum(value for level, value in fc_count.get(req_diff, {}).items() if level >= int(req_level))
+            if count < req_count:
+                break
+        else:
+            selected_requirements = requirements
+            if (mid, diff) not in candidates:
+                candidates.append((mid, diff))
+    return candidates
+
+
 async def recommend_challenge_music(
     ctx: SekaiHandlerContext,
     profile: dict | None,
 ) -> tuple[int, str] | None:
-    if not config.get('deck.challenge_music_auto_recommend.enabled'):
-        return None
-    if not profile or not profile.get('userMusicResults'):
-        return None
+    """返回首选挑战歌曲，供只接受单曲的调用方使用。"""
+    candidates = await recommend_challenge_musics(ctx, profile)
+    return candidates[0] if candidates else None
 
-    # 统计各难度各等级fc数量
-    fc_count: dict[str, dict[int, int]] = {}
-    for music in await get_valid_musics(ctx, leak=False):
-        for diff in DIFF_COLORS:
-            mid = music['id']
-            level = (await get_music_diff_info(ctx, mid)).level.get(diff)
-            if not level: 
-                continue
-            results = find_by(profile['userMusicResults'], "musicId", mid, mode='all') 
-            results = find_by(results, 'musicDifficultyType', diff, mode='all') + find_by(results, 'musicDifficulty', diff, mode='all')
-            if results:
-                full_combo, all_prefect = False, False
-                for item in results:
-                    full_combo = full_combo or item["fullComboFlg"]
-                    all_prefect = all_prefect or item["fullPerfectFlg"]
-                if full_combo or all_prefect:
-                    fc_count.setdefault(diff, {}).setdefault(level, 0)
-                    fc_count[diff][level] += 1
-    # 各等级后缀和
-    for diff in DIFF_COLORS:
-        if count := fc_count.get(diff):
-            for level in range(40, 1):
-                if level + 1 not in count:
-                    continue
-                count.setdefault(level, 0)
-                count[level] += count[level + 1]
-    # 根据规则进行推荐
-    for rule in config.get('deck.challenge_music_auto_recommend.rules'):
-        mid, diff = rule['music']
-        if not await is_valid_music(ctx, mid, leak=False, diff=diff):
+
+def select_challenge_music_results(options_list, batch_results) -> list[int]:
+    """每个角色选择最优歌曲对应的整组结果，目标值相同按候选顺序取首项。"""
+    selected = {}
+    for index, (options, batch) in enumerate(zip(options_list, batch_results)):
+        cid = options.challenge_live_character_id
+        if cid not in selected:
+            selected[cid] = index
             continue
-        ok = True
-        for req_key, req_count in rule['fc_requires'].items():
-            req_diff, req_level = req_key.split('_')
-            if fc_count.get(req_diff, {}).get(int(req_level), 0) < req_count:
-                ok = False
-                break
-        if ok:
-            return (mid, diff)
-    return None
+        previous = selected[cid]
+        decks, old_decks = batch[0].decks, batch_results[previous][0].decks
+        if not decks:
+            continue
+        if not old_decks:
+            selected[cid] = index
+            continue
+        candidate_key = get_deck_target_key(decks[0], options)
+        previous_key = get_deck_target_key(old_decks[0], options)
+        # 分数相同时保持默认选曲顺序，实效仅用于同一首歌内部的卡组排序。
+        if options.target == 'score':
+            candidate_key, previous_key = candidate_key[0], previous_key[0]
+        if candidate_key > previous_key:
+            selected[cid] = index
+    return list(selected.values())
+
+
+async def get_challenge_character_head(cid: int) -> Image.Image:
+    """按共同面部参考点缩放官方Q版头，返回独立的64像素透明图。"""
+    image = await get_character_sd_image(cid)
+    # 官方250×200素材的面部参考点为(120,117)，下方补透明空间形成共同方框。
+    # 按共同框缩放可保留头发轮廓，避免各角色的发型改变头像大小和对齐位置。
+    return image.crop((3, 0, 237, 234)).resize((64, 64), Image.Resampling.LANCZOS)
 
 
 # ================================ 烤森当前队伍计算 ================================ #
@@ -2705,10 +2748,13 @@ async def compose_deck_recommend_image(
 
     # 挑战组卡自动推荐歌曲
     use_recommended_challenge_music = False
-    if options.live_type == "challenge" and additional.get('use_default_music'):
-        if res := await recommend_challenge_music(ctx, profile):
-            options.music_id, options.music_diff = res
+    challenge_music_candidates = []
+    if options.live_type == "challenge" and additional.get('use_default_music') and not music_compare:
+        challenge_music_candidates = await recommend_challenge_musics(ctx, profile)
+        if challenge_music_candidates:
+            options.music_id, options.music_diff = challenge_music_candidates[0]
             use_recommended_challenge_music = True
+    compare_challenge_musics = len(challenge_music_candidates) > 1
 
     # 体力加成
     boost = additional.get('boost', None)
@@ -2766,10 +2812,14 @@ async def compose_deck_recommend_image(
         # 挑战组卡没有指定角色情况下，每角色组1个最强
         assert_and_reply(not music_compare, f"挑战组卡必须指定一个角色才能进行歌曲比较")
         for cid in range(1, 26 + 1):
-            options.challenge_live_character_id = cid
-            options.limit = 1
-            all_options.append(DeckRecommendOptions(options))
+            for mid, diff in challenge_music_candidates or [(options.music_id, options.music_diff)]:
+                candidate_options = DeckRecommendOptions(options)
+                candidate_options.challenge_live_character_id = cid
+                candidate_options.limit = 1
+                candidate_options.music_id, candidate_options.music_diff = mid, diff
+                all_options.append(candidate_options)
         options.challenge_live_character_id = None
+        options.limit = 1
     elif music_compare:
         # 歌曲比较
         options.limit = 1
@@ -2777,6 +2827,11 @@ async def compose_deck_recommend_image(
             options.music_id = mid
             options.music_diff = diff
             all_options.append(DeckRecommendOptions(options))
+    elif compare_challenge_musics:
+        for mid, diff in challenge_music_candidates:
+            candidate_options = DeckRecommendOptions(options)
+            candidate_options.music_id, candidate_options.music_diff = mid, diff
+            all_options.append(candidate_options)
     else:
         # 正常组卡
         all_options = [options]
@@ -2823,18 +2878,33 @@ async def compose_deck_recommend_image(
     cost_times, wait_times = {}, {}
     result_decks = []
     result_algs = []
-    for res, algs, cost_and_wait_times in await do_deck_recommend_batch(
+    batch_results = await do_deck_recommend_batch(
         ctx,
         all_options,
         user_data,
         servers_override=servers_override,
-    ):
+    )
+    # 每个角色整组取优，保留获选歌曲的队伍、算法来源和分数对应关系。
+    selected_indices = (
+        select_challenge_music_results(all_options, batch_results)
+        if compare_challenge_musics else range(len(batch_results))
+    )
+    result_challenge_musics = []
+    for index in selected_indices:
+        res, algs, _ = batch_results[index]
         result_decks.extend(res.decks)
         result_algs.extend(algs)
+        selected_options = all_options[index]
+        result_challenge_musics.extend([(selected_options.music_id, selected_options.music_diff)] * len(res.decks))
+    if compare_challenge_musics and recommend_type == 'challenge':
+        selected_options = all_options[selected_indices[0]]
+        options.music_id, options.music_diff = selected_options.music_id, selected_options.music_diff
+    # 所有候选歌曲均有计算开销，页脚统计应包含未获选的批次。
+    for _, _, cost_and_wait_times in batch_results:
         for alg, (cost, wait) in cost_and_wait_times.items():
             cost_times.setdefault(alg, []).append(cost)
             wait_times.setdefault(alg, []).append(wait)
-    for alg in cost_and_wait_times:
+    for alg in cost_times:
         cost_times[alg] = sum(cost_times[alg]) / len(cost_times[alg])
         wait_times[alg] = sum(wait_times[alg]) / len(wait_times[alg])
 
@@ -2880,6 +2950,19 @@ async def compose_deck_recommend_image(
             logger.warning(f"烤森当前队伍计算失败: {get_exc_desc(exc)}")
 
     # 准备绘图数据。
+
+    challenge_music_info = {}
+    challenge_music_row_covers = {}
+    if compare_challenge_musics and recommend_type == 'challenge_all':
+        for mid, diff in challenge_music_candidates:
+            music = await jp_ctx.md.musics.find_by_id(mid)
+            challenge_music_info[(mid, diff)] = (
+                truncate(music['title'], 20),
+                await get_music_cover_thumb(jp_ctx, mid),
+                {540: '虚无', 104: '10th'}.get(mid, truncate(music['title'], 6)),
+            )
+            # 表格封面使用查询区服素材，顶部歌曲标题和封面沿用日服资源。
+            challenge_music_row_covers[(mid, diff)] = await get_music_cover_thumb(ctx, mid)
 
     if not music_compare:
         # 获取一般情况音乐标题和封面
@@ -3202,18 +3285,29 @@ async def compose_deck_recommend_image(
                             TextBox(f"WL仅支持自动组主队，支援队请自行配置", TextStyle(font=DEFAULT_FONT, size=24, color=(50, 50, 50)))
                     
                     if recommend_type not in NO_MUSIC_TYPES and not music_compare:
-                        with HSplit().set_content_align('l').set_item_align('l').set_sep(16):
-                            if last_args:
-                                TextBox(f"{last_args} → ", TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(70, 70, 70)))
-                            with Frame().set_size((50, 50)):
-                                if options.music_id != OMAKASE_MUSIC_ID:
-                                    Spacer(w=50, h=50).set_bg(FillBg(fill=DIFF_COLORS[options.music_diff])).set_offset((6, 6))
-                                    ImageBox(music_cover, size=(50, 50))
-                                else:
-                                    ImageBox(music_cover, size=(50, 50), shadow=True)
-                            TextBox(music_title, TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(70, 70, 70)))
-                            if use_recommended_challenge_music:
-                                TextBox(f"*根据游玩记录自动推荐", TextStyle(font=DEFAULT_FONT, size=20, color=(70, 70, 70)))
+                        if challenge_music_info:
+                            with HSplit().set_content_align('l').set_item_align('c').set_sep(24):
+                                for (mid, diff), (title, cover, _) in challenge_music_info.items():
+                                    with HSplit().set_content_align('l').set_item_align('c').set_sep(12):
+                                        with Frame().set_size((50, 50)):
+                                            Spacer(w=50, h=50).set_bg(FillBg(fill=DIFF_COLORS[diff])).set_offset((6, 6))
+                                            ImageBox(cover, size=(50, 50))
+                                        with VSplit().set_content_align('l').set_item_align('l').set_sep(2):
+                                            TextBox(title, TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(70, 70, 70)))
+                                            TextBox(diff.upper(), TextStyle(font=DEFAULT_FONT, size=20, color=(70, 70, 70)))
+                        else:
+                            with HSplit().set_content_align('l').set_item_align('l').set_sep(16):
+                                if last_args:
+                                    TextBox(f"{last_args} → ", TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(70, 70, 70)))
+                                with Frame().set_size((50, 50)):
+                                    if options.music_id != OMAKASE_MUSIC_ID:
+                                        Spacer(w=50, h=50).set_bg(FillBg(fill=DIFF_COLORS[options.music_diff])).set_offset((6, 6))
+                                        ImageBox(music_cover, size=(50, 50))
+                                    else:
+                                        ImageBox(music_cover, size=(50, 50), shadow=True)
+                                TextBox(music_title, TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(70, 70, 70)))
+                                if use_recommended_challenge_music:
+                                    TextBox(f"*根据游玩记录自动推荐", TextStyle(font=DEFAULT_FONT, size=20, color=(70, 70, 70)))
 
                     if recommend_type not in ["bonus", "wl_bonus", "mysekai"]:
                         skill_text_style = TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(70, 70, 70))
@@ -3341,6 +3435,29 @@ async def compose_deck_recommend_image(
                                 th_style2 = TextStyle(font=DEFAULT_BOLD_FONT, size=28, color=(75, 75, 75))
                                 th_main_sign = '∇'
                                 tb_style = TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=(70, 70, 70))
+
+                                if recommend_type == 'challenge_all':
+                                    with VSplit().set_w(80).set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
+                                        TextBox('角色', th_style2).set_h(gh // 2).set_content_align('c')
+                                        Spacer(h=6)
+                                        for deck in result_decks:
+                                            card = await _get_result_card_masterdata(deck.cards[0].card_id)
+                                            head = await get_challenge_character_head(card['characterId'])
+                                            with Frame().set_w(64).set_h(gh).set_content_align('c'):
+                                                ImageBox(head, size=(64, 64), image_size_mode='fit').set_offset((0, -voffset))
+                                    if challenge_music_info:
+                                        with VSplit().set_w(80).set_content_align('c').set_item_align('c').set_sep(vsp).set_padding(8):
+                                            TextBox('歌曲', th_style2).set_h(gh // 2).set_content_align('c')
+                                            Spacer(h=6)
+                                            for mid, diff in result_challenge_musics:
+                                                _, _, label = challenge_music_info[(mid, diff)]
+                                                cover = challenge_music_row_covers[(mid, diff)]
+                                                with Frame().set_w(64).set_h(gh).set_content_align('c'):
+                                                    with VSplit().set_content_align('c').set_item_align('c').set_sep(6).set_offset((0, -6)):
+                                                        with Frame().set_size((48, 48)):
+                                                            Spacer(w=48, h=48).set_bg(FillBg(fill=DIFF_COLORS[diff])).set_offset((3, 3))
+                                                            ImageBox(cover, size=(48, 48))
+                                                        TextBox(label, TextStyle(font=DEFAULT_FONT, size=15, color=(75, 75, 75)))
 
                                 # 歌曲比较添加额外歌曲列
                                 if music_compare:
