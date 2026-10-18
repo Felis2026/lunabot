@@ -178,6 +178,28 @@ async def _(ctx: SekaiHandlerContext):
     )
 
 
+# ================================ 生日卡牌自适应排列 ================================ #
+def _draw_birthday_card_rows(cards: List[dict], card_thumbs: List[Image.Image], content_width: int):
+    """按实际卡数均分行宽，每行最多六张，末行整体居中。"""
+    card_count = len(cards)
+    if not card_count:
+        return
+    row_count = (card_count + 5) // 6
+    column_count = (card_count + row_count - 1) // row_count
+    gap = 16
+    cell_width, remainder = divmod(content_width - gap * (column_count - 1), column_count)
+    widths = [cell_width + (column < remainder) for column in range(column_count)]
+    thumb_size = min(128, cell_width)
+    with VSplit().set_w(content_width).set_sep(12).set_content_align('c').set_item_align('c'):
+        for start in range(0, card_count, column_count):
+            with Frame().set_w(content_width).set_content_align('c'):
+                with HSplit().set_sep(gap).set_item_align('t'):
+                    for column, index in enumerate(range(start, min(start + column_count, card_count))):
+                        with VSplit().set_w(widths[column]).set_sep(4).set_content_align('c').set_item_align('c'):
+                            ImageBox(card_thumbs[index], size=(thumb_size, thumb_size), shadow=True)
+                            TextBox(f"{cards[index]['id']}", TextStyle(DEFAULT_FONT, 16, (50, 50, 50)))
+
+
 chara_bd = SekaiCmdHandler([
     "/pjsk chara birthday", "/角色生日", "/生日",
 ])
@@ -253,7 +275,7 @@ async def _(ctx: SekaiHandlerContext):
 
     with Canvas(bg=ImageBg(card_image)).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('c').set_item_align('c').set_padding(16).set_sep(8) \
-            .set_item_bg(roundrect_bg()).set_bg(roundrect_bg()):
+            .set_item_bg(roundrect_bg()).set_bg(roundrect_bg()) as content:
         
             with HSplit().set_sep(16).set_padding(16).set_content_align('c').set_item_align('c'):
                 ImageBox(await get_character_sd_image(cid), size=(None, 80), shadow=True)
@@ -280,14 +302,11 @@ async def _(ctx: SekaiHandlerContext):
                     draw_time_range("🌱浇水开放时间", flower_start, flower_end)
                     draw_time_range("🎂派对开放时间", party_start, party_end)
 
-            with HSplit().set_sep(4).set_padding(16).set_content_align('l').set_item_align('l'):
-                TextBox(f"卡牌", style1)
-                Spacer(w=8)
-                with Grid(col_count=6).set_sep(4, 4):
-                    for i in range(len(card_thumbs)):
-                        with VSplit().set_sep(2).set_content_align('c').set_item_align('c'):
-                            ImageBox(card_thumbs[i], size=(80, 80), shadow=True)
-                            TextBox(f"{info['cards'][i]['id']}", TextStyle(DEFAULT_FONT, 16, (50, 50, 50)))
+            # 下方十三列生日列表决定最小行宽，卡牌区域与其余信息共用同一内容宽度。
+            card_panel_width = max(content._get_content_size()[0], 13 * 48 + 12 * 2 + 32)
+            with VSplit().set_w(card_panel_width).set_padding(16).set_sep(12).set_content_align('l').set_item_align('l'):
+                TextBox("卡牌", style1)
+                _draw_birthday_card_rows(info['cards'], card_thumbs, card_panel_width - 32)
                 
             with Grid(col_count=13).set_sep(2, 2).set_padding(16).set_content_align('c').set_item_align('c'):
                 idx = 0
@@ -305,6 +324,12 @@ async def _(ctx: SekaiHandlerContext):
                             b.set_bg(roundrect_bg(radius=8))
                         month, day = get_character_birthday(chara_id)
                         TextBox(f"{month}/{day}", TextStyle(DEFAULT_FONT, 14, (50, 50, 80)))
+
+            if is_fifth_anniv and ctx.region in ('cn', 'jp'):
+                with HSplit().set_w(card_panel_width).set_sep(8).set_padding(16).set_item_align('c').set_content_align('l'):
+                    TextBox('发送', TextStyle(DEFAULT_FONT, 22, BLACK))
+                    TextBox(f'/生日浇水 {get_character_first_nickname(cid)}', TextStyle(DEFAULT_FONT, 22, (20, 85, 155)))
+                    TextBox('查看露滴需求和奖励进度', TextStyle(DEFAULT_FONT, 22, BLACK))
 
     add_watermark(canvas)
 

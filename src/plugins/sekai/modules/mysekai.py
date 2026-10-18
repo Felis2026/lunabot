@@ -10,6 +10,7 @@ from ..sub import SekaiUserSubHelper, SekaiGroupSubHelper
 from ..gameapi import get_gameapi_config, request_gameapi
 from ..oauth import _normalize_suite_source_mode
 from .profile import (
+    PlayerAvatarInfo,
     get_player_bind_id, 
     get_player_bind_count,
     get_player_bind_id_index,
@@ -300,21 +301,20 @@ async def get_mysekai_info(
             return None, get_exc_desc(e)
     return mysekai_info, ""
 
-async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, basic_profile: dict, err_msg: str) -> Frame:
-    """生成 MySekai 玩家信息 Frame，准备账号状态后展示头像、ID 和数据来源。"""
+async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, basic_profile: dict, err_msg: str, show_level: bool = True, avatar_info: PlayerAvatarInfo = None) -> Frame:
+    """生成 MySekai 玩家信息 Frame，展示 ID 和数据来源，可复用已准备的头像。"""
     if mysekai_info:
         await _get_cloud_state(ctx, ctx.user_id)
     with Frame().set_bg(roundrect_bg()).set_padding(16) as f:
         with HSplit().set_content_align('c').set_item_align('c').set_sep(14):
             if mysekai_info:
-                avatar_info = await get_player_avatar_info_by_basic_profile(ctx, basic_profile)
+                avatar_info = avatar_info or await get_player_avatar_info_by_basic_profile(ctx, basic_profile)
 
                 frames = get_player_frames(ctx, basic_profile['user']['userId'], None)
                 await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = basic_profile['user']
-                    mysekai_game_data = mysekai_info['updatedResources']['userMysekaiGamedata']
                     if ctx.region in BD_MYSEKAI_REGIONS:
                         process_sensitive_cmd_source(mysekai_info)
                     source = get_mysekai_source_display_name(
@@ -332,9 +332,10 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
                         for item in hs.items:
                             if isinstance(item, TextBox):
                                 name_length += get_str_display_length(item.text)
-                        ms_lv = mysekai_game_data['mysekaiRank']
-                        ms_lv_text = f"MySekai Lv.{ms_lv}" if name_length <= 12 else f"MSLv.{ms_lv}"
-                        TextBox(ms_lv_text, TextStyle(font=DEFAULT_FONT, size=18, color=BLACK))
+                        if show_level:
+                            ms_lv = mysekai_info['updatedResources']['userMysekaiGamedata']['mysekaiRank']
+                            ms_lv_text = f"MySekai Lv.{ms_lv}" if name_length <= 12 else f"MSLv.{ms_lv}"
+                            TextBox(ms_lv_text, TextStyle(font=DEFAULT_FONT, size=18, color=BLACK))
 
                     TextBox(f"{ctx.region.upper()}: {process_hide_uid(ctx, game_data['userId'], keep=6)} Mysekai数据", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
                     TextBox(f"更新时间: {update_time_text}", TextStyle(font=DEFAULT_FONT, size=16, color=BLACK))
@@ -343,15 +344,15 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
                 TextBox(f"获取数据失败:{err_msg}", TextStyle(font=DEFAULT_FONT, size=20, color=RED), line_count=3).set_w(240)
     return f
 
-async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_info: dict, profile: dict, err_msg: str, mode: str = None) -> Frame:
-    """生成合并 MySekai 与 Suite 信息的 Frame，准备账号状态并统一来源模式。"""
+async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_info: dict, profile: dict, err_msg: str, mode: str = None, show_level: bool = True, avatar_info: PlayerAvatarInfo = None) -> Frame:
+    """生成合并 MySekai 与 Suite 信息的 Frame，统一来源模式，可复用已准备的头像。"""
     if profile and mysekai_info:
         await _get_cloud_state(ctx, ctx.user_id)
         suite_mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
     with Frame().set_bg(roundrect_bg()).set_padding(16) as f:
         with HSplit().set_content_align('c').set_item_align('c').set_sep(14):
             if profile and mysekai_info:
-                avatar_info = await get_player_avatar_info_by_detailed_profile(ctx, profile)
+                avatar_info = avatar_info or await get_player_avatar_info_by_detailed_profile(ctx, profile)
 
                 frames = get_player_frames(ctx, profile['userGamedata']['userId'], profile)
                 await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
@@ -365,7 +366,6 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                     update_time_text = update_time.strftime('%m-%d %H:%M:%S') + f" ({get_readable_datetime(update_time, show_original_time=False)})"
                     user_id = process_hide_uid(ctx, game_data['userId'], keep=6)
 
-                    mysekai_game_data = mysekai_info['updatedResources']['userMysekaiGamedata']
                     if ctx.region in BD_MYSEKAI_REGIONS:
                         process_sensitive_cmd_source(mysekai_info)
                     ms_source = get_mysekai_source_display_name(
@@ -384,9 +384,10 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                         for item in hs.items:
                             if isinstance(item, TextBox):
                                 name_length += get_str_display_length(item.text)
-                        ms_lv = mysekai_game_data['mysekaiRank']
-                        ms_lv_text = f"MySekai Lv.{ms_lv}" if name_length <= 12 else f"MSLv.{ms_lv}"
-                        TextBox(ms_lv_text, TextStyle(font=DEFAULT_FONT, size=18, color=BLACK))
+                        if show_level:
+                            ms_lv = mysekai_info['updatedResources']['userMysekaiGamedata']['mysekaiRank']
+                            ms_lv_text = f"MySekai Lv.{ms_lv}" if name_length <= 12 else f"MSLv.{ms_lv}"
+                            TextBox(ms_lv_text, TextStyle(font=DEFAULT_FONT, size=18, color=BLACK))
 
                     style = TextStyle(font=DEFAULT_FONT, size=16, color=BLACK)
                     TextBox(f"{ctx.region.upper()}: {user_id}", style)

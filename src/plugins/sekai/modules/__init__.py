@@ -17,3 +17,4 @@ from .sk import *
 from .stamp import *
 from .stamp_maker import *
 from .vlive import *
+from .birthday import *

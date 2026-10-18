@@ -2347,10 +2347,10 @@ async def get_current_mysekai_deck(
 # ================================ 组卡结果绘制 ================================ #
 # ================================ 组卡标签与WL后排 ================================ #
 
-def make_deck_info_label(text: str, color=(50, 50, 50)) -> TextBox:
+def make_deck_info_label(text: str, color=(50, 50, 50), size: int = 12) -> TextBox:
     """按字形高度居中组卡小标签，保持标签底板与行高。"""
-    label = TextBox(text, TextStyle(font=DEFAULT_FONT, size=12, color=color))
-    font = get_font(DEFAULT_FONT, 12)
+    label = TextBox(text, TextStyle(font=DEFAULT_FONT, size=size, color=color))
+    font = get_font(DEFAULT_FONT, size)
     _, top, _, bottom = font.getbbox(label.text, anchor='ls')
     # TextBox 的基线按中文字高定位，拉丁字形需要单独对齐到字号行框。
     target_top = (label.style.size - (bottom - top) + 1) // 2

@@ -1714,15 +1714,16 @@ async def get_player_avatar_info_by_detailed_profile(ctx: SekaiHandlerContext, d
     unit = await get_unit_by_card_id(ctx, card_id)
     return PlayerAvatarInfo(card_id, cid, unit, avatar_img)
 
-async def get_detailed_profile_card(ctx: SekaiHandlerContext, profile: dict, err_msg: str, mode=None) -> Frame:
-    """生成玩家详细信息 Frame，准备账号状态后展示来源模式与隐藏后的 ID。"""
+async def get_detailed_profile_card(ctx: SekaiHandlerContext, profile: dict, err_msg: str, mode=None, avatar_info: PlayerAvatarInfo = None) -> Frame:
+    """生成玩家详细信息 Frame，展示来源模式与隐藏后的 ID，可复用已准备的头像。"""
     if profile:
         await _get_cloud_state(ctx, ctx.user_id)
         mode = _normalize_suite_source_mode(mode or get_user_suite_source_mode(ctx, ctx.user_id))
     with Frame().set_bg(roundrect_bg()).set_padding(16) as f:
         with HSplit().set_content_align('c').set_item_align('c').set_sep(14):
             if profile:
-                avatar_info = await get_player_avatar_info_by_detailed_profile(ctx, profile)
+                # 调用方已准备回退头像时，保留该头像，避免再次依赖残缺的队伍字段。
+                avatar_info = avatar_info or await get_player_avatar_info_by_detailed_profile(ctx, profile)
 
                 frames = get_player_frames(ctx, profile['userGamedata']['userId'], profile)
                 await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
