@@ -1088,7 +1088,11 @@ async def compose_card_detail_image(ctx: SekaiHandlerContext, card_id: int):
                 # 卡面
                 with VSplit().set_padding(16).set_sep(8).set_content_align('lt').set_item_align('lt'):
                     for img in card_images:
-                        ImageBox(img, size=(500, None), shadow=True)
+                        if img is UNKNOWN_IMG:
+                            # 卡面槽位保持横版比例，缺图时按同一宽高绘制占位。
+                            ImageBox(missing_image_for_slot(500, 281), size=(500, 281), shadow=True)
+                        else:
+                            ImageBox(img, size=(500, None), shadow=True)
 
                 # 关联活动
                 if event_detail:

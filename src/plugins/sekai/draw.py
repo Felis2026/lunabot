@@ -1,3 +1,6 @@
+from functools import lru_cache
+from PIL import ImageDraw
+
 from ..utils import *
 from .common import *
 from .handler import SekaiHandlerContext
@@ -79,6 +82,43 @@ BG_PADDING = 20
 WIDGET_BG_COLOR_CFG = config.item("draw.widget_bg_color")
 WIDGET_BG_RADIUS_CFG = config.item("draw.widget_bg_radius")
 BLURGLASS_CFG = config.item("draw.blurglass")
+
+# ================================ 自适应缺图占位 ================================ #
+
+@lru_cache(maxsize=16)
+def _render_missing_image(width: int, height: int, radius: int) -> Image.Image:
+    """按槽位尺寸绘制缺图外框和居中图案，返回共享缓存图片。"""
+    scale = 2
+    image = Image.new('RGBA', (width * scale, height * scale))
+    drawing = ImageDraw.Draw(image)
+    drawing.rounded_rectangle(
+        (scale, scale, (width - 1) * scale, (height - 1) * scale),
+        radius=radius * scale, fill=(255, 255, 255, 24),
+        outline=(125, 125, 125, 64), width=scale,
+    )
+    # PNG的浅色底透明度为24，提取图案后由当前槽位绘制完整底色。
+    source = UNKNOWN_IMG.convert('RGBA')
+    alpha = source.getchannel('A')
+    bounds = alpha.point(lambda value: 255 if value > 32 else 0).getbbox()
+    glyph_alpha = alpha.crop(bounds).point(
+        lambda value: max(0, round((value - 24) * 255 / 231)))
+    glyph = Image.new('RGBA', glyph_alpha.size, (125, 125, 125, 0))
+    glyph.putalpha(glyph_alpha)
+    edge = min(128, round(min(width, height) * .3125)) * scale
+    ratio = min(edge / glyph.width, edge / glyph.height)
+    glyph = glyph.resize(
+        (round(glyph.width * ratio), round(glyph.height * ratio)),
+        Image.Resampling.LANCZOS)
+    image.alpha_composite(
+        glyph, ((image.width - glyph.width) // 2, (image.height - glyph.height) // 2))
+    # 两倍抗锯齿仅用于占位资源，页面画布保持原尺寸。
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def missing_image_for_slot(width: int, height: int) -> Image.Image:
+    """按槽位大小取得占位图副本，后续合成可独立修改返回值。"""
+    return _render_missing_image(width, height, WIDGET_BG_RADIUS_CFG.get()).copy()
+
 
 # 统一的半透明白色圆角矩形背景
 def roundrect_bg(

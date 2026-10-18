@@ -1685,7 +1685,10 @@ async def compose_music_detail_image(ctx: SekaiHandlerContext, mid: int, title: 
                 with HSplit().set_content_align('c').set_item_align('c').set_sep(16):
                     # 封面
                     with Frame().set_padding(32):
-                        ImageBox(cover_img, size=(None, 300), shadow=True)
+                        ImageBox(
+                            missing_image_for_slot(300, 300) if cover_img is UNKNOWN_IMG else cover_img,
+                            size=(None, 300), shadow=True,
+                        )
 
                     # 信息
                     style1 = TextStyle(font=DEFAULT_HEAVY_FONT, size=30, color=(50, 50, 50))
