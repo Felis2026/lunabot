@@ -150,9 +150,8 @@ def _birthday_calculate(party, bonuses, threshold, target, suite, capture, prest
     cards = suite.get('userCards') if suite else None
     owned = {row['cardId'] for row in cards} if isinstance(cards, list) else None
     bonus = sum(row['rate'] for row in bonuses if top or row['cardId'] in owned) if bonuses and (top or owned is not None) else None
+    # 生日累计进度来自 MySekai，Suite 只提供持卡与库存。
     progress = _birthday_find(resources, 'userBirthdayParties', 'birthdayPartyId', party['id'])
-    if progress is None:
-        progress = _birthday_find(suite or {}, 'userBirthdayParties', 'birthdayPartyId', party['id'])
     planning = prestart or top
     count = 0 if planning else progress.get('obtainedMysekaiMaterialCount') if progress else None
     point = 0 if planning else progress.get('deliveryTotalPoint') if progress else None
@@ -176,7 +175,7 @@ async def _birthday_account(ctx: SekaiHandlerContext, uid: str | None):
     if not uid:
         return None, None, None, None
     qid = int(ctx.uid_arg[1:]) if (ctx.uid_arg or '').startswith('@') else ctx.user_id
-    fields = get_detailed_profile_card_filter('userMaterials', 'userMysekaiMaterials', 'userBirthdayParties')
+    fields = get_detailed_profile_card_filter('userMaterials', 'userMysekaiMaterials')
     (suite, _), (capture, _) = await asyncio.gather(
         get_detailed_profile(ctx, qid, filter=fields, strict=False, mode=ctx.data_mode_arg, require_verified_public=True),
         get_mysekai_info(ctx, qid, mode=ctx.data_mode_arg),
