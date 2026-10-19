@@ -81,6 +81,83 @@ def _matching_birthday_party(party: dict, candidates: list) -> dict | None:
     return matches[0] if party.get('assetbundleName') and len(matches) == 1 else None
 
 
+# ================================ 国服本轮规则参考 ================================ #
+
+def _birthday_cycles(parties: list, character_ids: dict) -> list[list[dict]]:
+    """按角色生日顺序分轮，只有前轮二十六角色齐全时才允许进入下一轮。"""
+    cycles, current, seen = [], [], set()
+    expected = set(range(1, 27))
+    for party in sorted(parties, key=lambda row: (row['birthdayStartAt'], row['id'])):
+        cid = character_ids.get(party['gameCharacterUnitId'])
+        if cid not in expected:
+            return []
+        if cid in seen:
+            # 历史缺项时，不能把下一轮的同角色记录拼进当前轮。
+            if seen != expected:
+                return []
+            cycles.append(current)
+            current, seen = [], set()
+        current.append(party)
+        seen.add(cid)
+    if current:
+        cycles.append(current)
+    return cycles
+
+
+# ================================ 同批次活动时间推算 ================================ #
+
+def _birthday_reference_schedule(party: dict, anchors: list) -> dict | None:
+    """从已公布活动校验日历年差与本地时刻，返回预计国服时间，冲突时保留未知。"""
+    local_zone = timezone(timedelta(hours=REGION_UTC_OFFSET['cn']))
+    peer_zone = timezone(timedelta(hours=REGION_UTC_OFFSET['jp']))
+    shifts = {datetime.fromtimestamp(local['birthdayStartAt'] / 1000, local_zone).year
+              - datetime.fromtimestamp(peer['birthdayStartAt'] / 1000, peer_zone).year for local, peer in anchors}
+    if len(shifts) != 1:
+        return None
+    shift = shifts.pop()
+    def project(stamp):
+        """将日服时间转换为已验证年差下的国服本地时间。"""
+        value = datetime.fromtimestamp(stamp / 1000, peer_zone)
+        # 保留区服本地日历与时刻，不能把时区差或闰年当作固定秒数平移。
+        return int(value.replace(year=value.year + shift, tzinfo=local_zone).timestamp() * 1000)
+    keys = ('startAt', 'birthdayStartAt', 'closedAt')
+    try:
+        if any(project(peer[key]) != local[key] for local, peer in anchors for key in keys):
+            return None
+        return {key: project(party[key]) for key in keys}
+    except ValueError:
+        # 闰日跨到非闰年时没有唯一日历日期，不擅自调整到二月末。
+        return None
+
+
+async def _birthday_reference_party(ctx, parties, character_ids, cid, now):
+    """定位国服本轮对应的日服活动，返回规则区服、活动和可推算的国服排期。"""
+    if ctx.region != 'cn':
+        return None
+    local_cycles = _birthday_cycles(parties, character_ids)
+    if not local_cycles:
+        return None
+    started = [rows for rows in local_cycles if min(row['startAt'] for row in rows) <= now]
+    current = started[-1] if started else local_cycles[0]
+    if any(character_ids[row['gameCharacterUnitId']] == cid for row in current):
+        return None
+    peer = SekaiHandlerContext.from_region('jp')
+    peer_parties = await _birthday_table(peer, 'birthdayParties') or []
+    peer_ids = {row['id']: row['gameCharacterId'] for row in await peer.md.game_character_units.get()}
+    peer_cycles = _birthday_cycles(peer_parties, peer_ids)
+    matched = [(row, _matching_birthday_party(row, peer_parties)) for row in current]
+    matched = [(local, peer) for local, peer in matched if peer is not None]
+    if not matched:
+        return None
+    anchors = {peer['id'] for _, peer in matched}
+    candidates = [rows for rows in peer_cycles if anchors.issubset({row['id'] for row in rows})
+                  and {peer_ids[row['gameCharacterUnitId']] for row in rows} == set(range(1, 27))]
+    if len(candidates) != 1:
+        return None
+    target = [row for row in candidates[0] if peer_ids[row['gameCharacterUnitId']] == cid]
+    return (peer, target[0], _birthday_reference_schedule(target[0], matched)) if len(target) == 1 else None
+
+
 # ================================ 奖励数据与同批次预览 ================================ #
 
 def _birthday_reward_bundle(rows, boxes, party_id: int):
@@ -213,6 +290,32 @@ async def _birthday_account(ctx: SekaiHandlerContext, uid: str | None):
     return suite, capture, basic, avatar
 
 
+# ================================ 账号与活动规则并行准备 ================================ #
+
+async def _birthday_rules(ctx: SekaiHandlerContext, party: dict):
+    """按原顺序读取奖励与积分规则，返回奖励、卡牌加成和花朵门槛表。"""
+    rewards = await _birthday_rewards(ctx, party)
+    bonus_rows, delivery_rows = await asyncio.gather(
+        _birthday_table(ctx, 'birthdayPartyDeliveryPointBonuses'),
+        _birthday_table(ctx, 'birthdayPartyDeliveryRewards'),
+    )
+    return rewards, bonus_rows, delivery_rows
+
+
+async def _birthday_prepare(ctx: SekaiHandlerContext, uid: str | None, party: dict, rules_ctx=None):
+    """并行准备账号和规则；失败或取消时回收两条分支，保留原始异常。"""
+    tasks = [asyncio.create_task(_birthday_account(ctx, uid)), asyncio.create_task(_birthday_rules(rules_ctx or ctx, party))]
+    try:
+        account, rules = await asyncio.gather(*tasks)
+        return (*account, *rules)
+    except BaseException:
+        # gather 的单个分支失败不会自动取消另一分支，须显式回收剩余任务。
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 # ================================ 资源读取与请求内复用 ================================ #
 
 class _BirthdayRipView:
@@ -242,7 +345,7 @@ async def _birthday_icon(data, ctx, path):
 
 async def _birthday_honor(data, item):
     """按资源箱指定的称号等级合成；本服缺元数据时补查同 ID，完全缺失返回空图。"""
-    ctx = data['ctx']
+    ctx = data['rewards']['ctx'] if data.get('reference') else data['ctx']
     key = ('honor', ctx.region, item['resourceId'], item['resourceLevel'])
     if key in data['images']:
         return data['images'][key]
@@ -360,26 +463,36 @@ def _draw_birthday_schedule(label, start, end, now, color):
 
 async def _draw_birthday_header(data):
     ctx, party, cid = data['ctx'], data['party'], data['cid']
-    with VSplit().set_w(512).set_padding(12).set_sep(8).set_bg(roundrect_bg()).set_item_align('c'):
-        with HSplit().set_sep(12).set_item_align('c'):
+    with VSplit().set_w(512).set_padding(12).set_sep(8).set_bg(roundrect_bg()).set_content_and_item_align('c'):
+        with HSplit().set_w(488).set_sep(12).set_item_align('c').set_content_align('c'):
             # 与“/生日”一致使用角色基础SD，活动关联单元不改变生日资料栏的形象。
             ImageBox(await get_character_sd_image(cid), size=(None, 46), shadow=True)
             label = await _birthday_icon(data, SekaiHandlerContext.from_region('jp'), f'character/label_horizontal/chr_h_lb_{cid}.png')
             ImageBox(label, size=(None, 32))
             month, day = get_character_birthday(cid)
             TextBox(f'{month}月{day}日', _birthday_style(24, True))
-        if party:
-            year = datetime.fromtimestamp(party['birthdayStartAt'] / 1000).year
+        reference = data.get('reference', False)
+        schedule = data.get('reference_schedule') if reference else party
+        if schedule:
+            year = datetime.fromtimestamp(schedule['birthdayStartAt'] / 1000).year
             now = data['now']
             mode = '进行中'
-            if now < party['startAt']:
-                seconds = (party['startAt'] - now) / 1000
+            if now < schedule['startAt']:
+                seconds = (schedule['startAt'] - now) / 1000
                 mode = f'距开始还有{int(seconds // 86400)}天' if seconds >= 86400 else f'距开始还有{max(1, math.ceil(seconds / 3600))}小时'
-            with HSplit().set_sep(14).set_item_align('c'):
-                TextBox(f'{year} 年生日浇水', _birthday_style(21, True))
+            elif now > schedule['closedAt']:
+                mode = '预计已结束' if reference else '已结束'
+            with HSplit().set_w(488).set_sep(14).set_item_align('c').set_content_align('c'):
+                TextBox(f"{year} 年生日浇水{'预览' if reference else ''}", _birthday_style(21, True))
                 TextBox(mode, _birthday_style(16))
-            _draw_birthday_schedule('露滴掉落', party['startAt'], party['birthdayStartAt'], now, data['color'])
-            _draw_birthday_schedule('浇水开放', party['startAt'], party['closedAt'] + 1000, now, data['color'])
+            _draw_birthday_schedule('露滴掉落', schedule['startAt'], schedule['birthdayStartAt'], now, data['color'])
+            _draw_birthday_schedule('浇水开放', schedule['startAt'], schedule['closedAt'] + 1000, now, data['color'])
+            if reference:
+                TextBox('*时间为推算，规则参考日服', _birthday_style(16, color=RED))
+        elif reference:
+            TextBox('国服本轮生日浇水预览', _birthday_style(21, True))
+            TextBox('*活动时间暂无法推算', _birthday_style(16, color=RED))
+            TextBox('*按日服对应轮次规则预览', _birthday_style(16, color=RED))
         else:
             TextBox(f'{get_region_name(ctx.region)}生日浇水', _birthday_style(21, True))
 
@@ -461,6 +574,8 @@ def _draw_birthday_requirement(data, dew):
                 note = '*本期浇水积分规则暂未公布，暂无法计算露滴需求'
         elif state['upper_bound']:
             note = '*未获取到生日卡持有数据，按无加成估算最多需求'
+        elif data.get('reference'):
+            note = '*按日服对应轮次规则，以满配从零估算露滴需求' if state['top'] else '*按日服对应轮次规则，按当前持卡从零计算露滴需求'
         elif data['prestart']:
             note = '*活动尚未开始，按满配从零估算露滴需求' if state['top'] else '*活动尚未开始，按当前持卡从零计算露滴需求'
         if note:
@@ -662,33 +777,40 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
     units = {row['id']: row for row in await ctx.md.game_character_units.get()}
     party = _select_birthday_party(parties, cid, now, {key: row['gameCharacterId'] for key, row in units.items()})
     cid = units[party['gameCharacterUnitId']]['gameCharacterId'] if party else cid or min(range(1, 27), key=lambda value: get_character_next_birthday_dt(ctx.region, value))
+    rules_ctx, reference, reference_schedule = ctx, False, None
+    if party is None:
+        matched = await _birthday_reference_party(ctx, parties, {key: row['gameCharacterId'] for key, row in units.items()}, cid, now)
+        if matched is not None:
+            rules_ctx, party, reference_schedule = matched
+            reference = True
     cards = [row for row in await ctx.md.cards.get() if row['characterId'] == cid and row['cardRarityType'] == 'rarity_birthday']
     assert_and_reply(cards, '暂无该角色的生日卡数据')
     background = await get_card_image(ctx, random.choice(cards), False)
-    unit = units[party['gameCharacterUnitId']] if party else units[cid]
+    unit = units[party['gameCharacterUnitId']] if party and not reference else next(row for row in units.values() if row['gameCharacterId'] == cid)
     data = dict(ctx=ctx, uid=uid, cid=cid, party=party, now=now, color=color_code_to_rgb(unit['colorCode']),
-                suite=None, capture=None, basic=None, avatar=None, images={}, resources={}, metadata={})
+                suite=None, capture=None, basic=None, avatar=None, images={}, resources={}, metadata={},
+                reference=reference, reference_schedule=reference_schedule)
     if party:
-        suite, capture, basic, avatar = await _birthday_account(ctx, uid)
-        rewards = await _birthday_rewards(ctx, party)
-        bonus_rows, delivery_rows = await asyncio.gather(
-            _birthday_table(ctx, 'birthdayPartyDeliveryPointBonuses'),
-            _birthday_table(ctx, 'birthdayPartyDeliveryRewards'),
-        )
+        suite, capture, basic, avatar, rewards, bonus_rows, delivery_rows = await _birthday_prepare(ctx, uid, party, rules_ctx)
+        if reference:
+            rewards = {**rewards, 'preview': True, 'peer': rules_ctx}
         bonuses = [row for row in bonus_rows or [] if row['birthdayPartyId'] == party['id']]
         thresholds = {row['requirement'] for row in delivery_rows or [] if row['birthdayPartyId'] == party['id']}
         threshold = next(iter(thresholds)) if len(thresholds) == 1 and next(iter(thresholds)) > 0 else None
         maximum = max((row['requirement'] for row in rewards['rows']), default=None)
         assert_and_reply(target is None or maximum is None or target <= maximum, f'本期最高奖励目标为 {maximum} 朵')
         target = target if target is not None else maximum
-        prestart = now < party['startAt']
-        state = _birthday_calculate(party, bonuses, threshold, target, suite, capture, prestart, not suite and not capture)
+        prestart = reference or now < party['startAt']
+        # 日服活动ID仅用于取规则，不能拿它查国服抓包中的同号进度。
+        state = _birthday_calculate(party, bonuses, threshold, target, suite, None if reference else capture, prestart, not suite and not capture)
         data.update(suite=suite, capture=capture, basic=basic, avatar=avatar, rewards=rewards, state=state, prestart=prestart)
-        material = next((row for row in await _birthday_table(ctx, 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
-        if material is None and ctx.region == 'cn':
+        # 整期参考使用日服规则素材，避免逐次请求尚未实装的国服资源。
+        material_ctx = rules_ctx if reference else ctx
+        material = next((row for row in await _birthday_table(material_ctx, 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
+        if material is None and ctx.region == 'cn' and not reference:
             material = next((row for row in await _birthday_table(SekaiHandlerContext.from_region('jp'), 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
-        data['flower'] = await _birthday_icon(data, ctx, f"mysekai/thumbnail/material/{material['iconAssetbundleName']}.png") if material else UNKNOWN_IMG
-        dew = await _birthday_icon(data, ctx, f"thumbnail/material_rip/material{party['deliveryItemMaterialId']}.png")
+        data['flower'] = await _birthday_icon(data, material_ctx, f"mysekai/thumbnail/material/{material['iconAssetbundleName']}.png") if material else UNKNOWN_IMG
+        dew = await _birthday_icon(data, material_ctx, f"thumbnail/material_rip/material{party['deliveryItemMaterialId']}.png")
     with Canvas(bg=ImageBg(background)).set_padding(20) as canvas:
         with VSplit().set_w(1072).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_item_align('l'):
             with HSplit().set_sep(16).set_item_align('lt'):
