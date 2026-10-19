@@ -44,6 +44,8 @@ class SekaiHandlerContext(HandlerContext):
     # 键为 (region, str(qid))，值为 (缓存失效代次, state)，state=None 表示读取失败。
     # 异步入口准备后供绘图阶段复用，跨服状态通过键中的 region 区分。
     account_states: dict = field(default_factory=dict)
+    # 背景上传和调整会重复检查归属，本次指令复用同一 QQ、区服及 UID 的 OAuth 成功结果。
+    customization_oauth_accounts: set[tuple[str, str, str]] = field(default_factory=set)
 
     @classmethod
     def from_region(cls, region: str) -> 'SekaiHandlerContext':

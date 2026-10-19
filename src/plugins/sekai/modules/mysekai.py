@@ -311,7 +311,7 @@ async def get_mysekai_info_card(ctx: SekaiHandlerContext, mysekai_info: dict, ba
                 avatar_info = avatar_info or await get_player_avatar_info_by_basic_profile(ctx, basic_profile)
 
                 frames = get_player_frames(ctx, basic_profile['user']['userId'], None)
-                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
+                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames, uid=basic_profile['user']['userId'])
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = basic_profile['user']
@@ -355,7 +355,7 @@ async def get_mysekai_and_detail_profile_card(ctx: SekaiHandlerContext, mysekai_
                 avatar_info = avatar_info or await get_player_avatar_info_by_detailed_profile(ctx, profile)
 
                 frames = get_player_frames(ctx, profile['userGamedata']['userId'], profile)
-                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
+                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames, uid=profile['userGamedata']['userId'])
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = profile['userGamedata']

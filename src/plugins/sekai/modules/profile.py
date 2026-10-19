@@ -12,6 +12,10 @@ from ..oauth import (
     clear_oauth_runtime_cache,
     get_oauth_game_data,
 )
+from .avatar_frames import (
+    CustomAvatarFrame, load_custom_avatar_catalog, resolve_custom_avatar_frame,
+    split_custom_avatar_args, custom_avatar_selection_key, render_custom_avatar, render_custom_avatar_border,
+)
 from .honor import compose_full_honor_image
 from .resbox import get_res_box_info, get_res_icon
 from ...utils.safety import *
@@ -22,6 +26,8 @@ SEKAI_PROFILE_DIR = f"{SEKAI_DATA_DIR}/profile"
 profile_db = get_file_db(f"{SEKAI_PROFILE_DIR}/db.json", logger)
 bind_history_db = get_file_db(f"{SEKAI_PROFILE_DIR}/bind_history.json", logger)
 player_frame_db = get_file_db(f"{SEKAI_PROFILE_DIR}/player_frame.json", logger)
+custom_avatar_frame_db = get_file_db(f"{SEKAI_PROFILE_DIR}/custom_avatar_frames.json", logger)
+CUSTOM_AVATAR_FRAME_DIR = f"{SEKAI_ASSET_DIR}/static_images/custom_player_frames"
 
 DAILY_BIND_LIMITS = config.item('bind.daily_limits')
 TOTAL_BIND_LIMITS = config.item('bind.total_limits')
@@ -1203,7 +1209,7 @@ async def verify_user_game_account(ctx: SekaiHandlerContext, triggered_by_not_ve
             err_msg = f"开始验证时绑定的帐号与当前绑定帐号不一致\n"
 
     if triggered_by_not_verified:
-        err_msg = f"该功能需要验证你的游戏账号\n"
+        err_msg = "该功能需要先授权或验证当前游戏账号。\n授权：私聊 Bot 发送 /授权；也可按下方步骤验证。\n"
 
     if err_msg:
         _region_qid_verify_codes[ctx.region].pop(qid, None)
@@ -1254,21 +1260,34 @@ async def get_user_verified_uids(ctx: SekaiHandlerContext) -> List[str]:
     return profile_db.get_copy(f"verify_accounts_{ctx.region}", {}).get(str(ctx.user_id), [])
 
 async def get_uid_and_check_verified(ctx: SekaiHandlerContext, force: bool = False) -> str:
-    """选择游戏 UID 并要求账号验证，force=True 时跳过验证检查。
+    """选择游戏 UID，允许已验证或 OAuth 可访问的账号，force=True 时跳过检查。
 
-    尚未验证时发起验证码流程，并通过 ReplyException 返回引导。
+    OAuth 按当前 QQ、区服及 UID 判断，仅在本次指令内复用成功结果。
+    两种方式均未通过时发起验证码流程，通过 ReplyException 返回授权及验证引导。
     """
     uid = await get_player_bind_id(ctx)
-    if not force:
-        verified_uids = await get_user_verified_uids(ctx)
-        if uid not in verified_uids:
-            await verify_user_game_account(ctx, triggered_by_not_verified=True)
-            # 正常情况下不会往下走
-            assert_and_reply(uid in verified_uids, f"""
-该功能需要验证你的游戏帐号
-请使用"/{ctx.region}pjsk验证"进行验证，使用"/{ctx.region}pjsk验证列表"查看你验证过的游戏ID
-""".strip())
-    return uid
+    if force:
+        return uid
+    if str(uid) in {str(item) for item in await get_user_verified_uids(ctx)}:
+        return uid
+
+    state = await _get_cloud_state(ctx, ctx.user_id)
+    account = (ctx.region, str(ctx.user_id), str(uid))
+    if state and state.get('oauth_authorized') and str(uid) in {str(item) for item in state.get('bindings', [])}:
+        if account in ctx.customization_oauth_accounts:
+            return uid
+        # QQ 的授权标记不能证明任意绑定 UID 的归属，由 OAuth 接口确认当前账号的访问权限。
+        profile = await get_oauth_game_data(str(ctx.user_id), ctx.region, 'suite', str(uid), filter=['userGamedata'])
+        if _get_nested_uid_from_suite_profile(profile) == str(uid):
+            ctx.customization_oauth_accounts.add(account)
+            return uid
+
+    await verify_user_game_account(ctx, triggered_by_not_verified=True)
+    raise ReplyException(
+        '该功能需要先授权或验证当前游戏账号。\n'
+        '授权：私聊 Bot 发送 /授权\n'
+        f'验证：发送 /{ctx.region}pjsk验证'
+    )
 
 
 async def check_uid_in_blacklist(uid: str, region: str | None = None) -> bool:
@@ -1343,7 +1362,7 @@ async def get_basic_profile_card(ctx: SekaiHandlerContext, profile: dict) -> Fra
             avatar_info = await get_player_avatar_info_by_basic_profile(ctx, profile)
 
             frames = get_player_frames(ctx, profile['user']['userId'], None)
-            await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
+            await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames, uid=profile['user']['userId'])
 
             with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                 game_data = profile['user']
@@ -1726,7 +1745,7 @@ async def get_detailed_profile_card(ctx: SekaiHandlerContext, profile: dict, err
                 avatar_info = avatar_info or await get_player_avatar_info_by_detailed_profile(ctx, profile)
 
                 frames = get_player_frames(ctx, profile['userGamedata']['userId'], profile)
-                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames)
+                await get_avatar_widget_with_frame(ctx, avatar_info.img, 80, frames, uid=profile['userGamedata']['userId'])
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(5):
                     game_data = profile['userGamedata']
@@ -1814,7 +1833,7 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
             # 名片
             with HSplit().set_content_align('c').set_item_align('c').set_sep(32).set_padding((32, 0)):
                 frames = get_player_frames(ctx, uid, detail_profile)
-                await get_avatar_widget_with_frame(ctx, avatar_info.img, 128, frames)
+                await get_avatar_widget_with_frame(ctx, avatar_info.img, 128, frames, uid=uid)
 
                 with VSplit().set_content_align('c').set_item_align('l').set_sep(16):
                     game_data = basic_profile['user']
@@ -2128,8 +2147,94 @@ async def get_player_frame_image(ctx: SekaiHandlerContext, frame_id: int, frame_
         logger.print_exc(f"获取playerFrame {frame_id} 失败")
         return None
     
-# 获取带框头像控件
-async def get_avatar_widget_with_frame(ctx: SekaiHandlerContext, avatar_img: Image.Image, avatar_w: int, frame_data: list[dict]) -> Frame:
+# ================================ 自定义头像框 ================================ #
+
+def get_custom_avatar_catalog() -> list[CustomAvatarFrame]:
+    """读取可选的预置框，目录不可读时保留游戏头像框显示。"""
+    try:
+        return load_custom_avatar_catalog(CUSTOM_AVATAR_FRAME_DIR)
+    except Exception as e:
+        logger.warning(f"读取自定义头像框目录失败: {get_exc_desc(e)}")
+        return []
+
+
+def get_selected_custom_avatar_frame(region: str, uid: str | int) -> CustomAvatarFrame | None:
+    """查询被展示游戏账号的框，未选择或对应框下架时返回None。"""
+    ident = custom_avatar_frame_db.get('selected', {}).get(custom_avatar_selection_key(region, uid))
+    if ident is None:
+        return None
+    return next((frame for frame in get_custom_avatar_catalog() if frame.id == ident), None)
+
+
+def save_custom_avatar_selection(region: str, uid: str | int, frame: CustomAvatarFrame | None):
+    """保存或清除一个账号的选择，不改动游戏头像框数据。"""
+    # 读、改、写之间没有await，避免同一事件循环中的不同账号设置互相覆盖。
+    selected = dict(custom_avatar_frame_db.get('selected', {}))
+    key = custom_avatar_selection_key(region, uid)
+    if frame is None:
+        selected.pop(key, None)
+    else:
+        selected[key] = frame.id
+    custom_avatar_frame_db.set('selected', selected)
+
+
+async def compose_custom_avatar_frame_list(ctx: SekaiHandlerContext, uid: str | int | None = None) -> Image.Image:
+    """沿用PJSK表情的紧凑网格展示透明框，uid仅用于标记已选编号。"""
+    frames = get_custom_avatar_catalog()
+    assert_and_reply(frames, "当前还没有可选头像框")
+    selected = get_selected_custom_avatar_frame(ctx.region, uid) if uid is not None else None
+    previews = []
+    for frame in frames:
+        try:
+            image = await run_in_pool(render_custom_avatar_border, frame, 100)
+            if selected and selected.id == frame.id:
+                # 已选框还需能通过实际套框链路，蒙版损坏时不标为正在使用。
+                # 校验使用透明占位图，不查询游戏个人信息或读取玩家头像。
+                await run_in_pool(render_custom_avatar, Image.new('RGBA', (1, 1)), frame, 80)
+            previews.append((frame, image))
+        except Exception as e:
+            logger.warning(f"读取头像框 {frame.id} 失败: {get_exc_desc(e)}")
+            previews.append((frame, None))
+    with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
+        with VSplit().set_sep(8).set_item_align('l').set_bg(roundrect_bg()).set_padding(8):
+            TextBox(
+                "选择头像框：/设置头像框 编号\n"
+                "恢复游戏内头像框：/清除头像框\n"
+                "绿色编号表示正在使用的头像框",
+                TextStyle(font=DEFAULT_FONT, size=20, color=BLACK), use_real_line_count=True,
+            ).set_padding(16).set_bg(roundrect_bg())
+            with Grid(col_count=min(5, len(previews))).set_sep(4, 4).set_item_bg(roundrect_bg()):
+                for frame, image in previews:
+                    with VSplit().set_padding(4).set_sep(4).set_item_align('c').set_content_align('c'):
+                        if image:
+                            ImageBox(image, size=(None, 100), use_alphablend=True, shadow=True)
+                        else:
+                            TextBox('素材暂不可用', TextStyle(font=DEFAULT_FONT, size=16, color=(100, 100, 100, 255))).set_size((100, 100))
+                        color = (0, 150, 0, 255) if image is not None and selected and selected.id == frame.id else (200, 0, 0, 255)
+                        TextBox(f"{frame.id:03d}", TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=color))
+                        TextBox(frame.name, TextStyle(font=DEFAULT_FONT, size=14, color=BLACK), line_count=2).set_w(160).set_wrap(True).set_content_align('c')
+    add_watermark(canvas)
+    return await canvas.get_img()
+
+
+async def get_avatar_widget_with_frame(
+    ctx: SekaiHandlerContext, avatar_img: Image.Image, avatar_w: int, frame_data: list[dict],
+    *, uid: str | int,
+) -> Frame:
+    """按被展示账号选择头像框，成功使用自定义框时跳过游戏框和节日框。
+
+    uid必须为图片中被展示账号的游戏UID。
+    """
+    custom_frame = get_selected_custom_avatar_frame(ctx.region, uid)
+    if custom_frame:
+        try:
+            image = await run_in_pool(render_custom_avatar, avatar_img, custom_frame, avatar_w)
+            # 框图外沿和阴影参与尺寸计算，紧凑资料卡会为吉祥物自动留白。
+            with Frame().set_content_align('c').set_padding(6) as ret:
+                ImageBox(image, use_alphablend=True, shadow=True)
+            return ret
+        except Exception as e:
+            logger.warning(f"绘制自定义头像框 {custom_frame.id} 失败，回退游戏框: {get_exc_desc(e)}")
     frame_img = None
     try:
         if frame := find_by(frame_data, 'playerFrameAttachStatus', "first"):
@@ -3876,4 +3981,55 @@ async def _(ctx: SekaiHandlerContext):
         data['inherit_id'],
         data['inherit_pw'],
     ])
+
+
+
+# ================================ 头像框指令 ================================ #
+
+def prepare_custom_avatar_command(ctx: SekaiHandlerContext) -> str:
+    """提取末尾的账号参数，不把素材全名内部的数字当作游戏ID。"""
+    args, account_arg = split_custom_avatar_args(ctx.get_args())
+    ctx.uid_arg = account_arg
+    return args
+
+
+custom_avatar_list = SekaiCmdHandler(['/头像框列表', '/头像框预览', '/pjsk frame list', '/pjsk frame preview'], parse_uid_arg=False, parse_data_mode_arg=False)
+custom_avatar_list.check_cdrate(cd).check_wblist(gbl)
+@custom_avatar_list.handle()
+async def _(ctx: SekaiHandlerContext):
+    args = prepare_custom_avatar_command(ctx)
+    assert_and_reply(not args, '用法：/头像框列表 [u2]，也可使用 /头像框预览')
+    uid = await get_player_bind_id(ctx, check_bind=False)
+    return await ctx.asend_reply_msg(await get_image_cq(await compose_custom_avatar_frame_list(ctx, uid=uid)))
+
+
+custom_avatar_set = SekaiCmdHandler(['/设置头像框', '/pjsk frame set'], parse_uid_arg=False, parse_data_mode_arg=False)
+custom_avatar_set.check_cdrate(cd).check_wblist(gbl)
+@custom_avatar_set.handle()
+async def _(ctx: SekaiHandlerContext):
+    args = prepare_custom_avatar_command(ctx)
+    assert_and_reply(args, '用法：/设置头像框 编号或素材全名 [u2]')
+    try:
+        frame = resolve_custom_avatar_frame(get_custom_avatar_catalog(), args)
+    except ValueError as e:
+        raise ReplyException(str(e)) from e
+    uid = await get_uid_and_check_verified(ctx, force=check_superuser(ctx.event))
+    # 素材能正常解码后才保存选择，缺失或损坏时保留之前的设置。
+    try:
+        await run_in_pool(render_custom_avatar, Image.new('RGBA', (80, 80)), frame, 80)
+    except Exception as e:
+        raise ReplyException('该头像框素材暂不可用，请选择其他编号') from e
+    save_custom_avatar_selection(ctx.region, uid, frame)
+    return await ctx.asend_reply_msg(f"已为{get_region_name(ctx.region)}账号 {process_hide_uid(ctx, uid, keep=6)}设置头像框 {frame.id:03d}：{frame.name}")
+
+
+custom_avatar_clear = SekaiCmdHandler(['/清除头像框', '/pjsk frame clear'], parse_uid_arg=False, parse_data_mode_arg=False)
+custom_avatar_clear.check_cdrate(cd).check_wblist(gbl)
+@custom_avatar_clear.handle()
+async def _(ctx: SekaiHandlerContext):
+    args = prepare_custom_avatar_command(ctx)
+    assert_and_reply(not args, '用法：/清除头像框 [u2]')
+    uid = await get_uid_and_check_verified(ctx, force=check_superuser(ctx.event))
+    save_custom_avatar_selection(ctx.region, uid, None)
+    return await ctx.asend_reply_msg(f"已清除{get_region_name(ctx.region)}账号 {process_hide_uid(ctx, uid, keep=6)}的自定义头像框，恢复游戏头像框")
 
