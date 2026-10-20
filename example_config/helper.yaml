@@ -4,3 +4,10 @@ template: |
   例如发送 /help sekai 查看世界计划服务的帮助
   可查询的服务列表:
   {service_list}
+
+  说明：
+  ✅ = 本群已开，❌ = 本群未开
+  🛠️ = 群管理员以上可控制开关，🔒 = 仅 superuser 可控制
+  服务开关：/<服务名> on 开启，/<服务名> off 关闭
+  查看状态：/<服务名> status
+  例如 /sekai on 开启PJSK服务
