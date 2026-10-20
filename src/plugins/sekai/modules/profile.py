@@ -1176,7 +1176,15 @@ async def swap_player_bind_id(ctx: SekaiHandlerContext, qid: str, index1: int, i
 """.strip()
 
 
-async def verify_user_game_account(ctx: SekaiHandlerContext, triggered_by_not_verified: bool = False):
+def get_account_access_guide(ctx: SekaiHandlerContext) -> str:
+    """返回当前区服的账号验证与授权引导。"""
+    return (
+        '该功能需要验证游戏账号或完成授权\n'
+        f'发送 /{ctx.region}pjsk验证，或私聊发送 /授权'
+    )
+
+
+async def verify_user_game_account(ctx: SekaiHandlerContext):
     """通过名片验证码验证当前游戏账号，使用 ReplyException 返回验证引导或结果。"""
     verified_uids = await get_user_verified_uids(ctx)
     uid = await get_player_bind_id(ctx)
@@ -1207,9 +1215,6 @@ async def verify_user_game_account(ctx: SekaiHandlerContext, triggered_by_not_ve
             err_msg = f"你的上次验证已过期\n"
         if info.uid != uid:
             err_msg = f"开始验证时绑定的帐号与当前绑定帐号不一致\n"
-
-    if triggered_by_not_verified:
-        err_msg = "该功能需要先授权或验证当前游戏账号。\n授权：私聊 Bot 发送 /授权；也可按下方步骤验证。\n"
 
     if err_msg:
         _region_qid_verify_codes[ctx.region].pop(qid, None)
@@ -1263,7 +1268,7 @@ async def get_uid_and_check_verified(ctx: SekaiHandlerContext, force: bool = Fal
     """选择游戏 UID，允许已验证或 OAuth 可访问的账号，force=True 时跳过检查。
 
     OAuth 按当前 QQ、区服及 UID 判断，仅在本次指令内复用成功结果。
-    两种方式均未通过时发起验证码流程，通过 ReplyException 返回授权及验证引导。
+    两种方式均未通过时抛出 ReplyException，提示用户选择验证或授权。
     """
     uid = await get_player_bind_id(ctx)
     if force:
@@ -1282,12 +1287,7 @@ async def get_uid_and_check_verified(ctx: SekaiHandlerContext, force: bool = Fal
             ctx.customization_oauth_accounts.add(account)
             return uid
 
-    await verify_user_game_account(ctx, triggered_by_not_verified=True)
-    raise ReplyException(
-        '该功能需要先授权或验证当前游戏账号。\n'
-        '授权：私聊 Bot 发送 /授权\n'
-        f'验证：发送 /{ctx.region}pjsk验证'
-    )
+    raise ReplyException(get_account_access_guide(ctx))
 
 
 async def check_uid_in_blacklist(uid: str, region: str | None = None) -> bool:
@@ -1597,10 +1597,7 @@ async def get_detailed_profile(
 
         # OAuth 未取得结果时按访问资格回退，分别适配公开接口和旧后端的参数契约。
         if profile is None:
-            assert_and_reply(public_access_verified,
-                             '查询背包需要先授权或验证当前游戏账号。\n'
-                             '授权：私聊 Bot 发送 /授权\n'
-                             f'验证：发送 /{ctx.region}pjsk验证')
+            assert_and_reply(public_access_verified, get_account_access_guide(ctx))
             req_url = url.format(uid=uid)
             try:
                 if use_suite_api_public:
@@ -3365,11 +3362,11 @@ OAUTH_AUTHORIZE_GROUP_GUIDE = (
 
 async def reply_oauth_authorize_link(ctx: SekaiHandlerContext, url: str, force: bool = False):
     """私聊直接发送授权链接；群内只有明确指定 force 才允许发送。"""
-    if ctx.group_id and not force:
+    if is_group_msg(ctx.event) and not force:
         return await ctx.asend_reply_msg(OAUTH_AUTHORIZE_GROUP_GUIDE)
 
     message = f"请复制到浏览器中打开以下链接完成 Haruki OAuth2 授权（链接 10 分钟内有效）：\n{url}"
-    if ctx.group_id:
+    if is_group_msg(ctx.event):
         message = "请勿转发授权链接。\n" + message
     return await ctx.asend_reply_msg(message)
 
@@ -3383,7 +3380,7 @@ async def _(ctx: SekaiHandlerContext):
     args = ctx.get_args().strip().lower()
     assert_and_reply(args in {'', 'force'}, "参数错误，请使用 /授权 或 /授权 force")
     force = args == 'force'
-    if ctx.group_id and not force:
+    if is_group_msg(ctx.event) and not force:
         # 普通群聊只给引导，不生成 pending state，也不清理账号缓存或请求 Cloud。
         return await ctx.asend_reply_msg(OAUTH_AUTHORIZE_GROUP_GUIDE)
 

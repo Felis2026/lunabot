@@ -210,7 +210,7 @@ async def _mp_handle_event(self, event: Event) -> None:
     if event.post_type == "message_sent":
         data = event.model_dump()
         data['post_type'] = 'message'
-        event = GroupMessageEvent(**data) if hasattr(event, 'group_id') else PrivateMessageEvent(**data)
+        event = GroupMessageEvent(**data) if is_group_msg(event) else PrivateMessageEvent(**data)
 
     if isinstance(event, MessageEvent):
         event.message.reduce()
@@ -779,10 +779,9 @@ async def get_image_urls_from_msg(
 # ============================ 聊天检查 ============================ #
         
 def is_group_msg(event: MessageEvent):
-    """
-    检查事件是否是群聊消息
-    """
-    return hasattr(event, 'group_id') and event.group_id is not None
+    """根据 OneBot 消息类型判断事件是否为群聊消息。"""
+    # 临时会话携带的 group_id 表示来源群，其消息类型仍为 private。
+    return getattr(event, 'message_type', None) == 'group'
 
 async def check_in_group(bot: Bot, group_id: int):
     """
@@ -1020,6 +1019,26 @@ async def send_reply_msg(handler, event: MessageEvent, message: str):
     """
     if check_group_disabled_by_event(event): return None
     return await handler.send(Message(f'[CQ:reply,id={event.message_id}]{message}'))
+
+
+@send_msg_func
+async def send_event_reply_msg(event: MessageEvent, message: str):
+    """通过接收消息的 Bot 回复原会话。
+
+    Bot 未连接、群聊停用或私聊用户在黑名单中时返回 None。
+    发送失败的异常由调用者处理。
+    """
+    bot = get_bot_by_self_id(event.self_id)
+    if bot is None:
+        utils_logger.warning(f'取消回复消息，没有可用的Bot {event.self_id}')
+        return None
+    if check_group_disabled_by_event(event):
+        return None
+    if not is_group_msg(event) and check_in_blacklist(event.user_id):
+        return None
+    # 临时会话直接回复接收事件的 Bot，主动私信方法的好友检查不适用于此处。
+    return await bot.send(event, Message(f'[CQ:reply,id={event.message_id}] {message}'))
+
 
 @send_msg_func
 async def send_at_msg(handler, event: MessageEvent, message: str):
@@ -1420,10 +1439,7 @@ class ColdDown:
                         rest_time = timedelta(seconds=interval - (now - last_use[key]))
                         verbose_msg = f'冷却中, 剩余时间: {get_readable_timedelta(rest_time)}'
                         if hasattr(event, 'message_id'):
-                            if hasattr(event, 'group_id'):
-                                await send_group_msg_by_bot(event.group_id, f'[CQ:reply,id={event.message_id}] {verbose_msg}')
-                            else:
-                                await send_private_msg_by_bot(event.user_id, f'[CQ:reply,id={event.message_id}] {verbose_msg}')
+                            await send_event_reply_msg(event, verbose_msg)
                 except Exception as e:
                     self.logger.print_exc(f'{self.cold_down_name}检查: {key} CD中, 发送冷却中消息失败')
             return False
@@ -1501,10 +1517,7 @@ class RateLimit:
                     reply_msg = reply_msg.format(period="天", limit=limit)
                 try:
                     if hasattr(event, 'message_id'):
-                        if hasattr(event, 'group_id'):
-                            await send_group_msg_by_bot(event.group_id, f'[CQ:reply,id={event.message_id}] {reply_msg}')
-                        else:
-                            await send_private_msg_by_bot(event.user_id, f'[CQ:reply,id={event.message_id}] {reply_msg}')
+                        await send_event_reply_msg(event, reply_msg)
                 except Exception as e:
                     self.logger.print_exc(f'{self.rate_limit_name}检查: {key} 频率超限, 发送频率超限消息失败')
             ok = False
