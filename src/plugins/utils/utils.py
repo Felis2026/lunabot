@@ -484,6 +484,30 @@ async def run_in_pool(func, *args, pool=None):
         pool = _default_pool_executor
     return await asyncio.get_event_loop().run_in_executor(pool, func, *args)
 
+
+async def run_in_pool_until_complete(func, *args):
+    """在线程池中执行函数，取消时等待后台结束再抛出取消异常。
+
+    调用者可在返回或抛出异常后清理文件、释放并发额度。
+    正常调用返回函数结果，并传播工作线程中的异常。
+    """
+    task = asyncio.get_running_loop().run_in_executor(_default_pool_executor, func, *args)
+    cancelled = False
+    # 工作线程无法随协程取消，文件和额度需要保留到线程实际结束。
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
+
+
 def run_in_pool_nowait(func, *args):
     return asyncio.get_event_loop().run_in_executor(_default_pool_executor, func, *args)
 

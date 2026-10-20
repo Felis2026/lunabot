@@ -18,6 +18,7 @@ from nonebot.adapters.onebot.v11.event import Sender, Reply
 from nonebot.adapters.onebot.v11.message import MessageSegment, Message
 import nonebot.adapters.onebot.v11.bot as bot_module
 from argparse import ArgumentParser
+from weakref import WeakValueDictionary
 import requests
 from .control_plane import register_group_toggle
 
@@ -391,6 +392,46 @@ async def download_avatar(bot: Bot, user_id: int, circle=False) -> Image.Image:
         img.putalpha(circle_img)
     return img
       
+_image_encoding_semaphore = asyncio.Semaphore(4)
+_image_encoding_locks = WeakValueDictionary()
+
+
+def _save_message_image(image, temporary_file, low_quality, quality, subsampling, optimize):
+    """解码并保存待发送图片，返回图片消息段。
+
+    temporary_file 为当前任务独有的临时文件对象，按输出格式更新其路径。
+    路径和字节输入在本函数中打开并关闭；PIL 输入由调用者持有。
+    """
+    owned_image = None
+    try:
+        if isinstance(image, bytes):
+            owned_image = Image.open(io.BytesIO(image))
+            image = owned_image
+        elif isinstance(image, str):
+            if not os.path.exists(image):
+                raise Exception(f'图片文件不存在: {image}')
+            owned_image = open_image(image)
+            image = owned_image
+
+        is_gif_img = is_animated(image) or image.mode == 'P'
+        ext = 'gif' if is_gif_img else ('jpg' if low_quality else 'png')
+        temporary_file.path = os.path.splitext(temporary_file.path)[0] + f'.{ext}'
+        if ext == 'gif':
+            save_transparent_gif(gif_to_frames(image), get_gif_duration(image), temporary_file.path)
+        elif ext == 'jpg':
+            with image.convert('RGB') as converted:
+                converted.save(
+                    temporary_file.path, format='JPEG', quality=quality,
+                    optimize=optimize, subsampling=subsampling, progressive=False,
+                )
+        else:
+            image.save(temporary_file.path)
+        return f'[CQ:image,file=file://{os.path.abspath(temporary_file.path)}]'
+    finally:
+        if owned_image is not None:
+            owned_image.close()
+
+
 async def get_image_cq(
     image: Union[str, Image.Image, bytes],
     allow_error: bool = False, 
@@ -401,8 +442,10 @@ async def get_image_cq(
     optimize: bool | ConfigItem = DEFAULT_LQ_IMAGE_OPTIMIZE_CFG,
     send_url_as_is: bool = False,
 ):
-    """
-    获取图片的cq码用于发送
+    """获取图片消息段，最多同时编码 4 张图片。
+
+    编码在线程池执行；取消时等待编码结束后登记临时文件清理。
+    同一 PIL 对象的编码串行执行，等待期间调用者应保持该对象可用且不修改它。
     """
     args = (allow_error, logger, low_quality, quality)
     try:
@@ -412,36 +455,37 @@ async def get_image_cq(
                 return f'[CQ:image,file={image}]'
             image = await download_image(image)
             return await get_image_cq(image, *args)
-        # 如果是bytes
-        if isinstance(image, bytes):
-            image = Image.open(io.BytesIO(image))
-            return await get_image_cq(image, *args)
         # 如果是本地路径
-        if isinstance(image, str):
+        if isinstance(image, str) and send_url_as_is:
             if not os.path.exists(image):
                 raise Exception(f'图片文件不存在: {image}')
-            if send_url_as_is:
-                return f'[CQ:image,file=file://{os.path.abspath(image)}]'
-            image = open_image(image)
-            return await get_image_cq(image, *args)
+            return f'[CQ:image,file=file://{os.path.abspath(image)}]'
 
-        is_gif_img = is_animated(image) or image.mode == 'P'
-        ext = 'gif' if is_gif_img else ('jpg' if low_quality else 'png')
-        with TempFilePath(ext, remove_after=timedelta(minutes=global_config.get('msg_send.tmp_img_keep_minutes'))) as tmp_path:
-            if ext == 'gif':
-                save_transparent_gif(gif_to_frames(image), get_gif_duration(image), tmp_path)
-            elif ext == 'jpg':
-                image = image.convert('RGB')
-                image.save(
-                    tmp_path, format='JPEG', 
-                    quality=get_cfg_or_value(quality), 
-                    optimize=get_cfg_or_value(optimize),
-                    subsampling=get_cfg_or_value(subsampling), 
-                    progressive=False
+        if isinstance(image, (str, bytes)):
+            # 路径和字节输入按原递归调用使用默认采样与优化参数。
+            subsampling = DEFAULT_LQ_IMAGE_SUBSAMPLING_CFG
+            optimize = DEFAULT_LQ_IMAGE_OPTIMIZE_CFG
+
+        async def encode():
+            async with _image_encoding_semaphore:
+                temporary_file = TempFilePath(
+                    'png', remove_after=timedelta(minutes=global_config.get('msg_send.tmp_img_keep_minutes')),
                 )
-            else:
-                image.save(tmp_path)
-            return f'[CQ:image,file=file://{os.path.abspath(tmp_path)}]'
+                with temporary_file:
+                    return await run_in_pool_until_complete(
+                        _save_message_image, image, temporary_file, low_quality,
+                        get_cfg_or_value(quality), get_cfg_or_value(subsampling), get_cfg_or_value(optimize),
+                    )
+
+        if isinstance(image, Image.Image):
+            # GIF 解帧和 Pillow 保存会操作图片状态，同一对象不能并发编码。
+            image_lock = _image_encoding_locks.get(id(image))
+            if image_lock is None:
+                image_lock = asyncio.Lock()
+                _image_encoding_locks[id(image)] = image_lock
+            async with image_lock:
+                return await encode()
+        return await encode()
 
     except Exception as e:
         if allow_error: 
