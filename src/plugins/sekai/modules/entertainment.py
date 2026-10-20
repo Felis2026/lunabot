@@ -911,15 +911,30 @@ async def send_guess_card_hint(gctx: GuessContext):
     gctx.used_hint_types.add(hint)
     await gctx.asend_msg(msg)
 
-# 随机裁剪音频+反转
-async def random_clip_audio(input_path: str, save_path: str, length: float, reverse: bool = False, clip_start=20.0, clip_end=10.0):
+_audio_clip_semaphore = asyncio.Semaphore(2)
+
+
+def _random_clip_audio_sync(input_path, save_path, length, reverse, clip_start, clip_end):
+    """解码、随机裁剪并导出 MP3，按 reverse 决定是否反转。"""
     audio = pydub.AudioSegment.from_file(input_path)
     length = int(length * 1000)
     start = random.randint(int(clip_start * 1000), len(audio) - length - int(clip_end * 1000))
     clip = audio[start:start + length]
     if reverse:
         clip = clip.reverse()
-    clip.export(save_path, format='mp3')
+    with clip.export(save_path, format='mp3'):
+        pass
+
+
+async def random_clip_audio(input_path: str, save_path: str, length: float, reverse: bool = False, clip_start=20.0, clip_end=10.0):
+    """在线程池中裁剪音频，最多同时处理 2 份。
+
+    取消时等待导出结束，再交由调用方清理输出文件。
+    """
+    async with _audio_clip_semaphore:
+        await run_in_pool_until_complete(
+            _random_clip_audio_sync, input_path, save_path, length, reverse, clip_start, clip_end,
+        )
 
 # 获取猜曲检查函数
 def get_guess_music_check_fn(guess_type: str):
