@@ -2212,7 +2212,10 @@ async def recommend_challenge_musics(
     ctx: SekaiHandlerContext,
     profile: dict | None,
 ) -> list[tuple[int, str]]:
-    """按FC记录选择首个达标档位，返回该档位中已开放的候选歌曲。"""
+    """按FC记录筛选已开放谱面，并按配置排除被高档候选替代的歌曲。
+
+    目标谱面已有FC或AP时直接准入；excluded_by 使用全部达标候选判断替代关系。
+    """
     if not config.get('deck.challenge_music_auto_recommend.enabled'):
         return []
     if not profile or not profile.get('userMusicResults'):
@@ -2235,24 +2238,32 @@ async def recommend_challenge_musics(
                 count[level] = count.get(level, 0) + 1
 
     candidates = []
-    selected_requirements = None
+    candidate_rules = []
     for rule in config.get('deck.challenge_music_auto_recommend.rules'):
-        requirements = rule['fc_requires']
-        if selected_requirements is not None and requirements != selected_requirements:
-            continue
         mid, diff = rule['music']
         if not await is_valid_music(ctx, mid, leak=False, diff=diff):
             continue
-        for req_key, req_count in requirements.items():
-            req_diff, req_level = req_key.split('_')
-            # 门槛表示该等级及以上的FC数，等级上限由当前谱面数据决定。
-            count = sum(value for level, value in fc_count.get(req_diff, {}).items() if level >= int(req_level))
-            if count < req_count:
+        requirement_options = rule.get('fc_requires_any', [rule.get('fc_requires', {})])
+        eligible = (mid, diff) in cleared_charts
+        for requirements in requirement_options:
+            if eligible:
                 break
-        else:
-            selected_requirements = requirements
-            if (mid, diff) not in candidates:
-                candidates.append((mid, diff))
+            for req_key, req_count in requirements.items():
+                req_diff, req_level = req_key.split('_')
+                count = sum(value for level, value in fc_count.get(req_diff, {}).items() if level >= int(req_level))
+                if count < req_count:
+                    break
+            else:
+                eligible = True
+        if eligible:
+            candidate_rules.append(rule)
+    eligible_charts = {tuple(rule['music']) for rule in candidate_rules}
+    for rule in candidate_rules:
+        if any(tuple(chart) in eligible_charts for chart in rule.get('excluded_by', [])):
+            continue
+        chart = tuple(rule['music'])
+        if chart not in candidates:
+            candidates.append(chart)
     return candidates
 
 

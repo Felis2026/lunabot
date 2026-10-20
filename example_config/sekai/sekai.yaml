@@ -136,21 +136,35 @@ deck:
 
   challenge_music_auto_recommend:
     enabled: true
+    # fc_requires 统计该等级及以上的FC数，AP计入FC；目标谱面已FC时直接准入。
+    # fc_requires_any 中任意一组条件满足即可；excluded_by 列出达标后会替代当前曲的谱面。
     rules:
+      - music: [11, append]  # Viva Happy
+        fc_requires: { 'append_31': 3 }
+        fc_requires_any: [{ 'append_31': 3 }, { 'append_34': 1 }]
       - music: [610, master]  # 紫北极星
         fc_requires: { 'master_31': 5 }
-      - music: [6, append]    # 火花apd
-        fc_requires: { 'append_34': 1 }
       - music: [141, append]  # 群青apd
         fc_requires: { 'append_29': 3 }
+        excluded_by: [[610, master]]
+      - music: [765, expert]  # Rem
+        fc_requires: {}
+        excluded_by: [[11, append], [610, master]]
       - music: [540, master]  # 紫虚无
         fc_requires: { 'master_29': 5 }
+        excluded_by: [[11, append], [610, master], [141, append]]
       - music: [104, master]  # 紫10th
         fc_requires: { 'master_29': 5 }
+        excluded_by: [[11, append], [610, master], [141, append]]
       - music: [62, expert]   # 红jsg
         fc_requires: { 'expert_26': 5 }
+        excluded_by: [[11, append], [610, master], [141, append], [765, expert], [540, master], [104, master]]
+      - music: [104, expert]  # 红10th
+        fc_requires: { 'expert_26': 5 }
+        excluded_by: [[11, append], [610, master], [141, append], [765, expert], [540, master], [104, master]]
       - music: [74, expert]   # 红虾
         fc_requires: {}
+        excluded_by: [[11, append], [610, master], [141, append], [765, expert], [540, master], [104, master]]
 
 gacha:
   list_page_size: 100
