@@ -2372,6 +2372,29 @@ def make_deck_skill_label(level: int, color=(50, 50, 50)) -> TextBox:
     return make_deck_info_label(f"SLv.{level}", color)
 
 
+def align_deck_result_columns(tables, minimum_widths=None):
+    """按全部结果统一列宽，清除受影响的布局缓存并返回各列宽度。"""
+    table_columns = [
+        next(child for child in table.items if isinstance(child, HSplit)).items
+        for table in tables
+    ]
+    column_widths = []
+    for index, columns in enumerate(zip(*table_columns)):
+        minimum_width = minimum_widths[index] if minimum_widths else 0
+        width = max(minimum_width, *(
+            column._get_content_size()[0] + column.hpadding * 2 for column in columns
+        ))
+        column_widths.append(width)
+        for column in columns:
+            column.set_w(width)
+            # 测量子项会缓存尺寸；列宽变化后，所在表和外层画布需要重新计算。
+            widget = column
+            while widget is not None:
+                widget._calc_w = widget._calc_h = None
+                widget = widget.parent
+    return column_widths
+
+
 def deck_completed_color(current: float, maximum: Optional[float], normal=(70, 70, 70)):
     """已达到有效正数上限的数值使用完成色。"""
     return (50, 150, 50) if maximum is not None and maximum > 0 and current >= maximum - 0.0001 else normal
@@ -3975,33 +3998,31 @@ async def compose_deck_recommend_image(
                         else:
                             TextBox("未找到符合条件的卡组", TextStyle(font=DEFAULT_BOLD_FONT, size=26, color=(255, 50, 50)))
 
-                    if table_title and result_decks:
-                        columns = next(child for child in result_table.items if isinstance(child, HSplit)).items
-                        for column, width in zip(columns, (112, 456, 112, 128)):
-                            column.set_w(width)
                     return result_table
 
                 if current_mysekai_deck is not None:
-                    await draw_result_table([current_mysekai_deck], [''], '当前队伍', True)
-                    await draw_result_table(result_decks, result_algs, '推荐卡组')
+                    current_table = await draw_result_table([current_mysekai_deck], [''], '当前队伍', True)
+                    recommended_table = await draw_result_table(result_decks, result_algs, '推荐卡组')
+                    align_deck_result_columns((current_table, recommended_table), (112, 456, 112, 128))
                 elif is_wl and any(getattr(deck, 'support_deck_cards', []) for deck in result_decks):
                     # ================================ WL前后排结果 ================================ #
                     # 每套前排紧接自身后排；整页共用表头和列宽，后排卡图左缘对齐前排。
                     with VSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_padding(16).set_bg(roundrect_bg()):
-                        column_widths = None
+                        tables, result_rows = [], []
                         for index, (deck, algorithm) in enumerate(zip(result_decks, result_algs)):
-                            with VSplit().set_content_align('lt').set_item_align('lt').set_sep(6).set_padding(0):
+                            with VSplit().set_content_align('lt').set_item_align('lt').set_sep(6).set_padding(0) as result_row:
                                 table = await draw_result_table(
                                     [deck], [algorithm], show_header=index == 0, bare=True,
                                     row_music_diffs=[music_diffs_to_compare[index]] if music_compare else None,
                                 )
-                                columns = next(child for child in table.items if isinstance(child, HSplit)).items
-                                if column_widths is None:
-                                    column_widths = [column._get_self_size()[0] for column in columns]
-                                for column, width in zip(columns, column_widths):
-                                    column.set_w(width)
-                                card_column = int(music_compare) + int(recommend_type != 'wl_bonus')
-                                front_start = sum(column_widths[:card_column]) + 16 * card_column + columns[card_column].hpadding
+                            tables.append(table)
+                            result_rows.append(result_row)
+                        column_widths = align_deck_result_columns(tables)
+                        columns = next(child for child in tables[0].items if isinstance(child, HSplit)).items
+                        card_column = int(music_compare) + int(recommend_type != 'wl_bonus')
+                        front_start = sum(column_widths[:card_column]) + 16 * card_column + columns[card_column].hpadding
+                        for deck, result_row in zip(result_decks, result_rows):
+                            with result_row:
                                 draw_wl_support_deck(deck, support_thumbnails, await get_result_support_limits(deck), front_start,
                                                      colorize_bonus=not simulated_event)
                 else:

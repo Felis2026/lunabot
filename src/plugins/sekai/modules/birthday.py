@@ -421,6 +421,50 @@ async def _birthday_resource(data, kind, resource_id):
 
 # ================================ 资料栏与活动排期 ================================ #
 
+def _fit_birthday_profile_card(card, width=512):
+    """按生日页栏宽调整传入资料卡，保留头像和文字样式，长文字自动换行。"""
+    row = card.items[0]
+    text_stack = next(item for item in row.items if isinstance(item, VSplit))
+    text_width = (width - card.hpadding * 2 - row.hpadding * 2
+                  - row.sep * (len(row.items) - 1)
+                  - sum(item._get_self_size()[0] for item in row.items if item is not text_stack))
+    card.set_w(width)
+    text_stack.set_w(text_width)
+
+    def wrap_text(text, available_width):
+        text.set_w(available_width).set_wrap(True)
+        text.use_real_line_count = True
+        text.line_count = 99999
+
+    items = list(text_stack.items)
+    for index, item in enumerate(items):
+        if isinstance(item, TextBox):
+            wrap_text(item, text_width)
+        elif isinstance(item, HSplit) and item._get_self_size()[0] > text_width:
+            # 彩色昵称由多个文字片段组成，保留各段颜色并在栏宽内排列。
+            segments, pending = [], list(item.items)
+            while pending:
+                child = pending.pop(0)
+                if isinstance(child, TextBox):
+                    segments.append(child)
+                else:
+                    pending[0:0] = child.items
+            with text_stack:
+                with Flow().set_w(text_width).set_padding((item.hpadding, item.vpadding)).set_sep(0, 2).set_content_and_item_align('l') as wrapped:
+                    for segment in segments:
+                        segment_width = min(segment._get_self_size()[0], text_width - item.hpadding * 2)
+                        wrap_text(segment, segment_width)
+                        wrapped.add_item(segment)
+            items[index] = wrapped
+    text_stack.set_items(items)
+    # 资料栏可能已被测量过，文字换行后重新计算所有子项的尺寸。
+    pending = [card]
+    while pending:
+        widget = pending.pop()
+        widget._calc_w = widget._calc_h = None
+        pending.extend(getattr(widget, 'items', []))
+
+
 async def _draw_birthday_profile(data):
     """复用原资料栏；缺失提示加在栏内，生日页不展示 MySekai 等级。"""
     ctx, suite, capture = data['ctx'], data['suite'], data['capture']
@@ -446,6 +490,7 @@ async def _draw_birthday_profile(data):
             text_stack = next(item for item in card.items[0].items if isinstance(item, VSplit))
             with text_stack:
                 TextBox('*未获取到 Suite 数据' if not suite else '*未获取到 MySekai 数据', _birthday_style(16, color=RED))
+        _fit_birthday_profile_card(card)
 
 
 def _draw_birthday_schedule(label, start, end, now, color):
