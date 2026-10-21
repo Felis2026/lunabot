@@ -51,7 +51,8 @@ class EventDetail:
     start_time: datetime
     end_time: datetime
     event_cards: List[dict]
-    bonus_attr: str
+    bonus_attr: Optional[str]
+    bonus_attrs: List[str]
     bonus_cuids: List[int]
     bonus_cids: List[int]
     banner_cid: int
@@ -127,8 +128,8 @@ async def get_card_supply_type(ctx: SekaiHandlerContext, cid: int) -> str:
         return card_supply["cardSupplyType"]
     return "normal"
 
-# 获取某个活动详情
 async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[int, Dict], require_assets: List[str]) -> EventDetail:
+    """读取活动信息与所需素材，缺少活动卡时保留时间、加成和所属团信息。"""
     if isinstance(event_or_event_id, int):
         event_id = event_or_event_id
         event = await ctx.md.events.find_by_id(event_id)
@@ -147,23 +148,35 @@ async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[in
     event_card_ids = [ec['cardId'] for ec in event_cards]
     event_cards = await ctx.md.cards.collect_by_ids(event_card_ids)
 
-    bonus_attr = None
+    bonus_attrs = set()
     bonus_cuids = set()
     for deck_bonus in await ctx.md.event_deck_bonuses.find_by('eventId', event_id, mode="all"):
-        if 'cardAttr' in deck_bonus:
-            bonus_attr = deck_bonus['cardAttr']
+        if deck_bonus.get('cardAttr'):
+            bonus_attrs.add(deck_bonus['cardAttr'])
         if 'gameCharacterUnitId' in deck_bonus:
             bonus_cuids.add(deck_bonus['gameCharacterUnitId'])
     bonus_cuids = sorted(list(bonus_cuids))
     bonus_cids = [await get_chara_id_by_cuid(ctx, cuid) for cuid in bonus_cuids]
+    bonus_attrs = [attr for attr in CARD_ATTRS if attr in bonus_attrs]
+    bonus_attr = bonus_attrs[0] if len(bonus_attrs) == 1 else None
 
     banner_cid = await get_event_banner_chara_id(ctx, event)
     unit = None
     if banner_cid:
         unit = get_unit_by_chara_id(banner_cid)
     elif event['eventType'] == 'world_bloom':
-        if len(event_cards) <= 6:
+        if 1 <= len(event_cards) <= 6:
             unit = get_unit_by_chara_id(event_cards[0]['characterId'])
+    if unit is None and not event_cards and bonus_cuids:
+        # 无活动卡的团活通过加成角色识别所属团，个人箱主仍可为空。
+        bonus_units = None
+        for cuid in bonus_cuids:
+            character_unit = await ctx.md.game_character_units.find_by_id(cuid)
+            supported_units = {character_unit['unit'], get_unit_by_chara_id(character_unit['gameCharacterId'])}
+            supported_units.discard('none')
+            bonus_units = supported_units if bonus_units is None else bonus_units & supported_units
+        if len(bonus_units) == 1:
+            unit = next(iter(bonus_units))
     
     assert not require_assets or all(a in ['banner', 'logo', 'bg', 'story_bg', 'ban_chara', 'card_thumbs'] for a in require_assets)
 
@@ -204,6 +217,7 @@ async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[in
         end_time=end_time,
         event_cards=event_cards,
         bonus_attr=bonus_attr,
+        bonus_attrs=bonus_attrs,
         bonus_cuids=bonus_cuids,
         bonus_cids=bonus_cids,
         banner_cid=banner_cid,
@@ -315,8 +329,8 @@ def extract_event_type(text: str, default: str = None) -> Tuple[str, str]:
                 return event_type[0], text
     return default, text
 
-# 获取所有箱活id集合（往期通过书下曲判断，当期书下可能还没上线通过活动加成判断）
 async def get_ban_events_id_set(ctx: SekaiHandlerContext) -> set[int]:
+    """收集个人箱活候选，未发布书下曲的活动还须有可识别箱主的活动卡。"""
     events = await ctx.md.events.get_sorted('startAt')
     # 获取已有书下的活动
     ret = set((await ctx.md.event_musics.get_indexed('eventId')).keys())
@@ -334,7 +348,8 @@ async def get_ban_events_id_set(ctx: SekaiHandlerContext) -> set[int]:
             cuid = deck_bonus.get('gameCharacterUnitId')
             if cuid and cuid <= 20:
                 bonus_unit.add((await ctx.md.game_character_units.find_by_id(cuid))['unit'])
-        if len(bonus_unit) == 1:    # 所有角色加成都是同一个团
+        # 总集篇也有单团加成，只有活动卡可识别箱主时才补入候选。
+        if len(bonus_unit) == 1 and await get_event_banner_card(ctx, event_id):
             ret.add(event_id)
     # 特判sdl3
     ret.add(74)
@@ -347,17 +362,22 @@ async def is_ban_event(ctx: SekaiHandlerContext, event: dict) -> bool:
         return False
     return event['id'] in await get_ban_events_id_set(ctx)
 
-# 获取箱活ban主角色id 不是箱活返回None
+async def get_event_banner_card(ctx: SekaiHandlerContext, event_id: int) -> Optional[dict]:
+    """返回 ID 最小的非庆典活动卡，跳过缺失记录，候选为空时返回 None。"""
+    event_cards = await ctx.md.event_cards.find_by('eventId', event_id, mode="all")
+    cards = await ctx.md.cards.collect_by_ids(ec['cardId'] for ec in event_cards)
+    for card in sorted(cards, key=lambda card: card['id']):
+        if "festival_limited" not in await get_card_supply_type(ctx, card['id']):
+            return card
+    return None
+
+
 async def get_event_banner_chara_id(ctx: SekaiHandlerContext, event: dict) -> int | None:
+    """返回个人箱主角色 ID，非箱活或没有合格活动卡时返回 None。"""
     if not await is_ban_event(ctx, event):
         return None
-    event_cards = await ctx.md.event_cards.find_by('eventId', event['id'], mode="all")
-    banner_card_id = min([
-        ec['cardId'] for ec in event_cards
-        if "festival_limited" not in await get_card_supply_type(ctx, ec['cardId'])
-    ])
-    banner_card = await ctx.md.cards.find_by_id(banner_card_id)
-    return banner_card['characterId']
+    banner_card = await get_event_banner_card(ctx, event['id'])
+    return banner_card['characterId'] if banner_card else None
 
 # 获取某个角色所有箱活（按时间顺序排列）
 async def get_chara_ban_events(ctx: SekaiHandlerContext, cid: int) -> List[dict]:
@@ -380,7 +400,7 @@ async def compose_event_list_image(ctx: SekaiHandlerContext, filter: EventListFi
             if filter.leak is not None:
                 if filter.leak and d.start_time <= datetime.now(): continue
                 if not filter.leak and d.start_time > datetime.now(): continue
-            if filter.attr and filter.attr != d.bonus_attr: continue
+            if filter.attr and filter.attr not in d.bonus_attrs: continue
             if filter.cids and any(cid not in d.bonus_cids for cid in filter.cids): continue
             if filter.banner_cid and filter.banner_cid != d.banner_cid: continue
             if filter.year and filter.year != d.start_time.year: continue
@@ -921,8 +941,11 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
     detail = await get_event_detail(ctx, event, ['logo', 'bg', 'story_bg', 'ban_chara', 'card_thumbs'])
     now = datetime.now()
 
+    banner_index = None
     if detail.banner_cid:
-        banner_index = find_by(await get_chara_ban_events(ctx, detail.banner_cid), "id", detail.eid)['ban_index']
+        banner_event = find_by(await get_chara_ban_events(ctx, detail.banner_cid), "id", detail.eid)
+        if banner_event:
+            banner_index = banner_event['ban_index']
 
     label_style = TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=(50, 50, 50))
     text_style = TextStyle(font=DEFAULT_FONT, size=24, color=(70, 70, 70))
@@ -998,7 +1021,8 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                         if detail.banner_cid:
                             Spacer(w=8)
                             ImageBox(get_chara_icon_by_chara_id(detail.banner_cid), size=(30, 30))
-                            TextBox(f"{banner_index}箱", label_style)
+                            if banner_index is not None:
+                                TextBox(f"{banner_index}箱", label_style)
 
                 # 活动时间
                 with VSplit().set_padding(16).set_sep(12).set_item_align('c').set_content_align('c'):
@@ -1070,11 +1094,18 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                                     TextBox(f"ID:{card['id']}", TextStyle(font=DEFAULT_FONT, size=16, color=(75, 75, 75)), overflow='clip')
                 
                 # 加成
-                if detail.bonus_attr or detail.bonus_cuids:
+                if detail.bonus_attrs or detail.bonus_cuids:
                     with HSplit().set_padding(16).set_sep(8).set_item_align('c').set_content_align('c'):
-                        if detail.bonus_attr:
+                        if detail.bonus_attrs:
                             TextBox("加成属性", label_style)
-                            ImageBox(get_attr_icon(detail.bonus_attr), size=(None, 40))
+                            if len(detail.bonus_attrs) == len(CARD_ATTRS):
+                                TextBox("全属性", text_style)
+                            elif detail.bonus_attr:
+                                ImageBox(get_attr_icon(detail.bonus_attr), size=(None, 40))
+                            else:
+                                with Grid(col_count=2).set_sep(4, 4):
+                                    for attr in detail.bonus_attrs:
+                                        ImageBox(get_attr_icon(attr), size=(None, 40))
                         if detail.bonus_cuids:
                             bonus_cids = set([await get_chara_id_by_cuid(ctx, cuid) for cuid in detail.bonus_cuids])
                             bonus_cids = sorted(list(bonus_cids))
