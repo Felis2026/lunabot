@@ -1538,7 +1538,8 @@ async def get_detailed_profile(
 
     require_verified_public=True 时，公开接口仅用于当前 QQ 已验证的账号。
     获取失败时通常返回空数据和提示，raise_exc=True 时向调用方传播异常。
-    strict=True 且缺少 filter 指定字段时抛出 ReplyException。
+    strict=True 且缺少 filter 指定的必要字段时抛出 ReplyException。
+    userPlayerFrames 仅用于头像框展示，缺失时继续使用缓存。
     """
     cache_path = None
     uid = None
@@ -1700,15 +1701,15 @@ async def get_detailed_profile(
             return None, get_exc_desc(e)
 
     if strict and filter:
-        missing_keys = [k for k in filter if k not in profile]
+        missing_keys = [k for k in filter if k not in profile and k != 'userPlayerFrames']
         if missing_keys:
             raise ReplyException(format_suite_missing_fields_error(ctx, profile, missing_keys))
         
     return profile, ""
 
-# 获取包含了玩家详细信息的简单卡片控件所需要的filter
 def get_detailed_profile_card_filter(*s: str) -> set[str]:
-    return {'userGamedata', 'userDecks', 'upload_time', 'userCards', *s}
+    """返回玩家资料卡及调用方所需的 Suite 字段。"""
+    return {'userGamedata', 'userDecks', 'upload_time', 'userCards', 'userPlayerFrames', *s}
 
 # 从玩家详细信息获取该玩家头像的PlayerAvatarInfo
 async def get_player_avatar_info_by_detailed_profile(ctx: SekaiHandlerContext, detail_profile: dict) -> PlayerAvatarInfo:
@@ -2046,23 +2047,21 @@ async def get_profile_bg_settings(ctx: SekaiHandlerContext) -> ProfileBgSettings
         ret.blur = 4
     return ret
 
-# 获取玩家框信息，提供detail_profile会直接取用并更新缓存，否则使用缓存数据
 def get_player_frames(ctx: SekaiHandlerContext, uid: str, detail_profile: Optional[dict] = None) -> List[dict]:
+    """读取玩家框缓存，用较新的显式框列表更新缓存，空列表表示卸框。"""
     uid = str(uid)
     all_cached_frames = player_frame_db.get(ctx.region, {})
     cached_frames = all_cached_frames.get(uid, {})
-    if detail_profile:
+    if detail_profile and 'userPlayerFrames' in detail_profile:
         upload_time = detail_profile.get('upload_time', 0)
-        frames = detail_profile.get('userPlayerFrames', [])
+        frames = detail_profile['userPlayerFrames']
         if upload_time > cached_frames.get('upload_time', 0):
-            # 更新缓存
             cached_frames = {
                 'upload_time': upload_time,
                 'frames': frames
             }
-            if frames:
-                all_cached_frames[uid] = cached_frames
-                player_frame_db.set(ctx.region, all_cached_frames)
+            all_cached_frames[uid] = cached_frames
+            player_frame_db.set(ctx.region, all_cached_frames)
     return cached_frames.get('frames', [])
 
 # 获取头像框图片，失败返回None

@@ -335,8 +335,8 @@ async def compose_inventory_image(ctx: SekaiHandlerContext, qid: int, category: 
         format_suite_missing_fields_error,
     )
 
-    required = get_detailed_profile_card_filter(*_get_inventory_required_fields(category))
-    optional = {'userMysekaiMaterials'} if category == 'default' else set()
+    required = get_detailed_profile_card_filter(*_get_inventory_required_fields(category)) - {'userPlayerFrames'}
+    optional = {'userPlayerFrames'} | ({'userMysekaiMaterials'} if category == 'default' else set())
     profile, pmsg = await get_detailed_profile(
         ctx, qid, filter=required | optional, raise_exc=True, strict=False,
         require_verified_public=True,
