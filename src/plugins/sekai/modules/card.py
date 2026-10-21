@@ -631,6 +631,17 @@ def _get_box_group_width(groups: list[tuple], height: int, size: int, gap: int) 
     return sum(widths) + 4 * max(0, len(widths) - 1)
 
 
+def _get_box_attribute_columns(character_count: int) -> int:
+    """返回属性视图的列数，单角色为每行上限，多角色为每个角色的固定列数。"""
+    if character_count == 1:
+        return 9
+    if character_count <= 4:
+        return 3
+    if character_count <= 13:
+        return 2
+    return 1
+
+
 def _draw_box_progress_bar(width: int, height: int, ratio: float, color):
     """使用原绘图控件绘制收集进度条。"""
     with Frame().set_size((width, height)).set_content_align('l'):
@@ -710,6 +721,14 @@ async def compose_box_image(
         chara_id: color_code_to_rgb((await ctx.md.game_character_units.find_by_id(chara_id))['colorCode'])
         for chara_id, _ in chara_cards
     }
+    progress_avatar_image = None
+    if profile and layout == 'character' and len(chara_cards) == 1:
+        chara_id = chara_cards[0][0]
+        progress_avatar_image = await SekaiHandlerContext.from_region('jp').rip.img(
+            f'bonds_honor/character/chr_sd_{chara_id:02d}_01.png', default=None)
+        if progress_avatar_image is not None:
+            bounds = progress_avatar_image.getbbox()
+            progress_avatar_image = progress_avatar_image.crop(bounds) if bounds else None
 
     def style(font_size, bold=False, auxiliary=False):
         return TextStyle(font=DEFAULT_BOLD_FONT if bold else DEFAULT_FONT, size=font_size,
@@ -730,13 +749,16 @@ async def compose_box_image(
             if show_id:
                 TextBox(str(card['id']), style(12)).set_w(size)
 
-    def draw_character(chara_id, group, selected, show_count=True):
-        columns = max(1, math.ceil(len(group) / best_height))
+    def draw_character(chara_id, group, selected, show_count=True, fixed_columns=None):
+        """绘制角色头像与卡牌分列，指定列数时为各角色预留相同宽度。"""
+        columns = fixed_columns or max(1, math.ceil(len(group) / best_height))
         rows = max(1, min(best_height, len(group)))
         width = size * columns + gap * (columns - 1)
         total = sum(card['characterId'] == chara_id for card in selected)
         owned = sum(card['characterId'] == chara_id and card['has'] for card in selected)
-        with VSplit().set_content_align('t').set_item_align('c').set_sep(3):
+        with VSplit().set_content_align('t').set_item_align('c').set_sep(3) as character_column:
+            if fixed_columns:
+                character_column.set_w(width)
             if show_count and profile:
                 TextBox(str(len(group) if show_unowned else owned), style(max(11, int(size * 0.2)), bold=True)).set_w(width).set_content_align('c')
             if profile:
@@ -744,32 +766,42 @@ async def compose_box_image(
             else:
                 ImageBox(get_chara_icon_by_chara_id(chara_id), size=(size, size))
             Spacer(w=width, h=max(4, gap)).set_bg(FillBg(chara_colors[chara_id]))
-            with Grid(row_count=rows, vertical=rows > columns).set_content_align('lt').set_item_align('lt').set_sep(gap, gap):
+            grid = Grid(col_count=columns) if fixed_columns else Grid(row_count=rows, vertical=rows > columns)
+            with grid.set_content_align('lt').set_item_align('lt').set_sep(gap, gap):
                 for card in group:
                     draw_card(card)
 
-    # ================================ 单角色收集进度 ================================ #
     def draw_single_progress(chara_id, width):
+        """绘制角色形象与居中的各稀有度收集进度。"""
         selected = [card for card in all_cards if card['characterId'] == chara_id]
-        with HSplit().set_w(width).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_content_align('l').set_item_align('c'):
-            ImageBox(get_chara_icon_by_chara_id(chara_id), size=(56, 56))
-            with VSplit().set_w(width - 104).set_sep(8).set_content_align('lt').set_item_align('lt'):
-                TextBox('收集进度', style(20, bold=True))
+        avatar_size = 144 if progress_avatar_image is not None else 56
+        progress_width = min(620, width - 32 - 2 * (avatar_size + 16))
+        with HSplit().set_w(width).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_content_align('c').set_item_align('c'):
+            with Frame().set_size((avatar_size, avatar_size)).set_content_align('c'):
+                if progress_avatar_image is not None:
+                    scale = min(avatar_size / progress_avatar_image.width, avatar_size / progress_avatar_image.height)
+                    display_size = (max(1, int(progress_avatar_image.width * scale)),
+                                    max(1, int(progress_avatar_image.height * scale)))
+                    ImageBox(progress_avatar_image, size=display_size)
+                else:
+                    ImageBox(get_chara_icon_by_chara_id(chara_id), size=(56, 56))
+            with VSplit().set_w(progress_width).set_sep(8).set_content_align('c').set_item_align('c'):
+                TextBox('收集进度', style(20, bold=True)).set_w(progress_width).set_content_align('c')
                 for rarity in [names[0] for names in CARD_RARE_NAMES]:
                     rarity_cards = [card for card in selected if card['cardRarityType'] == rarity]
                     if not rarity_cards:
                         continue
-                    with HSplit().set_sep(0).set_content_align('c').set_w(width - 104):
+                    with HSplit().set_sep(0).set_content_align('c').set_w(progress_width):
                         if rarity == 'rarity_birthday':
                             ImageBox(ctx.static_imgs.get('card/rare_birthday.png'), size=(14, 14))
                         else:
                             for _ in range(int(rarity.rsplit('_', 1)[1])):
                                 ImageBox(ctx.static_imgs.get('card/rare_star_normal.png'), size=(14, 14))
                     owned = sum(card['has'] for card in rarity_cards)
-                    TextBox(f'{owned}/{len(rarity_cards)}', style(12)).set_w(width - 104).set_content_align('c')
-                    _draw_box_progress_bar(width - 104, 8, owned / len(rarity_cards), chara_colors[chara_id])
+                    TextBox(f'{owned}/{len(rarity_cards)}', style(15)).set_w(progress_width).set_content_align('c')
+                    _draw_box_progress_bar(progress_width, 8, owned / len(rarity_cards), chara_colors[chara_id])
+            Spacer(w=avatar_size)
 
-    # ================================ 属性分区与获取时间线 ================================ #
     attribute_names = [('cute', '可爱'), ('cool', '帅气'), ('pure', '纯真'), ('happy', '快乐'), ('mysterious', '神秘')]
     attribute_groups = [(attr, label, _group_box_cards([card for card in visible if card['attr'] == attr]))
                         for attr, label in attribute_names]
@@ -813,10 +845,18 @@ async def compose_box_image(
                                             day = f"{card['created_time'].day:02d}日" if card['created_time'] else '未知'
                                             TextBox(day, style(11, auxiliary=True)).set_w(size).set_content_align('c')
             elif layout == 'attribute':
-                width = max(480, max(_get_box_group_width(group, *geometry) for _, _, group in attribute_groups) + 32)
+                single_character = len(chara_cards) == 1
+                if single_character:
+                    column_count = min(_get_box_attribute_columns(1), max(len(group[0][1]) for _, _, group in attribute_groups))
+                    content_width = column_count * size + (column_count - 1) * gap
+                else:
+                    fixed_columns = _get_box_attribute_columns(len(chara_cards))
+                    character_width = fixed_columns * size + (fixed_columns - 1) * gap
+                    content_width = len(chara_cards) * character_width + 4 * (len(chara_cards) - 1)
+                panels = []
                 for attr, label, group in attribute_groups:
                     selected = [card for card in all_cards if card['attr'] == attr]
-                    with VSplit().set_w(width).set_padding(16).set_sep(8).set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt'):
+                    with VSplit().set_padding(16).set_sep(8).set_bg(roundrect_bg()).set_content_align('lt').set_item_align('lt') as panel:
                         with HSplit().set_sep(8).set_content_align('l').set_item_align('c'):
                             icon = ctx.static_imgs.get(f'card/attr_icon_{attr}.png')
                             ImageBox(icon, size=(24, 24))
@@ -826,9 +866,20 @@ async def compose_box_image(
                                 TextBox(f'{owned}/{len(selected)}', style(18, bold=True)).set_w(96).set_content_align('r')
                                 color = icon.convert('RGB').resize((1, 1)).getpixel((0, 0))
                                 _draw_box_progress_bar(260, 12, owned / len(selected), color)
-                        with HSplit().set_sep(4).set_content_align('lt').set_item_align('lt'):
-                            for chara_id, values in group:
-                                draw_character(chara_id, values, selected)
+                        if single_character:
+                            with Grid(col_count=column_count).set_sep(gap, gap).set_content_align('lt').set_item_align('lt'):
+                                for card in group[0][1]:
+                                    draw_card(card)
+                        else:
+                            grouped_cards = dict(group)
+                            with HSplit().set_sep(4).set_content_align('lt').set_item_align('lt'):
+                                for chara_id, _ in chara_cards:
+                                    draw_character(chara_id, grouped_cards.get(chara_id, []), selected, fixed_columns=fixed_columns)
+                    panels.append(panel)
+                # 表头与卡牌区共同决定宽度，所有属性面板保持左右对齐。
+                width = max(480, content_width + 32, *(panel._get_content_size()[0] + panel.hpadding * 2 for panel in panels))
+                for panel in panels:
+                    panel.set_w(width)
             else:
                 width = max(480, _get_box_group_width(chara_cards, *geometry) + 32)
                 if len(chara_cards) == 1 and profile:

@@ -780,7 +780,7 @@ async def _draw_birthday_rewards(data):
                             with VSplit().set_w(160).set_sep(3).set_item_align('l'):
                                 name_size = 14 if get_text_size(get_font(DEFAULT_FONT, 15), name)[0] > 156 else 15
                                 TextBox(name, _birthday_style(name_size), use_real_line_count=True).set_w(160).set_h(32).set_content_align('l')
-                                TextBox(f'{current:,}/{total:,}' if current is not None else f'未知/{total:,}', _birthday_style(19, True, (50, 150, 50) if current == total else (25, 25, 25)))
+                                TextBox(f'{current:,}/{total:,}' if current is not None else f'未知/{total:,}', _birthday_style(20, True, (50, 150, 50) if current == total else (25, 25, 25)))
                                 _draw_birthday_reward_track(current, total, data['color'])
         if not honors:
             _draw_birthday_footer(data, honors)
