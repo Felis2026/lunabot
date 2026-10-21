@@ -181,22 +181,8 @@ class Worker:
     
     # ================================ WL后排加成上限 ================================ #
 
-    def get_support_limits(self, options: DeckRecommendOptions, character_id: int, count: int) -> dict:
-        """按已加载的活动规则计算全卡满养成的后排上限，返回只读的共享缓存结果。"""
-        region = options.region
-        option_data = options.to_dict()
-        selectors = {
-            name: option_data[name]
-            for name in ('event_id', 'event_unit', 'world_bloom_event_turn', 'world_bloom_finale_turn')
-            if option_data.get(name) is not None
-        }
-        key = (region, tuple(selectors.items()), character_id, count)
-        now = time.time() * 1000
-        cached = self.support_limits_cache.get(key)
-        if cached is not None and now < cached[0]:
-            self.support_limits_cache.move_to_end(key)
-            return cached[1]
-
+    def _prepare_support_limit_data(self, region: str, now: float) -> dict:
+        """按指定毫秒时间准备全卡满养成数据与缓存过期时间，供同次请求复用。"""
         directory = self.masterdata_path[region]
         cards = load_json(pjoin(directory, 'cards.json'))
         rarities = {row['cardRarityType']: row for row in load_json(pjoin(directory, 'cardRarities.json'))}
@@ -219,21 +205,48 @@ class Worker:
                 for card in published
             ],
         }, indent=False).encode('utf-8'))
+        expires_at = min((card['releaseAt'] for card in cards if card.get('releaseAt', 0) > now), default=float('inf'))
+        return {'user_data': userdata, 'max_skills': max_skills, 'expires_at': expires_at}
+
+    def get_support_limits(
+        self, options: DeckRecommendOptions, character_id: int, count: int,
+        prepared_data: dict | None = None,
+    ) -> dict:
+        """计算全卡满养成的后排上限，返回只读的共享缓存结果。
+
+        传入的 prepared_data 字典在首次未命中时写入准备结果，仅供同次请求复用。
+        """
+        region = options.region
+        selectors = {}
+        for name in ('event_id', 'event_unit', 'world_bloom_event_turn', 'world_bloom_finale_turn'):
+            value = getattr(options, name)
+            if value is not None:
+                selectors[name] = value
+        key = (region, tuple(selectors.items()), character_id, count)
+        now = time.time() * 1000
+        cached = self.support_limits_cache.get(key)
+        if cached is not None and now < cached[0]:
+            self.support_limits_cache.move_to_end(key)
+            return cached[1]
+
+        if prepared_data is None:
+            prepared_data = {}
+        if 'user_data' not in prepared_data:
+            prepared_data.update(self._prepare_support_limit_data(region, now))
         cap_options = DeckRecommendOptions.from_dict({
             **selectors, 'region': region, 'world_bloom_character_id': character_id,
             'support_master_max': True, 'support_skill_max': True,
         })
-        cap_options.user_data = userdata
+        cap_options.user_data = prepared_data['user_data']
         support_cards = self.recommender.get_world_bloom_support_cards(cap_options)
         # 上限使用活动规定的后排容量；玩家缺卡时也应显示完整容量的理论上限。
         result = {
             'upper': sum(card.bonus for card in support_cards[:count]),
             'card_maxima': {str(card.card_id): card.bonus for card in support_cards},
-            'max_skills': max_skills,
+            'max_skills': prepared_data['max_skills'],
         }
         # 每个 Worker 串行处理任务，同键只计算一次。MasterData 重载时清空，卡牌开放时过期。
-        expires_at = min((card['releaseAt'] for card in cards if card.get('releaseAt', 0) > now), default=float('inf'))
-        self.support_limits_cache[key] = (expires_at, result)
+        self.support_limits_cache[key] = (prepared_data['expires_at'], result)
         self.support_limits_cache.move_to_end(key)
         while len(self.support_limits_cache) > 32:
             self.support_limits_cache.popitem(last=False)
@@ -258,10 +271,11 @@ class Worker:
         if count is None:
             return {}
         limits = {}
+        prepared_data = {}
         for deck in decks:
             character_id = options.world_bloom_character_id or cards[deck.cards[0].card_id]['characterId']
             if str(character_id) not in limits:
-                limits[str(character_id)] = self.get_support_limits(options, character_id, count)
+                limits[str(character_id)] = self.get_support_limits(options, character_id, count, prepared_data)
         return limits
 
     # ================================ 组卡任务 ================================ #
