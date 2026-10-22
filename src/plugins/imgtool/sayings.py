@@ -80,6 +80,8 @@ class Saying:
     content_key: str = ""
     extension: str = "png"
     media_json: str = "[]"
+    deleted_at: int | None = None
+    deleted_by: int | None = None
 
 
 class SayingLimitError(Exception):
@@ -137,6 +139,9 @@ class SayingStore:
                     if name not in columns:
                         await connection.execute(
                             f"ALTER TABLE sayings ADD COLUMN {name} TEXT NOT NULL DEFAULT {default}")
+                for name in ("deleted_at", "deleted_by"):
+                    if name not in columns:
+                        await connection.execute(f"ALTER TABLE sayings ADD COLUMN {name} INTEGER")
                 await connection.execute("""
                     CREATE INDEX IF NOT EXISTS sayings_media_content
                     ON sayings (group_id, author_id, content_key, number)
@@ -176,7 +181,7 @@ class SayingStore:
             return None
 
     async def find_source(self, group_id: int, source_msg_id: int) -> tuple[Saying, bytes | None] | None:
-        """生成前检查同群原消息，已有记录直接复用原图。"""
+        """收录前检查同群原消息，包括已删除记录，供收录流程复用原编号和原图。"""
         async with self._lock:
             connection = await self._connect()
             row = await self._fetch_one(connection,
@@ -189,7 +194,7 @@ class SayingStore:
 
     async def find_content(self, group_id: int, author_id: int, text: str,
                            content_key: str = "") -> tuple[Saying, bytes | None] | None:
-        """按同群作者与完整正文查重，复用最早收录的编号和原图。"""
+        """收录前按同群作者与完整内容查重，包括已删除记录。"""
         async with self._lock:
             connection = await self._connect()
             if content_key:
@@ -205,11 +210,12 @@ class SayingStore:
             return saying, await self._read_image(saying)
 
     async def get(self, group_id: int, number: int) -> tuple[Saying, bytes | None] | None:
-        """按群与编号读取成品图快照，发送过程使用独立的图片字节。"""
+        """按群与编号读取可见语录的成品图快照，已删除记录返回 None。"""
         async with self._lock:
             connection = await self._connect()
             row = await self._fetch_one(connection,
-                "SELECT * FROM sayings WHERE group_id = ? AND number = ?", (group_id, number))
+                "SELECT * FROM sayings WHERE group_id = ? AND number = ? AND deleted_at IS NULL",
+                (group_id, number))
             if row is None:
                 return None
             saying = Saying(**dict(row))
@@ -240,7 +246,7 @@ class SayingStore:
                     await connection.rollback()
                     return Saying(**dict(row)), False
 
-                # 容量按现存记录统计，旧语录由用户管理，达到上限后仍可即时出图。
+                # 已删除记录保留文件，继续计入记录数和磁盘容量；复用已有记录无需增加容量。
                 row = await self._fetch_one(connection,
                     "SELECT COUNT(*) AS count FROM sayings WHERE group_id = ?", (group_id,))
                 if row["count"] >= max_per_group:
@@ -315,7 +321,7 @@ class SayingStore:
         async with self._lock:
             connection = await self._connect()
             # 全群和个人查询共用分页，群号始终是必选条件；主键支持本群编号倒序。
-            where_clause = "group_id = ?"
+            where_clause = "group_id = ? AND deleted_at IS NULL"
             parameters = (group_id,)
             if author_id is not None:
                 where_clause += " AND author_id = ?"
@@ -337,31 +343,47 @@ class SayingStore:
             return images, total, page_count
 
     async def delete(self, group_id: int, number: int, actor_id: int,
-                     is_admin: bool) -> tuple[Saying, OSError | None] | None:
-        """作者、收录人及本群管理员可删除；先撤下索引，再清理对应图片。"""
+                     is_admin: bool) -> Saying | None:
+        """校验删除权限后标记删除时间和操作者，保留记录与全部素材。"""
         async with self._lock:
             connection = await self._connect()
             row = await self._fetch_one(connection,
-                "SELECT * FROM sayings WHERE group_id = ? AND number = ?", (group_id, number))
+                "SELECT * FROM sayings WHERE group_id = ? AND number = ? AND deleted_at IS NULL",
+                (group_id, number))
             if row is None:
                 return None
             saying = Saying(**dict(row))
             if actor_id not in (saying.author_id, saying.recorder_id) and not is_admin:
                 raise PermissionError("仅原作者、收录人或群管理员可以删除这条语录")
             try:
-                await connection.execute("DELETE FROM sayings WHERE group_id = ? AND number = ?",
-                                         (group_id, number))
+                await connection.execute(
+                    "UPDATE sayings SET deleted_at = ?, deleted_by = ? WHERE group_id = ? AND number = ?",
+                    (int(time.time()), actor_id, group_id, number))
                 await connection.commit()
             except BaseException:
                 await connection.rollback()
                 raise
-            cleanup_error = None
+            return saying
+
+    async def restore(self, group_id: int, number: int) -> bool | None:
+        """恢复本群记录；返回是否发生恢复，记录不存在时返回 None，权限由命令入口校验。"""
+        async with self._lock:
+            connection = await self._connect()
+            row = await self._fetch_one(connection,
+                "SELECT deleted_at FROM sayings WHERE group_id = ? AND number = ?", (group_id, number))
+            if row is None:
+                return None
+            if row["deleted_at"] is None:
+                return False
             try:
-                await asyncio.to_thread(self._remove_files,
-                                        [self.image_path(saying), *self.media_paths(saying)])
-            except OSError as error:
-                cleanup_error = error
-            return saying, cleanup_error
+                await connection.execute(
+                    "UPDATE sayings SET deleted_at = NULL, deleted_by = NULL WHERE group_id = ? AND number = ?",
+                    (group_id, number))
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+            return True
 
     async def close(self):
         """Bot 正常关闭时释放 SQLite 连接和工作线程。"""
@@ -1326,21 +1348,24 @@ async def _get_saying_image_cq(data: bytes, extension: str = "png") -> str:
 
 
 async def _send_saved_saying(ctx: HandlerContext, stored, *, created: bool | None = None):
-    """发送原图快照，区分首次收录、重复命中和按编号查看。"""
+    """发送原图快照；重新收录已删除内容时恢复原编号，按编号查看只读取可见记录。"""
     if stored is None:
         raise ReplyException("本群没有这条语录")
     saying, png = stored
     if png is None:
-        raise ReplyException(f"语录 #{saying.number} 的原图已丢失，请删除记录后重新收录")
+        raise ReplyException(f"语录 #{saying.number} 的原图已丢失，请联系管理员")
     def verify_image():
         with Image.open(io.BytesIO(png)) as image:
             image.verify()
     try:
         await run_in_pool(verify_image)
     except (OSError, ValueError, SyntaxError):
-        raise ReplyException(f"语录 #{saying.number} 的原图已损坏，请删除记录后重新收录")
+        raise ReplyException(f"语录 #{saying.number} 的原图已损坏，请联系管理员")
     image_cq = await _get_saying_image_cq(png, saying.extension)
-    if created is False:
+    if created is False and saying.deleted_at is not None:
+        await saying_store.restore(saying.group_id, saying.number)
+        notice = f"已重新收录，本群编号 #{saying.number}"
+    elif created is False:
         notice = f"这条语录已收录，本群编号 #{saying.number}。"
     else:
         prefix = "已收录为" if created else ""
@@ -1489,7 +1514,7 @@ async def _collect_rich_saying(ctx, source_msg_id):
         logger.print_exc("保存语录失败")
         notice = "图片已生成，但保存失败，未收录到语录册"
     else:
-        stored = (saying, png) if created else await saying_store.get(ctx.group_id, saying.number)
+        stored = (saying, png) if created else await saying_store.find_source(ctx.group_id, saying.source_msg_id)
         if created and fallback:
             await ctx.asend_reply_msg(fallback)
         return await _send_saved_saying(ctx, stored, created=created)
@@ -1499,7 +1524,7 @@ async def _collect_rich_saying(ctx, source_msg_id):
     return await ctx.asend_reply_msg(f"{notice}\n{image_cq}")
 
 
-# ================================ 查询与删除语录 ================================ #
+# ================================ 查询与管理语录 ================================ #
 
 async def _handle_query_sayings(ctx: HandlerContext):
     mentioned_ids = []
@@ -1551,11 +1576,20 @@ async def _handle_delete_saying(ctx: HandlerContext):
         raise ReplyException(str(error))
     if deleted is None:
         raise ReplyException("这条语录已被删除")
-    _, cleanup_error = deleted
-    if cleanup_error is not None:
-        logger.error(f"删除语录 #{number} 后清理图片失败: {cleanup_error}")
-        return await ctx.asend_reply_msg(f"已删除本群语录 #{number}，但图片文件清理失败，请联系管理员")
     return await ctx.asend_reply_msg(f"已删除本群语录 #{number}")
+
+
+async def _handle_restore_saying(ctx: HandlerContext):
+    try:
+        number = parse_saying_number(ctx.get_args())
+    except ValueError as error:
+        raise ReplyException(str(error).replace('/语录 12', '/恢复语录 12'))
+    restored = await saying_store.restore(ctx.group_id, number)
+    if restored is None:
+        raise ReplyException("本群没有这条语录")
+    if not restored:
+        return await ctx.asend_reply_msg(f"本群语录 #{number} 未被删除")
+    return await ctx.asend_reply_msg(f"已恢复本群语录 #{number}")
 
 # ================================ 命令注册 ================================ #
 
@@ -1573,4 +1607,7 @@ def register_sayings(shared_config, shared_logger, shared_cd, shared_gbl):
         matcher = CmdHandler(aliases, logger)
         matcher.check_cdrate(shared_cd).check_wblist(shared_gbl).check_group()
         matcher.handle()(handler)
+    restore = CmdHandler(['/恢复语录'], logger)
+    restore.check_superuser().check_cdrate(shared_cd).check_wblist(shared_gbl).check_group()
+    restore.handle()(_handle_restore_saying)
     on_shutdown()(_close_saying_store)
