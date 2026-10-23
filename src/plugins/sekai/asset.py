@@ -1388,6 +1388,7 @@ class RegionRipAssetManger:
         timeout: Union[int, ConfigItem]=DEFAULT_GET_RIP_ASSET_TIMEOUT_CFG,
         use_img_cache: bool=False,
         img_cache_max_res: Union[int, ConfigItem]=RIP_IMG_CACHE_MAX_RES_CFG,
+        decode_in_pool: bool=False,
     ) -> Image.Image:
         """
         获取图片类型解包资源，参数：
@@ -1399,13 +1400,14 @@ class RegionRipAssetManger:
         - `timeout`: 超时时间
         - `use_img_cache`: 是否使用图片缓存
         - `img_cache_max_res`: 图片缓存最大分辨率，None则不缩放
+        - `decode_in_pool`: 在线程池中解码图片，减少大图解码占用事件循环的时间
         """
         # 尝试从图片缓存加载
         if use_img_cache and path in self.cached_images:
             return self.cached_images[path]
         data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs, get_cfg_or_value(timeout))
         try: 
-            img = open_image(io.BytesIO(data))
+            img = await run_in_pool(open_image, io.BytesIO(data)) if decode_in_pool else open_image(io.BytesIO(data))
             if use_img_cache:
                 if img_cache_max_res:
                     max_res = parse_cfg_num(get_cfg_or_value(img_cache_max_res))
@@ -1421,6 +1423,8 @@ class RegionRipAssetManger:
                     self._img_cache_map[img_hash] = img
                 self.cached_images[path] = img
             return img
+        except asyncio.CancelledError:
+            raise
         except: pass
         if not allow_error:
             raise Exception(f"解析下载的 {self.region} 解包资源 {path} 为图片失败")

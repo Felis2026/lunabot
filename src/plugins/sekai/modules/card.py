@@ -326,15 +326,18 @@ async def compose_card_list_image(ctx: SekaiHandlerContext, cards: List[Dict], q
     add_watermark(canvas)
     return await canvas.get_img()
 
-# 获取卡面图片
-async def get_card_image(ctx: SekaiHandlerContext, cid_or_card: int, after_training: bool, allow_error: bool = True) -> Image.Image:
+async def get_card_image(ctx: SekaiHandlerContext, cid_or_card: int, after_training: bool, allow_error: bool = True, *, decode_in_pool: bool = False) -> Image.Image:
+    """获取普通或特训卡面，decode_in_pool=True 时在线程池解码。"""
     image_type = "after_training" if after_training else "normal"
     if isinstance(cid_or_card, int):
         card = await ctx.md.cards.find_by_id(cid_or_card)
         if not card: raise Exception(f"找不到ID为{cid_or_card}的卡牌") 
     else:
         card = cid_or_card
-    return await ctx.rip.img(f"character/member/{card['assetbundleName']}_rip/card_{image_type}.png", timeout=30, allow_error=allow_error)
+    options = dict(timeout=30, allow_error=allow_error)
+    if decode_in_pool:
+        options['decode_in_pool'] = True
+    return await ctx.rip.img(f"character/member/{card['assetbundleName']}_rip/card_{image_type}.png", **options)
 
 # 获取卡面立绘图片
 async def get_card_cutout_image(ctx: SekaiHandlerContext, cid: int, after_training: bool, allow_error: bool = True) -> str:

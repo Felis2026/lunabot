@@ -15,7 +15,7 @@ from .profile import (
     get_player_bind_id, get_basic_profile, get_detailed_profile,
     get_detailed_profile_card, get_detailed_profile_card_filter,
     get_player_avatar_info_by_detailed_profile, get_player_avatar_info_by_basic_profile,
-    PlayerAvatarInfo,
+    get_player_frames, get_selected_custom_avatar_frame, PlayerAvatarInfo,
 )
 from .mysekai import (
     get_mysekai_info, get_mysekai_info_card, get_mysekai_and_detail_profile_card,
@@ -27,6 +27,12 @@ from .mysekai import (
 # 浇水基础积分为每个露滴 100，生日卡 rate 与其相加；每朵门槛仍从本期表读取。
 BIRTHDAY_DELIVERY_BASE_POINT = 100
 BIRTHDAY_REWARD_PURPOSE = 'birthday_party_delivery_total_reward'
+BIRTHDAY_PREPARE_CONCURRENCY = 4
+BIRTHDAY_RESOURCE_TABLES = dict(
+    material='materials', boost_item='boostItems', practice_ticket='practiceTickets',
+    skill_practice_ticket='skillPracticeTickets', mysekai_material='mysekaiMaterials',
+    mysekai_item='mysekaiItems', gacha_ticket='gachaTickets',
+)
 
 
 def _birthday_style(size=18, bold=False, color=(25, 25, 25, 255)):
@@ -292,10 +298,22 @@ async def _birthday_account(ctx: SekaiHandlerContext, uid: str | None):
 
 # ================================ 账号与活动规则并行准备 ================================ #
 
+async def _birthday_gather(*coroutines):
+    """并行准备相互独立的数据，失败或取消时回收本组剩余任务。"""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def _birthday_rules(ctx: SekaiHandlerContext, party: dict):
-    """按原顺序读取奖励与积分规则，返回奖励、卡牌加成和花朵门槛表。"""
-    rewards = await _birthday_rewards(ctx, party)
-    bonus_rows, delivery_rows = await asyncio.gather(
+    """并行读取奖励、卡牌加成和花朵门槛表。"""
+    rewards, bonus_rows, delivery_rows = await asyncio.gather(
+        _birthday_rewards(ctx, party),
         _birthday_table(ctx, 'birthdayPartyDeliveryPointBonuses'),
         _birthday_table(ctx, 'birthdayPartyDeliveryRewards'),
     )
@@ -304,19 +322,41 @@ async def _birthday_rules(ctx: SekaiHandlerContext, party: dict):
 
 async def _birthday_prepare(ctx: SekaiHandlerContext, uid: str | None, party: dict, rules_ctx=None):
     """并行准备账号和规则；失败或取消时回收两条分支，保留原始异常。"""
-    tasks = [asyncio.create_task(_birthday_account(ctx, uid)), asyncio.create_task(_birthday_rules(rules_ctx or ctx, party))]
-    try:
-        account, rules = await asyncio.gather(*tasks)
-        return (*account, *rules)
-    except BaseException:
-        # gather 的单个分支失败不会自动取消另一分支，须显式回收剩余任务。
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    account, rules = await _birthday_gather(_birthday_account(ctx, uid), _birthday_rules(rules_ctx or ctx, party))
+    return (*account, *rules)
 
 
 # ================================ 资源读取与请求内复用 ================================ #
+
+async def _birthday_prepare_tables(data, material_ctx):
+    """并发准备本页实际使用的表，后续资源读取继续使用原缓存和回退规则。"""
+    ctx, rewards = data['ctx'], data['rewards']
+    contexts = {ctx.region: ctx, material_ctx.region: material_ctx}
+    requests = {(material_ctx.region, 'mysekaiMaterials')}
+    honor_ctx = rewards['ctx'] if data.get('reference') else ctx
+    for row in rewards['rows']:
+        if row['requirement'] > data['state']['target']:
+            continue
+        for item in rewards['boxes'][row['resourceBoxId']]['details']:
+            kind = item['resourceType']
+            if kind == 'honor':
+                contexts[honor_ctx.region] = honor_ctx
+                requests.update((honor_ctx.region, name) for name in ('honors', 'honorGroups'))
+            elif table := BIRTHDAY_RESOURCE_TABLES.get(kind):
+                requests.add((ctx.region, table))
+    if data['suite'] or data['capture']:
+        frames = get_player_frames(ctx, data['uid'], data['suite'])
+        if any(frame.get('playerFrameAttachStatus') == 'first' for frame in frames) and not get_selected_custom_avatar_frame(ctx.region, data['uid']):
+            requests.update((ctx.region, name) for name in ('playerFrames', 'playerFrameGroups'))
+    # 限制单次查询的预备请求数，组件仍按原顺序创建，避免异步任务交错进入绘图容器。
+    limiter = asyncio.Semaphore(BIRTHDAY_PREPARE_CONCURRENCY)
+
+    async def prepare(region, name):
+        async with limiter:
+            await _birthday_table(contexts[region], name)
+
+    await asyncio.gather(*(prepare(region, name) for region, name in sorted(requests)))
+
 
 class _BirthdayRipView:
     """称号合成沿用原函数，缺图时按相同资源路径补查 JP，失败保留文字档位。"""
@@ -387,11 +427,8 @@ async def _birthday_resource(data, kind, resource_id):
     key = (kind, resource_id)
     if key in data['resources']:
         return data['resources'][key]
-    tables = dict(material='materials', boost_item='boostItems', practice_ticket='practiceTickets',
-                  skill_practice_ticket='skillPracticeTickets', mysekai_material='mysekaiMaterials',
-                  mysekai_item='mysekaiItems', gacha_ticket='gachaTickets')
     ctx = data['ctx']
-    table = tables.get(kind)
+    table = BIRTHDAY_RESOURCE_TABLES.get(kind)
     row = {}
     contexts = [ctx]
     if data['rewards']['ctx'].region != ctx.region:
@@ -817,9 +854,14 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
     """通过原账号、MasterData 和资源层准备数据，绘制完整生日浇水页面。"""
     uid = await get_player_bind_id(ctx, check_bind=False)
     now = int(datetime.now().timestamp() * 1000)
-    parties = await _birthday_table(ctx, 'birthdayParties') or []
+    parties, unit_rows, all_cards = await _birthday_gather(
+        _birthday_table(ctx, 'birthdayParties'),
+        ctx.md.game_character_units.get(),
+        ctx.md.cards.get(),
+    )
+    parties = parties or []
     # 活动关联单元ID，卡牌与昵称使用角色ID；虚拟歌手的两种编号并不相同。
-    units = {row['id']: row for row in await ctx.md.game_character_units.get()}
+    units = {row['id']: row for row in unit_rows}
     party = _select_birthday_party(parties, cid, now, {key: row['gameCharacterId'] for key, row in units.items()})
     cid = units[party['gameCharacterUnitId']]['gameCharacterId'] if party else cid or min(range(1, 27), key=lambda value: get_character_next_birthday_dt(ctx.region, value))
     rules_ctx, reference, reference_schedule = ctx, False, None
@@ -828,15 +870,19 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
         if matched is not None:
             rules_ctx, party, reference_schedule = matched
             reference = True
-    cards = [row for row in await ctx.md.cards.get() if row['characterId'] == cid and row['cardRarityType'] == 'rarity_birthday']
+    cards = [row for row in all_cards if row['characterId'] == cid and row['cardRarityType'] == 'rarity_birthday']
     assert_and_reply(cards, '暂无该角色的生日卡数据')
-    background = await get_card_image(ctx, random.choice(cards), False)
+    background_card = random.choice(cards)
     unit = units[party['gameCharacterUnitId']] if party and not reference else next(row for row in units.values() if row['gameCharacterId'] == cid)
     data = dict(ctx=ctx, uid=uid, cid=cid, party=party, now=now, color=color_code_to_rgb(unit['colorCode']),
                 suite=None, capture=None, basic=None, avatar=None, images={}, resources={}, metadata={},
                 reference=reference, reference_schedule=reference_schedule)
     if party:
-        suite, capture, basic, avatar, rewards, bonus_rows, delivery_rows = await _birthday_prepare(ctx, uid, party, rules_ctx)
+        prepared, background = await _birthday_gather(
+            _birthday_prepare(ctx, uid, party, rules_ctx),
+            get_card_image(ctx, background_card, False, decode_in_pool=True),
+        )
+        suite, capture, basic, avatar, rewards, bonus_rows, delivery_rows = prepared
         if reference:
             rewards = {**rewards, 'preview': True, 'peer': rules_ctx}
         bonuses = [row for row in bonus_rows or [] if row['birthdayPartyId'] == party['id']]
@@ -851,11 +897,14 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
         data.update(suite=suite, capture=capture, basic=basic, avatar=avatar, rewards=rewards, state=state, prestart=prestart)
         # 整期参考使用日服规则素材，避免逐次请求尚未实装的国服资源。
         material_ctx = rules_ctx if reference else ctx
+        await _birthday_prepare_tables(data, material_ctx)
         material = next((row for row in await _birthday_table(material_ctx, 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
         if material is None and ctx.region == 'cn' and not reference:
             material = next((row for row in await _birthday_table(SekaiHandlerContext.from_region('jp'), 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
         data['flower'] = await _birthday_icon(data, material_ctx, f"mysekai/thumbnail/material/{material['iconAssetbundleName']}.png") if material else UNKNOWN_IMG
         dew = await _birthday_icon(data, material_ctx, f"thumbnail/material_rip/material{party['deliveryItemMaterialId']}.png")
+    else:
+        background = await get_card_image(ctx, background_card, False, decode_in_pool=True)
     with Canvas(bg=ImageBg(background)).set_padding(20) as canvas:
         with VSplit().set_w(1072).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_item_align('l'):
             with HSplit().set_sep(16).set_item_align('lt'):
