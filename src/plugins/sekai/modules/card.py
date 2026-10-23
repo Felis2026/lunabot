@@ -1249,7 +1249,7 @@ async def compose_card_detail_image(ctx: SekaiHandlerContext, card_id: int):
 
                     # 提示
                     with VSplit().set_padding(12).set_sep(6).set_content_align('l').set_item_align('l'):
-                        TextBox(f"发送\"/查卡面 {card_id}\"获取卡面原图, 发送\"/卡面剧情 {card_id}\"获取AI剧情总结", tip_style)
+                        TextBox(f"发送“/查卡面 {card_id}”获取卡面原图, 发送“/卡面剧情 {card_id}”获取AI剧情总结", tip_style)
 
     add_watermark(canvas)
     return await canvas.get_img()

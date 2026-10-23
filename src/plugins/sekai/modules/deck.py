@@ -4039,7 +4039,7 @@ async def compose_deck_recommend_image(
                         alg_and_cost_text += f"{alg.upper()}-{RECOMMEND_ALG_NAMES[alg]} (等待{tt(wait_times[alg])}/耗时{tt(cost_times[alg])}) + "
                     alg_and_cost_text = alg_and_cost_text[:-3]
                     TextBox(alg_and_cost_text, tip_style)
-                    TextBox(f"若发现组卡漏掉最优解可指定固定卡牌再尝试，发送\"{ctx.original_trigger_cmd}help\"获取详细帮助", tip_style)
+                    TextBox(f"若发现组卡漏掉最优解可指定固定卡牌再尝试，发送“{ctx.original_trigger_cmd}help”获取详细帮助", tip_style)
 
     add_watermark(canvas)
 

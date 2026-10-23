@@ -214,10 +214,10 @@ async def compose_score_control_image(ctx: SekaiHandlerContext, target_point: in
                 TextBox(f"2.单人游玩歌曲到对应分数范围内放置", style1)
                 TextBox(f"友情提醒：控分前请核对加成和体力设置", style3)
                 TextBox(f"特别注意核对加成不能有小数", style3)
-                TextBox(f'若有上传抓包可用"/控分组卡"加速配队', style1)
+                TextBox(f'若有上传抓包可用“/控分组卡”加速配队', style1)
                 if target_point <= 120:
                     TextBox(f"由于待控PT太小，候选项目较少", style3)
-                    TextBox(f"可使用\"/自定义房间控分\"获取更多控分方法", style3)
+                    TextBox(f"可使用“/自定义房间控分”获取更多控分方法", style3)
             
             # 数据
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_omit_parent_bg(True).set_item_bg(roundrect_bg()) as data_hs:
@@ -323,7 +323,7 @@ async def compose_custom_room_score_control_image(ctx: SekaiHandlerContext, targ
 4. 选择该歌曲（任意难度），两个人均放置整首歌
 """.strip(), style2, use_real_line_count=True)
                 TextBox(f"""
-若有上传Suite抓包，使用"/控分组卡"可以更快配出队伍
+若有上传Suite抓包，使用“/控分组卡”可以更快配出队伍
 可用同PT系数的歌曲替代表中歌曲
 数据来自x@SYLVIA0x0，目前验证不足仅供参考
 """.strip(), style2, use_real_line_count=True)
@@ -605,7 +605,7 @@ async def compose_music_board_image(
             title = f"{live_text}歌曲排行  -  {target_text} {order_text}  -  数据与公式来自33Kit  -  第{page}页/共{page_num}页\n"
             if texts:
                 title += texts + "\n"
-            title += f"发送\"/歌曲排行help\"查看如何修改比较依据以及自定义参数"
+            title += f"发送“/歌曲排行help”查看如何修改比较依据以及自定义参数"
             TextBox(title, title_style, use_real_line_count=True)
 
             # 表格
@@ -976,4 +976,3 @@ async def _(ctx: SekaiHandlerContext):
         )
     )
 
-    

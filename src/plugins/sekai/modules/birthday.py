@@ -651,7 +651,7 @@ def _draw_birthday_requirement(data, dew):
                 need = math.ceil(state['target'] * state['threshold'] / state['per_dew'])
                 note = f"*未获取到生日进度，从零获得 {state['target']} 朵共需 {need:,} 个露滴"
             elif state['target'] is None and state['threshold']:
-                note = f"*最高奖励目标暂未公布，可指定花朵目标，例如 /生日浇水 {get_character_first_nickname(data['cid'])} 目标25"
+                note = f"*最高奖励目标暂未公布，可指定花朵目标，例如“/生日浇水 {get_character_first_nickname(data['cid'])} 目标25”"
             elif state['threshold'] is None:
                 note = '*本期浇水积分规则暂未公布，暂无法计算露滴需求'
         elif state['upper_bound']:
@@ -758,15 +758,11 @@ def _birthday_footer_content(data, honors):
 
 
 def _draw_birthday_footer(data, honors):
-    """绘制目标查询引导，使用与正文一致的字号。"""
+    """在独立面板中绘制目标查询引导。"""
     if content := _birthday_footer_content(data, honors):
         command, description = content
-        Spacer(w=1004, h=1).set_bg(FillBg((150, 170, 185, 255)))
-        with HSplit().set_sep(8).set_item_align('c'):
-            TextBox('发送', _birthday_style(21))
-            make_deck_info_label(command, size=21).set_padding((6, 4)).set_bg(
-                RoundRectBg((255, 255, 255, 150), 2))
-            TextBox(description, _birthday_style(21))
+        with HSplit().set_w(1040).set_padding(16).set_item_align('c').set_content_align('l').set_bg(roundrect_bg()):
+            TextBox(f'发送“{command}”{description}', _birthday_style(22, color=BLACK))
 
 
 async def _draw_birthday_rewards(data):
@@ -819,9 +815,8 @@ async def _draw_birthday_rewards(data):
                                 TextBox(name, _birthday_style(name_size), use_real_line_count=True).set_w(160).set_h(32).set_content_align('l')
                                 TextBox(f'{current:,}/{total:,}' if current is not None else f'未知/{total:,}', _birthday_style(20, True, (50, 150, 50) if current == total else (25, 25, 25)))
                                 _draw_birthday_reward_track(current, total, data['color'])
-        if not honors:
-            _draw_birthday_footer(data, honors)
     if not honors:
+        _draw_birthday_footer(data, honors)
         return
     with VSplit().set_w(1040).set_padding(18).set_sep(16).set_bg(roundrect_bg()).set_item_align('l'):
         TextBox('生日称号', _birthday_style(21, True))
@@ -845,7 +840,7 @@ async def _draw_birthday_rewards(data):
                                 status = TextBox(label, _birthday_style(20, color=(50, 150, 50) if unlocked else (125, 125, 125) if state['count'] is None else (25, 25, 25)))
                                 status.set_padding((8, 4)).set_bg(RoundRectBg((50, 150, 50, 50) if unlocked else (80, 105, 130, 65), 5))
                             icon.set_size((status._get_self_size()[1], status._get_self_size()[1]))
-        _draw_birthday_footer(data, honors)
+    _draw_birthday_footer(data, honors)
 
 
 # ================================ 页面准备与命令入口 ================================ #

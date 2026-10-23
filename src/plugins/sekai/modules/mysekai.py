@@ -1750,14 +1750,9 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
 
             # ================================ CN普通查询预览指引 ================================ #
             if ctx.region == 'cn' and not preview:
-                guide_text = "可使用 /msg 预览  查看后续等级材料"
-                guide_style = TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=BLACK)
-                if profile:
-                    guide_column = next(item for item in header.items[0].items if isinstance(item, VSplit))
-                    with guide_column:
-                        TextBox(guide_text, guide_style)
-                else:
-                    TextBox(guide_text, guide_style).set_bg(roundrect_bg()).set_padding(16)
+                guide_text = "可使用“/msg 预览”查看后续等级材料"
+                guide_style = TextStyle(font=DEFAULT_FONT, size=18, color=BLACK)
+                TextBox(guide_text, guide_style).set_bg(roundrect_bg()).set_padding(16)
 
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_bg(roundrect_bg()).set_padding(8):
                 for gid, lv_materials in gate_materials.items():

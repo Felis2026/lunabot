@@ -326,10 +326,8 @@ async def _(ctx: SekaiHandlerContext):
                         TextBox(f"{month}/{day}", TextStyle(DEFAULT_FONT, 14, (50, 50, 80)))
 
             if is_fifth_anniv and ctx.region in ('cn', 'jp'):
-                with HSplit().set_w(card_panel_width).set_sep(8).set_padding(16).set_item_align('c').set_content_align('l'):
-                    TextBox('发送', TextStyle(DEFAULT_FONT, 22, BLACK))
-                    TextBox(f'/生日浇水 {get_character_first_nickname(cid)}', TextStyle(DEFAULT_FONT, 22, (20, 85, 155)))
-                    TextBox('查看露滴需求和奖励进度', TextStyle(DEFAULT_FONT, 22, BLACK))
+                with HSplit().set_w(card_panel_width).set_padding(16).set_item_align('c').set_content_align('l'):
+                    TextBox(f'发送“/生日浇水 {get_character_first_nickname(cid)}”查看露滴需求和奖励进度', TextStyle(DEFAULT_FONT, 22, BLACK))
 
     add_watermark(canvas)
 

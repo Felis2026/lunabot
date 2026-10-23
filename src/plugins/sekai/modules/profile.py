@@ -2194,8 +2194,8 @@ async def compose_custom_avatar_frame_list(ctx: SekaiHandlerContext, uid: str | 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_sep(8).set_item_align('l').set_bg(roundrect_bg()).set_padding(8):
             TextBox(
-                "选择头像框：/设置头像框 编号\n"
-                "恢复游戏内头像框：/清除头像框\n"
+                "选择头像框：“/设置头像框 编号”\n"
+                "恢复游戏内头像框：“/清除头像框”\n"
                 "绿色编号表示正在使用的头像框",
                 TextStyle(font=DEFAULT_FONT, size=20, color=BLACK), use_real_line_count=True,
             ).set_padding(16).set_bg(roundrect_bg())
