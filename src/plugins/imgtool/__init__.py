@@ -772,8 +772,17 @@ async def reverse_image_list(ctx: HandlerContext, reply=True):
     if reply:
         return await ctx.asend_reply_msg(f"翻转成功，当前列表有{current_count}张图片")
 
-# 获取多张图片
+_image_download_limit = asyncio.Semaphore(4)
+
+
+async def _download_operation_image(url):
+    """图片工具的下载共用四个额度，重试沿用 download_image 的策略。"""
+    async with _image_download_limit:
+        return await download_image(url)
+
+
 async def get_multi_images(ctx: HandlerContext) -> tuple[Image.Image | List[Image.Image], bool, List[str]]:
+    """按消息顺序下载图片，使用图片列表时返回待操作成功后消费的快照。"""
     max_num = MULTI_IMAGE_MAX_NUM_CFG.get()
     img_urls = await ctx.aget_image_urls(min_count=None, max_count=max_num)
     # 使用消息本身带有的图片，如果本身不带图片则使用图片列表
@@ -788,15 +797,22 @@ async def get_multi_images(ctx: HandlerContext) -> tuple[Image.Image | List[Imag
 """.strip())
         
     # 下载图片
-    imgs = []
-    for img_url in img_urls:
+    async def download(img_url):
         try:
-            img = await download_image(img_url)
+            return await _download_operation_image(img_url)
         except Exception as e:
-            logger.print_exc(f"获取图片 {img_url} 失败")
-            await ctx.asend_reply_msg(f"获取图片 {img_url} 失败")
-            raise NoReplyException()
-        imgs.append(img)
+            raise ImageOperationUnavailableError(img_url) from e
+
+    try:
+        imgs = []
+        # 每批完成后再开始下一批，首批失败时不会继续下载整条消息的剩余图片。
+        for start in range(0, len(img_urls), 4):
+            imgs.extend(await bounded_map(download, img_urls[start:start + 4], concurrency=4))
+    except ImageOperationUnavailableError as exc:
+        img_url = str(exc)
+        logger.print_exc(f"获取图片 {img_url} 失败")
+        await ctx.asend_reply_msg(f"获取图片 {img_url} 失败")
+        raise NoReplyException() from exc
 
     if len(imgs) == 1:
         return imgs[0], used_saved_list, list(img_urls) if used_saved_list else []
@@ -2046,25 +2062,32 @@ img_check.check_cdrate(cd).check_wblist(gbl)
 @img_check.handle()
 async def _(ctx: HandlerContext):
     data_list = await ctx.aget_image_datas()
-    msg = ""
-    for i, data in enumerate(data_list):
+    messages = await bounded_map(_get_operation_image_info, enumerate(data_list), concurrency=4)
+    return await ctx.asend_fold_msg_adaptive(''.join(messages).strip())
+
+
+async def _get_operation_image_info(entry):
+    """使用独立临时文件读取图片信息，工作线程结束后再清理文件。"""
+    index, data = entry
+    msg = f'\n\n【图片{index + 1}】'
+    url = data.get('url', '')
+    async with _image_download_limit:
         with TempFilePath('png') as path:
-            msg += f"\n\n【图片{i+1}】"
             try:
-                url = data['url']
                 await download_file(url, path)
-                img = Image.open(path)
-                width = img.width
-                height = img.height
+                def inspect():
+                    with Image.open(path) as img:
+                        return img.width, img.height, img.n_frames if is_animated(img) else None, img.info.get('duration', 0)
+                width, height, frames, duration = await run_in_pool_until_complete(inspect)
                 msg += f"\n分辨率: {width}x{height}"
 
-                if is_animated(img):
-                    msg += f"\n长度: {img.n_frames}帧"
-                    if not img.info.get('duration', 0):
+                if frames is not None:
+                    msg += f"\n长度: {frames}帧"
+                    if not duration:
                         msg += f"\n帧间隔/FPS: 未知"
                     else:
-                        msg += f"\n帧间隔: {img.info['duration']}ms"
-                        fps = 1000 / img.info['duration']
+                        msg += f"\n帧间隔: {duration}ms"
+                        fps = 1000 / duration
                         msg += f"\nFPS: {fps:.2f}"
 
                 if 'file_size' in data:
@@ -2082,7 +2105,7 @@ async def _(ctx: HandlerContext):
                 logger.print_exc(f"获取 {url} 图片信息失败")
                 msg += f"\n无法获取图片信息: {get_exc_desc(e)}"
 
-    return await ctx.asend_fold_msg_adaptive(msg.strip())
+    return msg
 
 
 # ================================ Markdown转图片 ================================ #

@@ -478,6 +478,42 @@ async def run_managed_subprocess(*arguments, process_key: str, timeout: float, *
             raise asyncio.CancelledError
 
 
+async def bounded_map(func, items, concurrency=4):
+    """有界处理输入并保序返回；失败或取消时等待本组任务完成收尾。"""
+    if concurrency < 1:
+        raise ValueError('并发数必须大于零')
+    items = list(items)
+    results = [None] * len(items)
+    pending = iter(enumerate(items))
+
+    async def worker():
+        for index, item in pending:
+            results[index] = await func(item)
+
+    tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(items)))]
+    group = asyncio.gather(*tasks)
+    try:
+        await asyncio.shield(group)
+    finally:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        cleanup = asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = False
+        # 已进入取消收尾的任务需要完成异步清理，重复取消会打断线程等待或文件清理。
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if group.done() and not group.cancelled():
+            group.exception()
+        if cancelled:
+            raise asyncio.CancelledError
+    return results
+
+
 async def run_in_pool(func, *args, pool=None):
     if pool is None:
         global _default_pool_executor
@@ -954,13 +990,16 @@ async def adump_json(data: dict, path: str):
     """
     return await run_in_pool(dump_json, data, path)
 
-async def download_json(url: str) -> dict:
+async def download_json(url: str, *, decode_in_pool: bool = False, timings: dict | None = None) -> dict:
     """
-    异步下载json文件
+    异步下载 JSON，decode_in_pool=True 时在线程解析响应。
+
+    timings 非空时写入下载、解析和线程等待秒数。
     """
     headers = {
         'Accept-Language': 'en',
     }
+    started = time.perf_counter()
     async with get_client_session().get(url, headers=headers, verify_ssl=False) as resp:
         if resp.status != 200:
             try:
@@ -970,6 +1009,26 @@ async def download_json(url: str) -> dict:
                 pass
             utils_logger.error(f"下载 {url} 失败: {resp.status} {detail}")
             raise HttpError(resp.status, detail)
+        if decode_in_pool:
+            if "text/plain" in resp.content_type:
+                payload = await resp.text()
+            elif "application/octet-stream" in resp.content_type:
+                payload = await resp.read()
+            else:
+                payload = await resp.json(loads=lambda value: value)
+            fetched = time.perf_counter()
+
+            def parse():
+                """在工作线程解析响应，单独记录解析与线程等待时间。"""
+                parse_started = time.perf_counter()
+                result = loads_json(payload)
+                return result, time.perf_counter() - parse_started
+
+            result, parse_seconds = await run_in_pool(parse)
+            if timings is not None:
+                timings.update(download=fetched-started, json_parse=parse_seconds,
+                               json_queue=max(0, time.perf_counter()-fetched-parse_seconds))
+            return result
         if "text/plain" in resp.content_type:
             return loads_json(await resp.text())
         if "application/octet-stream" in resp.content_type:

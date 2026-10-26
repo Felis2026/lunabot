@@ -2,6 +2,9 @@ from ..utils import *
 from .common import *
 import threading
 import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 asset_config = Config('sekai.asset')
 ASSET_DEBUG_CFG = asset_config.item('debug')
@@ -19,6 +22,50 @@ DEFAULT_SORT_KEYS = []
 # 连续失败后由后续访问触发重试，等待间隔依次为 30、120、300 秒，此后按 300 秒封顶。
 MASTERDATA_RETRY_SECONDS = (30, 120, 300)
 _masterdata_cache_metadata_lock = asyncio.Lock()
+ASSET_REQUEST_LIMIT = ContextVar('sekai_asset_request_limit', default=None)
+ASSET_PREPARE_TIMINGS = ContextVar('sekai_asset_prepare_timings', default=None)
+ASSET_RESOURCE_LIMIT = asyncio.Semaphore(4)
+ASSET_PREPARE_IN_POOL = ContextVar('sekai_asset_prepare_in_pool', default=False)
+
+
+@asynccontextmanager
+async def resource_prepare_scope():
+    """为纯资源准备共享下载额度，读取和解码使用现有线程池。"""
+    limit_token = ASSET_REQUEST_LIMIT.set(ASSET_RESOURCE_LIMIT)
+    pool_token = ASSET_PREPARE_IN_POOL.set(True)
+    try:
+        yield
+    finally:
+        ASSET_PREPARE_IN_POOL.reset(pool_token)
+        ASSET_REQUEST_LIMIT.reset(limit_token)
+
+
+async def prepare_assets(requests):
+    """执行按唯一键登记的资源工厂，返回同顺序结果；工厂中不能创建绘图组件。"""
+    keys = list(requests)
+    async with resource_prepare_scope():
+        results = await bounded_map(lambda key: requests[key](), keys, concurrency=4)
+    return dict(zip(keys, results))
+
+
+def record_asset_timing(stage, name, seconds):
+    """把实际工作任务的耗时加入所属卡池请求，其他等待者仅记录自己的等待总时长。"""
+    timings = ASSET_PREPARE_TIMINGS.get()
+    if timings is not None:
+        timings.append((stage, name, round(seconds, 4)))
+
+
+@asynccontextmanager
+async def asset_request_slot():
+    """按请求上下文限制实际下载，等待共享任务的调用者不重复占用额度。"""
+    limit = ASSET_REQUEST_LIMIT.get()
+    if limit is None:
+        yield
+    else:
+        started = time.perf_counter()
+        async with limit:
+            record_asset_timing('queue', 'request', time.perf_counter()-started)
+            yield
 
 # 运行期缓存：按区服缓存 costume3ds 资源名补丁，避免重复读取和重复生成。
 _costume3ds_asset_patch_cache: Dict[str, Dict[int, str]] = {}
@@ -112,11 +159,12 @@ def load_costume3ds_assetbundle_patch(
     region: str,
     region_costume3ds=None,
     region_version: str | None = None,
+    source_identity: str | None = None,
 ) -> Dict[int, str]:
     """加载或生成衣装资源名补丁，返回按区服共享的缓存映射。
 
-    传入候选数据时直接基于候选内容重建，JP 参照优先使用内存快照。
-    省略候选数据时，按数据版本、规则版本和来源身份复用内存或 sidecar 缓存。
+    已确认的文件候选按文件身份复用补丁，新下载的候选按自身内容重建。
+    JP 参照优先使用内存快照，已落盘快照使用文件身份支持跨重启复用。
     新补丁会尝试保存到 sidecar，保存失败时仍返回生成结果。
     """
     candidate_supplied = region_costume3ds is not None
@@ -126,28 +174,34 @@ def load_costume3ds_assetbundle_patch(
     jp_version = jp_snapshot[3] if jp_snapshot else get_masterdata_cache_version("jp", "costume3ds")
     # 候选转换先于原始表落盘，必须直接使用候选内容，不能回读上一版文件。
     # 内存参照用对象身份区分，磁盘参照用文件状态识别同版本号的内容替换。
-    def source_identity(source_region, data):
-        """以对象身份或文件大小和修改时间标识参照来源，文件缺失时返回 missing。"""
-        if data is not None:
-            return f"memory:{id(data)}"
+    def reference_identity(source_region, data):
+        """已确认的快照使用文件身份，尚未保存的快照使用内存身份。"""
         try:
             stat = os.stat(get_masterdata_cache_path(source_region, "costume3ds"))
+            if data is not None:
+                manager = MasterDataManager.get("costume3ds")
+                if (manager.file_version.get(source_region) != manager.version.get(source_region)
+                        or manager._file_signatures.get(source_region) != (stat.st_size, stat.st_mtime_ns)):
+                    return f"memory:{id(data)}"
             return f"file:{stat.st_size}:{stat.st_mtime_ns}"
         except OSError:
-            return "missing"
+            return f"memory:{id(data)}" if data is not None else "missing"
 
-    identities = (source_identity(region, region_costume3ds), source_identity("jp", jp_costume3ds))
+    region_identity = source_identity or (
+        f"candidate:{id(region_costume3ds)}" if candidate_supplied else reference_identity(region, None))
+    identities = (region_identity, reference_identity("jp", jp_costume3ds))
     current_meta = (region_version, jp_version, COSTUME3DS_ASSET_PATCH_VERSION, *identities)
+    reusable = not candidate_supplied or bool(source_identity and source_identity.startswith('file:'))
 
     # 复用补丁前核对来源身份与规则版本，避免同版本数据替换后继续使用旧结果。
     with _costume3ds_asset_patch_lock:
-        if not candidate_supplied and _costume3ds_asset_patch_meta.get(region) == current_meta:
+        if reusable and _costume3ds_asset_patch_meta.get(region) == current_meta:
             return _costume3ds_asset_patch_cache.get(region, {})
 
         patch_path = get_masterdata_patch_path(region, "costume3ds_assetbundle_patch")
         patch: Dict[int, str] | None = None
 
-        if not candidate_supplied and os.path.exists(patch_path):
+        if reusable and os.path.exists(patch_path):
             try:
                 patch_data = load_json(patch_path)
                 if (
@@ -167,6 +221,10 @@ def load_costume3ds_assetbundle_patch(
         if patch is None:
             patch = build_costume3ds_assetbundle_patch(region, region_costume3ds, jp_costume3ds)
             try:
+                if not reusable:
+                    _costume3ds_asset_patch_cache[region] = patch
+                    _costume3ds_asset_patch_meta[region] = current_meta
+                    return patch
                 dump_json({
                     "region_version": region_version,
                     "jp_version": jp_version,
@@ -182,9 +240,30 @@ def load_costume3ds_assetbundle_patch(
         _costume3ds_asset_patch_meta[region] = current_meta
         return patch
 
+def persist_costume3ds_assetbundle_patch(region, version, candidate_identity, signature):
+    """原始文件保存后，将对应候选补丁登记为可跨重启复用的文件补丁。"""
+    with _costume3ds_asset_patch_lock:
+        meta = _costume3ds_asset_patch_meta.get(region)
+        if not meta or meta[0] != version or meta[3] != candidate_identity:
+            return
+        identity = f'file:{signature[0]}:{signature[1]}'
+        meta = (*meta[:3], identity, meta[4])
+        try:
+            dump_json({
+                'region_version': meta[0], 'jp_version': meta[1], 'patch_version': meta[2],
+                'source_identities': list(meta[3:]),
+                'assetbundle_map': {str(identifier): name for identifier, name in
+                                    _costume3ds_asset_patch_cache.get(region, {}).items()},
+            }, get_masterdata_patch_path(region, 'costume3ds_assetbundle_patch'), indent=False)
+            _costume3ds_asset_patch_meta[region] = meta
+        except Exception as exc:
+            logger.warning(f'MasterData [{region}.costume3ds] 保存补丁缓存失败: {get_exc_desc(exc)}')
+
+
 def make_costume3ds_map_fn(region: str):
     """创建指定区服的衣装转换函数，转换时会原地修改记录并可能生成 sidecar。"""
-    def costume3ds_map_fn(costume3ds: List[Dict[str, Any]], *, version: str | None = None):
+    def costume3ds_map_fn(costume3ds: List[Dict[str, Any]], *, version: str | None = None,
+                         source_identity: str | None = None):
         """原地统一资源名字段并应用补丁，返回传入的衣装列表。"""
         # 先统一资源名字段，再按缺失和纯数字名称的数量判断是否需要补丁。
         normalized_count = 0
@@ -203,7 +282,7 @@ def make_costume3ds_map_fn(region: str):
         if missing_count == 0 and numeric_count == 0:
             return costume3ds
 
-        patch = load_costume3ds_assetbundle_patch(region, costume3ds, version)
+        patch = load_costume3ds_assetbundle_patch(region, costume3ds, version, source_identity)
         patched_count = 0
         numeric_patched_count = 0
         for item in costume3ds:
@@ -399,7 +478,7 @@ class MasterDataManager:
 
     # 候选数据准备与内存切换。
 
-    def _prepare_candidate(self, region: str, raw_data, version: str):
+    def _prepare_candidate(self, region: str, raw_data, version: str, source_identity: str | None = None):
         """转换候选数据并建立索引和排序结果，保持当前生效数据不变。
 
         返回 (转换后数据, 索引, 排序结果, 版本)，转换结果为 None 时抛出 ValueError。
@@ -410,7 +489,8 @@ class MasterDataManager:
             # 部分映射会原地修改记录；磁盘及待保存状态必须仍持有上游原始格式。
             data = deepcopy(raw_data)
             if self.name == "costume3ds" and region in COMPACT_DATA_REGIONS:
-                data = map_fn(data, version=version)
+                data = map_fn(data, version=version,
+                              source_identity=source_identity or f'candidate:{id(raw_data)}')
             else:
                 data = map_fn(data)
         if data is None:
@@ -449,11 +529,12 @@ class MasterDataManager:
             f"MasterData [{region}.{self.name}] {stage}失败，{delay}秒后允许重试: {get_exc_desc(exc)}"
         )
 
-    async def _load_from_cache(self, region: str):
+    async def _load_from_cache(self, region: str, minimum_version: str | None = None):
         """读取缓存并准备完整快照，发布内存数据和已就绪文件状态。
 
         文件凭据缺失或不匹配时仍加载缓存，但版本标为未确认。
-        后续来源检查可在同一次访问中触发重新下载。
+        指定 minimum_version 且文件落后时，只登记文件状态并返回 False，
+        由刷新流程优先准备新版；完成本地快照发布时返回 True。
         """
         cache_path = self.get_cache_path(region)
         versions = file_db.get_copy("master_data_cache_versions", {}).get(region, {})
@@ -462,24 +543,32 @@ class MasterDataManager:
         def load_candidate():
             """读取稳定的缓存文件，核对版本凭据并返回候选快照和文件签名。"""
             before = os.stat(cache_path)
-            raw_data = load_json(cache_path)
-            after = os.stat(cache_path)
-            signature = (after.st_size, after.st_mtime_ns)
-            if signature != (before.st_size, before.st_mtime_ns):
-                raise RuntimeError("MasterData 文件在读取期间发生变化")
+            signature = (before.st_size, before.st_mtime_ns)
             recorded_version = versions.get(self.name, DEFAULT_VERSION)
             confirmed = (
                 receipt.get("version") == recorded_version
                 and signature == (receipt.get("size"), receipt.get("mtime_ns"))
             )
             version = recorded_version if confirmed else DEFAULT_VERSION
-            return self._prepare_candidate(region, raw_data, version), signature
+            if minimum_version and get_version_order(version) < get_version_order(minimum_version):
+                return None, signature, version
+            raw_data = load_json(cache_path)
+            after = os.stat(cache_path)
+            if signature != (after.st_size, after.st_mtime_ns):
+                raise RuntimeError("MasterData 文件在读取期间发生变化")
+            identity = f'file:{signature[0]}:{signature[1]}'
+            return self._prepare_candidate(region, raw_data, version, identity), signature, version
 
-        snapshot, signature = await run_in_pool(load_candidate)
-        self._publish_candidate(region, snapshot)
-        self.file_version[region] = snapshot[3]
+        started = time.perf_counter()
+        snapshot, signature, file_version = await run_in_pool(load_candidate)
+        record_asset_timing('cache_load', f'{region}.{self.name}', time.perf_counter()-started)
+        self.file_version[region] = file_version
         self._file_signatures[region] = signature
+        if snapshot is None:
+            return False
+        self._publish_candidate(region, snapshot)
         logger.info(f"MasterData [{region}.{self.name}] 本地数据已加载，确认版本 {snapshot[3]}")
+        return True
 
     # 原始文件保存与版本确认。
 
@@ -493,6 +582,7 @@ class MasterDataManager:
         if pending is None or not self._retry_allowed(region, "保存", pending["version"]):
             return
         version = pending["version"]
+        started = time.perf_counter()
         try:
             if pending["raw_data"] is not None:
                 def save_raw():
@@ -506,6 +596,9 @@ class MasterDataManager:
                 self.file_version[region] = version
                 self._file_signatures[region] = signature
                 pending["signature"] = signature
+                if self.name == 'costume3ds' and region in COMPACT_DATA_REGIONS:
+                    await run_in_pool(persist_costume3ds_assetbundle_patch, region, version,
+                                      f"candidate:{id(pending['raw_data'])}", signature)
                 pending["raw_data"] = None
 
             # 不同表同时完成下载时必须合并最新登记，避免整份版本字典相互覆盖。
@@ -524,6 +617,7 @@ class MasterDataManager:
             self._pending_cache.pop(region, None)
             self._retry_state.pop((region, "保存"), None)
             logger.info(f"MasterData [{region}.{self.name}] 文件与版本已保存: {version}")
+            record_asset_timing('save', f'{region}.{self.name}', time.perf_counter()-started)
         except Exception as exc:
             self._record_failure(region, "保存", version, exc)
 
@@ -535,9 +629,16 @@ class MasterDataManager:
         url = f"{base_url}{self.name}.json"
         download_fn = self.download_fn.get('all', self.download_fn.get(region))
         timeout = asset_config.get('default_masterdata_download_timeout')
-        request = download_fn(base_url) if download_fn else download_json(url)
-        raw_data = await asyncio.wait_for(request, timeout)
+        timings = {}
+        async with asset_request_slot():
+            request = (download_fn(base_url) if download_fn else
+                       download_json(url, decode_in_pool=True, timings=timings))
+            raw_data = await asyncio.wait_for(request, timeout)
+        for stage, seconds in timings.items():
+            record_asset_timing(stage, f'{region}.{self.name}', seconds)
+        prepared = time.perf_counter()
         snapshot = await run_in_pool(self._prepare_candidate, region, raw_data, version)
+        record_asset_timing('prepare', f'{region}.{self.name}', time.perf_counter()-prepared)
         self._publish_candidate(region, snapshot)
         self._pending_cache[region] = {"version": version, "raw_data": raw_data}
         self._retry_state.pop((region, "更新"), None)
@@ -566,18 +667,21 @@ class MasterDataManager:
         更新失败时继续提供已有内存数据，无可用数据时抛出异常。
         """
         async with self.lock:
-            if region not in self._cache_checked:
-                self._cache_checked.add(region)
-                try:
-                    await self._load_from_cache(region)
-                except Exception as exc:
-                    logger.warning(f"MasterData [{region}.{self.name}] 本地缓存加载失败: {get_exc_desc(exc)}")
             if source is None and self._retry_allowed(region, "版本检查", DEFAULT_VERSION):
                 try:
                     source = await RegionMasterDbManager.get(region).get_latest_source()
                     self._retry_state.pop((region, "版本检查"), None)
                 except Exception as exc:
                     self._record_failure(region, "版本检查", DEFAULT_VERSION, exc)
+            cache_deferred = False
+            if region not in self._cache_checked:
+                self._cache_checked.add(region)
+                minimum = (str(source.version) if source is not None and
+                           self._retry_allowed(region, '更新', str(source.version)) else None)
+                try:
+                    cache_deferred = not await self._load_from_cache(region, minimum)
+                except Exception as exc:
+                    logger.warning(f"MasterData [{region}.{self.name}] 本地缓存加载失败: {get_exc_desc(exc)}")
             if source is not None:
                 version = str(source.version)
                 outdated = get_version_order(self.version.get(region, DEFAULT_VERSION)) < get_version_order(version)
@@ -586,6 +690,11 @@ class MasterDataManager:
                         await self._download_from_db(region, source)
                     except Exception as exc:
                         self._record_failure(region, "更新", version, exc)
+            if cache_deferred and region not in self.data:
+                try:
+                    await self._load_from_cache(region)
+                except Exception as exc:
+                    logger.warning(f"MasterData [{region}.{self.name}] 本地缓存回退失败: {get_exc_desc(exc)}")
             await self._persist_pending_cache(region)
             if self.data.get(region) is None:
                 raise Exception(f"获取 MasterData [{region}.{self.name}] 的数据失败")
@@ -990,8 +1099,12 @@ def convert_compact_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 async def resource_boxes_download_fn(base_url):
     # resbox = await download_json(f"{base_url}/compactResourceBoxes.json")
     # resbox_detail = await download_json(f"{base_url}/compactResourceBoxDetails.json")
-    resbox = await download_json(f"{base_url}/resourceBoxes.json")
-    resbox_detail = await download_json(f"{base_url}/resourceBoxDetails.json")
+    box_timings, detail_timings = {}, {}
+    resbox = await download_json(f"{base_url}/resourceBoxes.json", decode_in_pool=True, timings=box_timings)
+    resbox_detail = await download_json(f"{base_url}/resourceBoxDetails.json", decode_in_pool=True, timings=detail_timings)
+    for name, timings in (('resourceBoxes', box_timings), ('resourceBoxDetails', detail_timings)):
+        for stage, seconds in timings.items():
+            record_asset_timing(stage, name, seconds)
     def convert(resbox, resbox_detail):
         # resbox = convert_compact_data(resbox)
         # resbox_detail = convert_compact_data(resbox_detail)
@@ -1177,6 +1290,10 @@ class RegionRipAssetSource:
             self.url_map_method = DEFAULT_URL_MAP_METHODS[self.name]
         self.prefixes = prefixes
 
+class AssetNotFoundError(HttpError):
+    """所有适用资源源均明确返回 404 时抛出的资源缺失异常。"""
+
+
 class RegionRipAssetManger:
     """
     区服解包资源管理器
@@ -1190,6 +1307,8 @@ class RegionRipAssetManger:
         self.sources = sources
         self.cache_dir = pjoin(DEFAULT_RIP_ASSET_DIR, region)
         self.cached_images: Dict[str, Image.Image] = {}
+        self._asset_requests: dict[tuple, asyncio.Task] = {}
+        self._missing_assets = OrderedDict()
         create_folder(self.cache_dir)
 
     def _iter_local_cache_paths(self, path: str) -> List[str]:
@@ -1251,14 +1370,100 @@ class RegionRipAssetManger:
         async def do_download():
             async with get_client_session().get(url, verify_ssl=False) as resp:
                 if resp.status != 200:
-                    raise Exception(f"请求失败: {resp.status}")
+                    raise HttpError(resp.status, '请求失败')
                 return await resp.read()
-        if not timeout:
-            return await do_download()
-        else:
-            return await asyncio.wait_for(do_download(), timeout)
+        async with asset_request_slot():
+            started = time.perf_counter()
+            if not timeout:
+                data = await do_download()
+            else:
+                data = await asyncio.wait_for(do_download(), timeout)
+            record_asset_timing('image_download', self.region, time.perf_counter()-started)
+            return data
 
     async def get_asset(
+        self, path: str, use_cache=True, allow_error=True, default=None,
+        cache_expire_secs=None, timeout=DEFAULT_GET_RIP_ASSET_TIMEOUT_CFG,
+        *, read_in_pool=False, cache_missing_secs=0,
+    ) -> bytes:
+        """读取资源；可选图片可合并下载并短期缓存明确的全源 404。
+
+        cache_missing_secs 大于零时启用共享请求。等待者取消不终止下载，
+        use_cache=False 绕过缺失记录以支持强制刷新。
+        """
+        if (not cache_missing_secs and ASSET_REQUEST_LIMIT.get() is None) or not use_cache:
+            return await self._get_asset(path, use_cache, allow_error, default,
+                                         cache_expire_secs, timeout, read_in_pool=read_in_pool)
+        started = time.perf_counter()
+        cached = (await run_in_pool_until_complete(self._read_cached_asset, path, cache_expire_secs) if read_in_pool
+                  else self._read_cached_asset(path, cache_expire_secs))
+        if read_in_pool:
+            record_asset_timing('image_read', path, time.perf_counter()-started)
+        if cached is not None:
+            return cached
+        sources = tuple((source.base_url.rstrip('/'), tuple(source.prefixes or ()), id(source.url_map_method))
+                        for source in self.sources)
+        key = (path, sources, get_cfg_or_value(timeout), cache_expire_secs)
+        expires = self._missing_assets.get(key, 0)
+        if expires > time.monotonic():
+            if not allow_error:
+                raise AssetNotFoundError(404, f'资源暂不存在: {path}')
+            return default
+        self._missing_assets.pop(key, None)
+        task = self._asset_requests.get(key)
+        if task is None:
+            task = asyncio.create_task(self._get_asset(
+                path, use_cache, False, None, cache_expire_secs, timeout,
+                read_in_pool=read_in_pool, track_missing=True))
+            self._asset_requests[key] = task
+
+            def finish(completed):
+                """下载实际结束后释放共享任务，仅将全源 404 登记为短期缺失。"""
+                if self._asset_requests.get(key) is completed:
+                    self._asset_requests.pop(key, None)
+                if (not completed.cancelled() and isinstance(completed.exception(), AssetNotFoundError)
+                        and cache_missing_secs):
+                    self._missing_assets[key] = time.monotonic() + cache_missing_secs
+                    self._missing_assets.move_to_end(key)
+                    # 只保留最近 512 个缺失键，避免查询大量旧卡池后持续增长。
+                    while len(self._missing_assets) > 512:
+                        self._missing_assets.popitem(last=False)
+
+            task.add_done_callback(finish)
+        try:
+            return await asyncio.shield(task)
+        except Exception:
+            if not allow_error:
+                raise
+            return default
+
+    def _read_cached_asset(self, path, cache_expire_secs):
+        """读取已存在且未过期的本地资源，未命中时返回 None。"""
+        for relative in self._iter_local_cache_paths(path):
+            cache_path = pjoin(self.cache_dir, relative)
+            try:
+                if (cache_expire_secs is not None and
+                        time.time() - os.path.getmtime(cache_path) >= cache_expire_secs):
+                    continue
+                with open(cache_path, 'rb') as stream:
+                    return stream.read()
+            except OSError:
+                continue
+        return None
+
+    def _write_cached_asset(self, path, data):
+        """原子保存完整资源，避免并发读取遇到尚未写完的图片。"""
+        create_parent_folder(path)
+        temporary = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+        try:
+            with open(temporary, 'wb') as stream:
+                stream.write(data)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+
+    async def _get_asset(
         self,
         path: str, 
         use_cache=True, 
@@ -1266,6 +1471,7 @@ class RegionRipAssetManger:
         default=None, 
         cache_expire_secs=None, 
         timeout: Union[int, ConfigItem]=DEFAULT_GET_RIP_ASSET_TIMEOUT_CFG,
+        *, read_in_pool=False, track_missing=False,
     ) -> bytes:
         """
         获取任意类型解包资源，返回二进制数据，参数：
@@ -1279,20 +1485,14 @@ class RegionRipAssetManger:
         cache_path = pjoin(self.cache_dir, path)
         # 首先尝试从缓存加载
         if use_cache:
-            for cache_rel_path in self._iter_local_cache_paths(path):
-                cache_path = pjoin(self.cache_dir, cache_rel_path)
-                try:
-                    assert os.path.exists(cache_path)
-                    if cache_expire_secs is not None:
-                        assert datetime.now().timestamp() - os.path.getmtime(cache_path) < cache_expire_secs
-                    with open(cache_path, "rb") as f:
-                        return f.read()
-                except:
-                    pass
-            cache_path = pjoin(self.cache_dir, path)
+            cached = (await run_in_pool_until_complete(self._read_cached_asset, path, cache_expire_secs) if read_in_pool
+                      else self._read_cached_asset(path, cache_expire_secs))
+            if cached is not None:
+                return cached
         
         # 尝试从网络下载
         error_list: List[Tuple[str, str]] = []
+        statuses = []
         for source in self.sources:
             if source.prefixes and not any([path.startswith(prefix) for prefix in source.prefixes]):
                 continue
@@ -1304,17 +1504,21 @@ class RegionRipAssetManger:
                 url = source.url_map_method(source.base_url + path)
                 data = await self._download_data(url, get_cfg_or_value(timeout))
                 if use_cache:
-                    create_parent_folder(cache_path)
-                    with open(cache_path, "wb") as f:
-                        f.write(data)
+                    if read_in_pool:
+                        await run_in_pool_until_complete(self._write_cached_asset, cache_path, data)
+                    else:
+                        self._write_cached_asset(cache_path, data)
                 return data
             
             except Exception as e:
+                statuses.append(getattr(e, 'status_code', None))
                 e = get_exc_desc(e)
                 error_list.append((source.name, e))
                 # logger.print_exc(f"从数据源 [{source.name}] 获取 {self.region} 解包资源 {path} 失败: {e}, url={url}")
                 logger.warning(f"从数据源 [{source.name}] 获取 {self.region} 解包资源 {path} 失败: {e}, url={url}")
 
+        if track_missing and statuses and all(status == 404 for status in statuses):
+            raise AssetNotFoundError(404, f'所有数据源均无此资源: {path}')
         if not allow_error:
             error_list_text = ""
             for source_name, err in error_list:
@@ -1341,9 +1545,15 @@ class RegionRipAssetManger:
         - `timeout`: 超时时间
         """
         # 首先尝试从缓存加载
-        cache_path = self.get_local_asset_cache_path(path, cache_expire_secs)
+        cache_path = (await run_in_pool_until_complete(self.get_local_asset_cache_path, path, cache_expire_secs)
+                      if ASSET_PREPARE_IN_POOL.get() else self.get_local_asset_cache_path(path, cache_expire_secs))
         if cache_path:
             return cache_path
+        if ASSET_REQUEST_LIMIT.get() is not None:
+            data = await self.get_asset(path, allow_error=allow_error, default=None,
+                                        cache_expire_secs=cache_expire_secs, timeout=timeout,
+                                        read_in_pool=True)
+            return self.get_local_asset_cache_path(path, cache_expire_secs=None) if data is not None else default
         cache_path = pjoin(self.cache_dir, path)
         
         # 尝试从网络下载
@@ -1389,6 +1599,7 @@ class RegionRipAssetManger:
         use_img_cache: bool=False,
         img_cache_max_res: Union[int, ConfigItem]=RIP_IMG_CACHE_MAX_RES_CFG,
         decode_in_pool: bool=False,
+        cache_missing_secs: int=0,
     ) -> Image.Image:
         """
         获取图片类型解包资源，参数：
@@ -1402,12 +1613,20 @@ class RegionRipAssetManger:
         - `img_cache_max_res`: 图片缓存最大分辨率，None则不缩放
         - `decode_in_pool`: 在线程池中解码图片，减少大图解码占用事件循环的时间
         """
+        decode_in_pool = decode_in_pool or ASSET_PREPARE_IN_POOL.get()
         # 尝试从图片缓存加载
         if use_img_cache and path in self.cached_images:
             return self.cached_images[path]
-        data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs, get_cfg_or_value(timeout))
+        data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs,
+                                    get_cfg_or_value(timeout), read_in_pool=decode_in_pool,
+                                    cache_missing_secs=cache_missing_secs)
+        if data is default:
+            return default
         try: 
-            img = await run_in_pool(open_image, io.BytesIO(data)) if decode_in_pool else open_image(io.BytesIO(data))
+            started = time.perf_counter()
+            img = await run_in_pool_until_complete(open_image, io.BytesIO(data)) if decode_in_pool else open_image(io.BytesIO(data))
+            if decode_in_pool:
+                record_asset_timing('image_decode', path, time.perf_counter()-started)
             if use_img_cache:
                 if img_cache_max_res:
                     max_res = parse_cfg_num(get_cfg_or_value(img_cache_max_res))
@@ -1449,8 +1668,13 @@ class RegionRipAssetManger:
         - `cache_expire_secs`: 缓存过期时间
         - `timeout`: 超时时间
         """
-        data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs, get_cfg_or_value(timeout))
-        try: return loads_json(data)
+        in_pool = ASSET_PREPARE_IN_POOL.get()
+        data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs,
+                                    get_cfg_or_value(timeout), read_in_pool=in_pool)
+        try:
+            return await run_in_pool_until_complete(loads_json, data) if in_pool else loads_json(data)
+        except asyncio.CancelledError:
+            raise
         except: pass
         if not allow_error:
             raise Exception(f"解析下载的 {self.region} 解包资源 {path} 为json失败")

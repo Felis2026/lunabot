@@ -83,8 +83,8 @@ MYSEKAI_HARVEST_FIXTURE_IMAGE_NAME = {
     5104: "junk.png",
 }
 
-mysekairun_friendcode_data = {}
-mysekairun_friendcode_mtime = None
+_mysekairun_snapshots = {}
+_mysekairun_locks = {}
 sekai8823_friendcode_data = WebJsonRes(
     "sekai.8823家具好友码信息", 
     "https://pjsk-static.8823.eu.org/api/fixtures/", 
@@ -838,6 +838,7 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
 
     return await canvas.get_img()
 
+@resource_prepare_scope()
 async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_harvested: bool, check_time: bool) -> List[Image.Image]:
     """绘制玩家 MySekai 资源分布，返回图片列表。"""
     with ProfileTimer("msr.get_basic_profile"):
@@ -966,10 +967,22 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
             site_res_num[site_id][res_key] += res_quantity
 
     # 获取资源地图图片
-    site_imgs = {
-        site_id: await ctx.rip.img(f"mysekai/site/sitemap/texture_rip/img_harvest_site_{site_id}.png") 
-        for site_id in site_res_num
-    }
+    requests = {('site', site_id): lambda site_id=site_id: ctx.rip.img(
+        f'mysekai/site/sitemap/texture_rip/img_harvest_site_{site_id}.png') for site_id in site_res_num}
+    for resources in site_res_num.values():
+        for key in resources:
+            requests['resource', key] = lambda key=key: get_mysekai_res_icon(ctx, key)
+    for cid in visit_cids:
+        requests['sd', cid] = lambda cid=cid: get_character_sd_image(cid)
+        if cid not in read_cids:
+            gcid = (await ctx.md.game_character_units.find_by_id(cid))['gameCharacterId']
+            requests['memoria', cid] = lambda gcid=gcid: ctx.rip.img(
+                f'mysekai/item_preview/material/item_memoria_{gcid}.png')
+    gate_specs = build_mysekai_gate_specs(await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get())
+    gate = gate_specs.get(gate_id, {'id': gate_id})
+    requests['gate'] = lambda: get_mysekai_gate_icon(ctx, gate)
+    prepared = await prepare_assets(requests)
+    site_imgs = {site_id: prepared['site', site_id] for site_id in site_res_num}
 
     # 排序
     site_res_num = [(site_id, site_res_num[site_id]) for site_id in SITE_ID_ORDER]
@@ -1028,11 +1041,7 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
             with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_padding(16).set_bg(roundrect_bg()):
                 # 到访角色列表
                 with HSplit().set_bg(roundrect_bg()).set_content_align('c').set_item_align('c').set_padding(16).set_sep(16):
-                    gate_specs = build_mysekai_gate_specs(
-                        await ctx.md.mysekai_gates.get(), await ctx.md.mysekai_gate_levels.get(),
-                    )
-                    gate = gate_specs.get(gate_id, {'id': gate_id})
-                    gate_icon = await get_mysekai_gate_icon(ctx, gate)
+                    gate_icon = prepared['gate']
                     with Frame().set_size((64, 64)).set_margin((16, 0)).set_content_align('rb'):
                         ImageBox(gate_icon, size=(64, 64), use_alphablend=True, shadow=True).set_offset((0, -4))
                         TextBox(
@@ -1041,12 +1050,11 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
                         ).set_content_align('c').set_offset((4, 2))
 
                     for cid in visit_cids:
-                        chara_icon = await get_character_sd_image(cid)
+                        chara_icon = prepared['sd', cid]
                         with Frame().set_content_align('lt'):
                             ImageBox(chara_icon, size=(80, None), use_alphablend=True)
                             if cid not in read_cids:
-                                gcid = (await ctx.md.game_character_units.find_by_id(cid))['gameCharacterId']
-                                chara_item_icon = await ctx.rip.img(f"mysekai/item_preview/material/item_memoria_{gcid}.png")
+                                chara_item_icon = prepared['memoria', cid]
                                 ImageBox(chara_item_icon, size=(40, None), use_alphablend=True, shadow=True).set_offset((80 - 40, 80 - 40))
                             if cid == reservation_cid:
                                 invitation_icon = ctx.static_imgs.get('mysekai/invitationcard.png')
@@ -1061,7 +1069,7 @@ async def compose_mysekai_res_image(ctx: SekaiHandlerContext, qid: int, show_har
                         
                         with Grid(col_count=5).set_content_align('lt').set_sep(hsep=5, vsep=5):
                             for res_key, res_quantity in res_num:
-                                res_img = await get_mysekai_res_icon(ctx, res_key)
+                                res_img = prepared['resource', res_key]
                                 if not res_img: continue
                                 with HSplit().set_content_align('l').set_item_align('l').set_sep(5):
                                     text_color = (100, 100, 100) 
@@ -1326,20 +1334,17 @@ async def get_mysekai_photo_and_time(ctx: SekaiHandlerContext, qid: int, seq: in
     return Image.open(io.BytesIO(image_bytes)), photo_time
 
 # 从本地的my.sekai.run网页html提取数据
-async def load_mysekairun_data(ctx: SekaiHandlerContext):
-    global mysekairun_friendcode_data, mysekairun_friendcode_mtime
-    path = f"{SEKAI_ASSET_DIR}/mysekairun/{ctx.region}.html"
-    if not os.path.exists(path):
-        logger.warning(f"my.sekai.run 文件不存在，取消加载")
-        return
-    if mysekairun_friendcode_mtime and os.path.getmtime(path) == mysekairun_friendcode_mtime:
-        return
-    mysekairun_friendcode_data = {}
-
+def _read_mysekairun_snapshot(path):
+    """在线程中解析完整好友码快照，文件在读取期间改变时由下次访问重新加载。"""
     from bs4 import BeautifulSoup
+    stat = os.stat(path)
+    identity = (os.path.realpath(path), stat.st_size, stat.st_mtime_ns)
+    records = {}
     with open(path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f, "html.parser")
         result = soup.find("div", id="result")
+        if result is None:
+            raise ValueError('my.sekai.run 页面缺少 result 区域')
         for genre in result.find_all("div"):
             table = genre.find("table")
             if not table: continue
@@ -1350,12 +1355,31 @@ async def load_mysekairun_data(ctx: SekaiHandlerContext):
                     _, name, ids = tr.find_all("td")
                     name = str(name.text).strip()
                     ids = list(ids.stripped_strings)
-                    mysekairun_friendcode_data[name] = ids
+                    records[name] = ids
                 except:
                     pass
 
-    mysekairun_friendcode_mtime = os.path.getmtime(path)
-    logger.info(f"my.sekai.run 数据加载完成: 加载了 {len(mysekairun_friendcode_data)} 个家具")
+    return identity, records
+
+
+async def load_mysekairun_data(ctx: SekaiHandlerContext):
+    """按区服和文件身份加载好友码，解析失败时保留该区服的完整旧快照。"""
+    path = f'{SEKAI_ASSET_DIR}/mysekairun/{ctx.region}.html'
+    lock = _mysekairun_locks.setdefault(ctx.region, asyncio.Lock())
+    async with lock:
+        previous = _mysekairun_snapshots.get(ctx.region)
+        try:
+            stat = await run_in_pool_until_complete(os.stat, path)
+            identity = (os.path.realpath(path), stat.st_size, stat.st_mtime_ns)
+            if previous and previous[0] == identity:
+                return previous[1]
+            snapshot = await run_in_pool_until_complete(_read_mysekairun_snapshot, path)
+        except (OSError, ValueError) as exc:
+            logger.warning(f'my.sekai.run 数据暂不可用: {get_exc_desc(exc)}')
+            return previous[1] if previous else {}
+        _mysekairun_snapshots[ctx.region] = snapshot
+        logger.info(f'my.sekai.run 数据加载完成: 加载了 {len(snapshot[1])} 个家具')
+        return snapshot[1]
 
 # 获取mysekai家具好友码，返回（好友码，来源）
 async def get_mysekai_fixture_friend_codes(ctx: SekaiHandlerContext, fid: int) -> Tuple[List[str], str]:
@@ -1373,17 +1397,17 @@ async def get_mysekai_fixture_friend_codes(ctx: SekaiHandlerContext, fid: int) -
         logger.warning(f"从 sekai.8823.eu.org 获取家具 {fid} 好友码失败: {e}")
 
     try:
-        await load_mysekairun_data(ctx)
+        records = await load_mysekairun_data(ctx)
         fname = fixture['name']
-        friend_codes = mysekairun_friendcode_data.get(fname.strip())
+        friend_codes = records.get(fname.strip())
         return friend_codes, "my.sekai.run"
     except Exception as e:
         logger.warning(f"从 my.sekai.run 获取家具 {fid} 好友码失败: {e}")
     
     return [], ""
     
-# 获取mysekai家具详情卡片控件 返回Widget
-async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: int) -> Widget:
+async def _prepare_mysekai_fixture_detail(ctx: SekaiHandlerContext, fid: int) -> dict:
+    """准备单个家具的数据和图片，翻译与好友码查询维持逐家具执行。"""
     await load_mysekairun_data(ctx)
 
     fixture = await ctx.md.mysekai_fixtures.find_by_id(fid)
@@ -1415,11 +1439,16 @@ async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: i
     # 类别
     main_genre_id = fixture['mysekaiFixtureMainGenreId']
     sub_genre_id = fixture.get('mysekaiFixtureSubGenreId')
-    main_genre_name, main_genre_image = await get_mysekai_fixture_genre_name_and_image(ctx, main_genre_id, True)
+    requests = {'main': lambda: get_mysekai_fixture_genre_name_and_image(ctx, main_genre_id, True)}
     if sub_genre_id:
-        sub_genre_name, sub_genre_image = await get_mysekai_fixture_genre_name_and_image(ctx, sub_genre_id, False)
+        requests['sub'] = lambda: get_mysekai_fixture_genre_name_and_image(ctx, sub_genre_id, False)
     # 图标
-    fimgs = [await get_mysekai_fixture_icon(ctx, fixture, i) for i in range(len(fcolorcodes))]
+    for color_index in range(len(fcolorcodes)):
+        requests['fixture', color_index] = lambda color_index=color_index: get_mysekai_fixture_icon(ctx, fixture, color_index)
+    prepared = await prepare_assets(requests)
+    main_genre_name, main_genre_image = prepared['main']
+    sub_genre_name, sub_genre_image = prepared.get('sub', (None, None))
+    fimgs = [prepared['fixture', color_index] for color_index in range(len(fcolorcodes))]
     # 标签
     tags = []
     for key, val in fixture.get('mysekaiFixtureTagGroup', {}).items():
@@ -1436,8 +1465,10 @@ async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: i
     if react_data:
         react_data = find_by(react_data['FixturerRactions'], 'FixtureId', fid)
         if react_data:
+            chara_images = await prepare_assets({cuid: lambda cuid=cuid: get_chara_icon_by_chara_unit_id(ctx, cuid)
+                for item in react_data['ReactionCharacter'] for cuid in item['CharacterUnitIds']})
             for item in react_data['ReactionCharacter']:
-                chara_imgs = [await get_chara_icon_by_chara_unit_id(ctx, cuid) for cuid in item['CharacterUnitIds']]
+                chara_imgs = [chara_images[cuid] for cuid in item['CharacterUnitIds']]
                 react_chara_group_imgs[len(chara_imgs)].append(chara_imgs)
                 has_chara_react = True
     # 制作材料
@@ -1448,22 +1479,50 @@ async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: i
         can_obtain_by_convert = blueprint['isObtainedByConvert']
         craft_count_limit = blueprint.get('craftCountLimit')
         cost_materials = await ctx.md.mysekai_blueprint_material_cost.find_by("mysekaiBlueprintId", blueprint['id'], mode='all')
-        cost_materials = [(
-            await get_mysekai_res_icon(ctx, f"mysekai_material_{item['mysekaiMaterialId']}"),
-            item['quantity']
-        ) for item in cost_materials]
     # 回收材料
     recycle_materials = []
     only_diassemble_materials = await ctx.md.mysekai_fixture_only_disassemble_materials.find_by("mysekaiFixtureId", fid, mode='all')
+    costs = cost_materials if blueprint else []
+    material_images = await prepare_assets({item['mysekaiMaterialId']: lambda mid=item['mysekaiMaterialId']:
+        get_mysekai_res_icon(ctx, f'mysekai_material_{mid}') for item in costs + only_diassemble_materials})
+    cost_materials = [(material_images[item['mysekaiMaterialId']], item['quantity']) for item in costs]
     if only_diassemble_materials:
         recycle_materials = [(
-            await get_mysekai_res_icon(ctx, f"mysekai_material_{item['mysekaiMaterialId']}"),
+            material_images[item['mysekaiMaterialId']],
             item['quantity']
         ) for item in only_diassemble_materials]
     elif blueprint and is_disassembled:
         recycle_materials = [(img, quantity // 2) for img, quantity in cost_materials if quantity > 1]
     # 抄写好友码
     friendcodes, friendcode_source = await get_mysekai_fixture_friend_codes(ctx, fid)
+
+    return dict(fixture=fixture, fname=fname, translated_name=translated_name, fsize=fsize,
+        is_assemble=is_assemble, is_disassembled=is_disassembled, is_character_action=is_character_action,
+        is_player_action=is_player_action, fcolorcodes=fcolorcodes, fimgs=fimgs,
+        main_genre_name=main_genre_name, main_genre_image=main_genre_image, sub_genre_id=sub_genre_id,
+        sub_genre_name=sub_genre_name, sub_genre_image=sub_genre_image, tags=tags,
+        react_chara_group_imgs=react_chara_group_imgs, has_chara_react=has_chara_react, blueprint=blueprint,
+        is_sketchable=is_sketchable if blueprint else False,
+        can_obtain_by_convert=can_obtain_by_convert if blueprint else False,
+        craft_count_limit=craft_count_limit if blueprint else None, cost_materials=cost_materials,
+        recycle_materials=recycle_materials, friendcodes=friendcodes, friendcode_source=friendcode_source)
+
+
+async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: int) -> Widget:
+    return _draw_mysekai_fixture_detail(ctx, fid, await _prepare_mysekai_fixture_detail(ctx, fid))
+
+
+def _draw_mysekai_fixture_detail(ctx, fid, data):
+    """按已准备的家具快照顺序创建组件。"""
+    fixture, fname, translated_name, fsize = (data[key] for key in ('fixture', 'fname', 'translated_name', 'fsize'))
+    is_assemble, is_disassembled, is_character_action, is_player_action = (
+        data[key] for key in ('is_assemble', 'is_disassembled', 'is_character_action', 'is_player_action'))
+    fcolorcodes, fimgs, main_genre_name, main_genre_image, sub_genre_id, sub_genre_name, sub_genre_image = (
+        data[key] for key in ('fcolorcodes', 'fimgs', 'main_genre_name', 'main_genre_image', 'sub_genre_id', 'sub_genre_name', 'sub_genre_image'))
+    tags, react_chara_group_imgs, has_chara_react, blueprint = (
+        data[key] for key in ('tags', 'react_chara_group_imgs', 'has_chara_react', 'blueprint'))
+    is_sketchable, can_obtain_by_convert, craft_count_limit, cost_materials, recycle_materials, friendcodes, friendcode_source = (
+        data[key] for key in ('is_sketchable', 'can_obtain_by_convert', 'craft_count_limit', 'cost_materials', 'recycle_materials', 'friendcodes', 'friendcode_source'))
 
     title_style = TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(25, 25, 25))
     text_style = TextStyle(font=DEFAULT_FONT, size=18, color=(50, 50, 50))
@@ -1566,12 +1625,14 @@ async def get_mysekai_fixture_detail_image_card(ctx: SekaiHandlerContext, fid: i
 
     return vs
 
-# 获取mysekai家具详情
+@resource_prepare_scope()
 async def compose_mysekai_fixture_detail_image(ctx: SekaiHandlerContext, fids: List[int]) -> Image.Image:
+    """准备指定家具后按输入顺序绘制详情，重复编号复用同份准备结果。"""
+    prepared = {fid: await _prepare_mysekai_fixture_detail(ctx, fid) for fid in dict.fromkeys(fids)}
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_item_bg(roundrect_bg()):
             for fid in fids:
-                await get_mysekai_fixture_detail_image_card(ctx, fid)
+                _draw_mysekai_fixture_detail(ctx, fid, prepared[fid])
     add_watermark(canvas)
     return await canvas.get_img()
 
@@ -1617,6 +1678,7 @@ async def get_mysekai_gate_upgrade_data(ctx: SekaiHandlerContext, preview: bool 
 
 
 # 合成mysekai门升级材料图片
+@resource_prepare_scope()
 async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int, spec_gate_id: int = None, preview: bool = False) -> Image.Image:
     gate_specs, gate_materials = await get_mysekai_gate_upgrade_data(ctx, preview)
     if spec_gate_id is not None:
@@ -1730,6 +1792,13 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
                         item['color'] = red_color
                         item['sum_quantity'] = f"{user_quantity_text}/{sum_quantity}"
     
+    requests = {('gate', gid): lambda gid=gid: get_mysekai_gate_icon(ctx, gate_specs[gid]) for gid in gate_materials}
+    for levels in gate_materials.values():
+        for items in levels.values():
+            for item in items:
+                mid = item['mid']
+                requests['material', mid] = lambda mid=mid: get_mysekai_res_icon(ctx, f'mysekai_material_{mid}')
+    prepared = await prepare_assets(requests)
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
             # ================================ 预览说明与原资料卡 ================================ #
@@ -1756,7 +1825,7 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
 
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16).set_bg(roundrect_bg()).set_padding(8):
                 for gid, lv_materials in gate_materials.items():
-                    gate_icon = await get_mysekai_gate_icon(ctx, gate_specs[gid])
+                    gate_icon = prepared['gate', gid]
                     with VSplit().set_content_align('c').set_item_align('c').set_sep(8).set_item_bg(roundrect_bg()).set_padding(8):
                         spec_lv = spec_lvs.get(gid, 0)
                         with HSplit().set_content_align('c').set_item_align('c').set_omit_parent_bg(True):
@@ -1776,7 +1845,7 @@ async def compose_mysekai_door_upgrade_image(ctx: SekaiHandlerContext, qid: int,
                                 for item in items:
                                     mid, quantity, color, sum_quantity = item['mid'], item['quantity'], item['color'], item['sum_quantity']
                                     with VSplit().set_content_align('c').set_item_align('c').set_sep(4):
-                                        img = await get_mysekai_res_icon(ctx, f"mysekai_material_{mid}")
+                                        img = prepared['material', mid]
                                         with Frame():
                                             sz = 64
                                             ImageBox(img, size=(sz, sz))

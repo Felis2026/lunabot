@@ -77,6 +77,7 @@ EVENT_TYPE_SHOW_NAMES = {
     "cheerful_carnival": "5v5",
     "world_bloom": "WorldLink",
 }
+EVENT_DETAIL_CARD_LIMIT = 8
 
 WL_TURN_RESERVED_ACTIVITY_ARGS = tuple(
     name
@@ -128,8 +129,11 @@ async def get_card_supply_type(ctx: SekaiHandlerContext, cid: int) -> str:
         return card_supply["cardSupplyType"]
     return "normal"
 
-async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[int, Dict], require_assets: List[str]) -> EventDetail:
-    """读取活动信息与所需素材，缺少活动卡时保留时间、加成和所属团信息。"""
+async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[int, Dict], require_assets: List[str], *, card_thumb_limit=None) -> EventDetail:
+    """读取活动信息与所需素材，缺少活动卡时保留时间、加成和所属团信息。
+
+    card_thumb_limit 只限制缩略图准备数量，活动卡列表保持完整。
+    """
     if isinstance(event_or_event_id, int):
         event_id = event_or_event_id
         event = await ctx.md.events.find_by_id(event_id)
@@ -180,31 +184,26 @@ async def get_event_detail(ctx: SekaiHandlerContext, event_or_event_id: Union[in
     
     assert not require_assets or all(a in ['banner', 'logo', 'bg', 'story_bg', 'ban_chara', 'card_thumbs'] for a in require_assets)
 
-    event_banner = None
+    requests = {}
     if 'banner' in require_assets:
-        event_banner = await get_event_banner_img(ctx, event)
-
-    event_logo = None
-    if 'logo' in require_assets:
-        event_logo = await ctx.rip.img(f"event/{asset_name}/logo/logo.png")
-
-    event_bg = None
-    if 'bg' in require_assets:
-        event_bg = await ctx.rip.img(f"event/{asset_name}/screen/bg.png", default=None)
-
-    event_story_bg = None
-    if 'story_bg' in require_assets and etype != 'world_bloom':
-        event_story_bg = await ctx.rip.img(f"event_story/{asset_name}/screen_image/story_bg.png", default=None)
-
-    event_ban_chara_img = None
-    if 'ban_chara' in require_assets and etype != 'world_bloom':
-        event_ban_chara_img = await ctx.rip.img(f"event/{asset_name}/screen/character.png", default=None)
-
-    event_card_thumbs = []
+        requests['banner'] = lambda: get_event_banner_img(ctx, event)
+    for kind, path in (
+        ('logo', f'event/{asset_name}/logo/logo.png'),
+        ('bg', f'event/{asset_name}/screen/bg.png'),
+        ('story_bg', f'event_story/{asset_name}/screen_image/story_bg.png'),
+        ('ban_chara', f'event/{asset_name}/screen/character.png'),
+    ):
+        if kind in require_assets and not (etype == 'world_bloom' and kind in ('story_bg', 'ban_chara')):
+            options = {} if kind == 'logo' else {'default': None}
+            requests[kind] = lambda path=path, options=options: ctx.rip.img(path, **options)
     if 'card_thumbs' in require_assets:
-        for card in event_cards:
-            thumb = await get_card_full_thumbnail(ctx, card, after_training=False)
-            event_card_thumbs.append(thumb)
+        thumbnail_cards = event_cards[:card_thumb_limit] if card_thumb_limit is not None else event_cards
+        for card in thumbnail_cards:
+            requests['card', card['id']] = lambda card=card: get_card_full_thumbnail(ctx, card, after_training=False)
+    prepared = await prepare_assets(requests)
+    event_banner, event_logo, event_bg, event_story_bg, event_ban_chara_img = (
+        prepared.get(kind) for kind in ('banner', 'logo', 'bg', 'story_bg', 'ban_chara'))
+    event_card_thumbs = [prepared['card', card['id']] for card in thumbnail_cards] if 'card_thumbs' in require_assets else []
 
     return EventDetail(
         event=event,
@@ -732,8 +731,9 @@ async def compose_event_story_summary_image(
     with ProfileTimer("event_story.get_img"): 
         return await canvas.get_img(cache_key=f"event_story_{ctx.region}_{eid}")
 
-# 获取活动剧情总结，返回待发送的消息列表或图片
+@resource_prepare_scope()
 async def get_event_story_summary(ctx: SekaiHandlerContext, event: dict, refresh: bool, summary_model: List[str], save: bool) -> list[str] | Image.Image:
+    """准备有序章节并生成剧情总结，返回待发送的消息列表或图片。"""
     eid = event['id']
     title = event['name']
     summary_db = get_file_db(f"{SEKAI_DATA_DIR}/story_summary/event/{ctx.region}/{eid}.json", logger)
@@ -750,16 +750,20 @@ async def get_event_story_summary(ctx: SekaiHandlerContext, event: dict, refresh
     chara_talk_count: Dict[str, int] = {}
 
     with ProfileTimer("event_story.load_eps"):
+        requests = {}
+        for index, episode in enumerate(story['eventStoryEpisodes'], 1):
+            requests['image', index] = lambda index=index: ctx.rip.img(
+                f'event_story/{asset_name}/episode_image_rip/{asset_name}_{index:02d}.png')
+            scenario_id = episode['scenarioId']
+            requests['scenario', scenario_id] = lambda scenario_id=scenario_id: ctx.rip.json(
+                f'event_story/{asset_name}/scenario_rip/{scenario_id}.asset', allow_error=False,
+                use_cache=True, cache_expire_secs=0 if refresh else 60 * 60 * 24)
+        prepared = await prepare_assets(requests)
         for i, ep in enumerate(story['eventStoryEpisodes'], 1):
             ep_id = ep['scenarioId']
             ep_title = ep['title']
-            ep_image = await ctx.rip.img(f"event_story/{asset_name}/episode_image_rip/{asset_name}_{i:02d}.png")
-            ep_data = await ctx.rip.json(
-                f"event_story/{asset_name}/scenario_rip/{ep_id}.asset", 
-                allow_error=False, 
-                use_cache=True,
-                cache_expire_secs=0 if refresh else 60 * 60 * 24,    # refresh时读取最新的，否则一天更新一次
-            )
+            ep_image = prepared['image', i]
+            ep_data = prepared['scenario', ep_id]
             cids = set([
                 (await ctx.md.characters_2ds.find_by_id(item['Character2dId'])).get('characterId', None)
                 for item in ep_data['AppearCharacters']
@@ -937,8 +941,11 @@ async def send_boost(ctx: SekaiHandlerContext, qid: int) -> str:
     return ret_msg
 
 # 合成活动详情图片
+@resource_prepare_scope()
 async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> Image.Image:
-    detail = await get_event_detail(ctx, event, ['logo', 'bg', 'story_bg', 'ban_chara', 'card_thumbs'])
+    """绘制活动详情，缩略图准备与卡片区使用同一数量上限。"""
+    detail = await get_event_detail(ctx, event, ['logo', 'bg', 'story_bg', 'ban_chara', 'card_thumbs'],
+                                    card_thumb_limit=EVENT_DETAIL_CARD_LIMIT)
     now = datetime.now()
 
     banner_index = None
@@ -956,6 +963,23 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
         chapter['end_time'] = datetime.fromtimestamp(chapter['aggregateAt'] / 1000 + 1)
 
     use_story_bg = detail.event_story_bg and detail.event_ban_chara_img and detail.etype != "world_bloom"
+    bonus_cids = sorted(set(detail.bonus_cids))
+    icon_cids = set(bonus_cids)
+    if detail.banner_cid:
+        icon_cids.add(detail.banner_cid)
+    if detail.etype == 'world_bloom' and len(wl_chapters) > 1:
+        icon_cids.update(chapter['wl_cid'] for chapter in wl_chapters)
+    requests = {('chara', cid): lambda cid=cid: run_in_pool_until_complete(get_chara_icon_by_chara_id, cid)
+                for cid in sorted(icon_cids)}
+    if len(detail.bonus_attrs) < len(CARD_ATTRS):
+        for attr in detail.bonus_attrs:
+            requests['attr', attr] = lambda attr=attr: run_in_pool_until_complete(get_attr_icon, attr)
+    if use_story_bg:
+        def crop_character():
+            image = detail.event_ban_chara_img
+            return image.crop((get_left_transparent_width(image), 0, image.width, image.height))
+        requests['character_cutout'] = lambda: run_in_pool_until_complete(crop_character)
+    static_assets = await prepare_assets(requests)
     event_bg = detail.event_story_bg if use_story_bg else detail.event_bg
     h = 1024
     w = min(int(h * 1.6), event_bg.size[0] * h // event_bg.size[1] if event_bg else int(h * 1.6))
@@ -974,7 +998,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                 name = chara.get('firstName', '') + chara.get('givenName', '')
                 dates = chapter['start_time'].strftime('%m/%d %H:%M') + ' — ' + chapter['end_time'].strftime('%m/%d %H:%M')
                 with HSplit().set_padding(0).set_margin(0).set_sep(6).set_item_align('c').set_content_align('l'):
-                    ImageBox(get_chara_icon_by_chara_id(chapter['wl_cid']), size=(22, 22)).set_margin(0)
+                    ImageBox(static_assets['chara', chapter['wl_cid']], size=(22, 22)).set_margin(0)
                     TextBox(name, style).set_w(86).set_margin(0)
                     TextBox(dates, style).set_margin(0)
 
@@ -1002,8 +1026,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
         with Canvas(bg=bg, w=w, h=h).set_padding(BG_PADDING).set_content_align('r') as canvas:
             with Frame().set_size((w-BG_PADDING*2, h-BG_PADDING*2)).set_content_align('lb').set_padding((64, 0)):
                 if use_story_bg:
-                    chara_img = detail.event_ban_chara_img
-                    chara_img = chara_img.crop((get_left_transparent_width(chara_img), 0, chara_img.width, chara_img.height))
+                    chara_img = static_assets['character_cutout']
                     ImageBox(chara_img, size=(None, int(h * 0.9)), use_alphablend=True).set_offset((0, BG_PADDING))
 
             with VSplit().set_padding(16).set_sep(16).set_item_align('t').set_content_align('t').set_item_bg(roundrect_bg()) as sidebar:
@@ -1020,7 +1043,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                         TextBox(f"{detail.etype_name}", text_style)
                         if detail.banner_cid:
                             Spacer(w=8)
-                            ImageBox(get_chara_icon_by_chara_id(detail.banner_cid), size=(30, 30))
+                            ImageBox(static_assets['chara', detail.banner_cid], size=(30, 30))
                             if banner_index is not None:
                                 TextBox(f"{banner_index}箱", label_style)
 
@@ -1082,7 +1105,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                 if detail.event_cards:
                     with HSplit().set_padding(16).set_sep(16).set_item_align('c').set_content_align('c'):
                         TextBox("活动卡片", label_style)
-                        detail.event_cards = detail.event_cards[:8]
+                        detail.event_cards = detail.event_cards[:EVENT_DETAIL_CARD_LIMIT]
                         card_num = len(detail.event_cards)
                         if card_num <= 4: col_count = card_num
                         elif card_num <= 6: col_count = 3
@@ -1101,18 +1124,16 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                             if len(detail.bonus_attrs) == len(CARD_ATTRS):
                                 TextBox("全属性", text_style)
                             elif detail.bonus_attr:
-                                ImageBox(get_attr_icon(detail.bonus_attr), size=(None, 40))
+                                ImageBox(static_assets['attr', detail.bonus_attr], size=(None, 40))
                             else:
                                 with Grid(col_count=2).set_sep(4, 4):
                                     for attr in detail.bonus_attrs:
-                                        ImageBox(get_attr_icon(attr), size=(None, 40))
+                                        ImageBox(static_assets['attr', attr], size=(None, 40))
                         if detail.bonus_cuids:
-                            bonus_cids = set([await get_chara_id_by_cuid(ctx, cuid) for cuid in detail.bonus_cuids])
-                            bonus_cids = sorted(list(bonus_cids))
                             TextBox("加成角色", label_style)
                             with Grid(col_count=5 if len(bonus_cids) < 20 else 7).set_sep(4, 4):
                                 for cid in bonus_cids:
-                                    ImageBox(get_chara_icon_by_chara_id(cid), size=(None, 40))
+                                    ImageBox(static_assets['chara', cid], size=(None, 40))
 
         if detail.etype == 'world_bloom':
             fit_wl_sidebar(sidebar)
@@ -1121,15 +1142,16 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
 
     return await draw(w, h)
 
-# 合成活动记录图片
+@resource_prepare_scope()
 async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Image.Image:
+    """按账号记录快照绘制活动和 WL 履历，排序与素材字段仅写入请求副本。"""
     profile, err_msg = await get_detailed_profile(
         ctx, 
         qid, 
         filter=get_detailed_profile_card_filter('userEvents','userWorldBlooms'), 
         raise_exc=True)
-    user_events: List[Dict[str, Any]] = profile.get('userEvents', [])
-    user_worldblooms: List[Dict[str, Any]] = profile.get('userWorldBlooms', [])
+    user_events: List[Dict[str, Any]] = [dict(item) for item in profile.get('userEvents', [])]
+    user_worldblooms: List[Dict[str, Any]] = [dict(item) for item in profile.get('userWorldBlooms', [])]
     for item in user_worldblooms:
         if 'worldBloomChapterPoint' in item:
             item['eventPoint'] = item['worldBloomChapterPoint']
@@ -1141,31 +1163,40 @@ async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Imag
     style3 = TextStyle(font=DEFAULT_BOLD_FONT, size=24, color=(70, 70, 70))
     style4 = TextStyle(font=DEFAULT_BOLD_FONT, size=20, color=(50, 50, 50))
     
-    async def draw_events(name, user_events):
+    groups = []
+    requests = {}
+    for name, records in (('活动', user_events), ('WL单榜', user_worldblooms)):
+        if not records:
+            continue
         topk = 30
-        if any('rank' in item for item in user_events):
+        if any('rank' in item for item in records):
             has_rank = True
             title = f"排名前{topk}的{name}记录"
-            user_events.sort(key=lambda x: (x.get('rank', 1e9), -x.get('eventPoint', 0)))
+            records.sort(key=lambda x: (x.get('rank', 1e9), -x.get('eventPoint', 0)))
         else:
             has_rank = False
             title = f"活动点数前{topk}的{name}记录"
-            user_events.sort(key=lambda x: -x['eventPoint'])
-
-        user_events = [item for item in user_events if await ctx.md.events.find_by_id(item['eventId'])]
-        user_events = user_events[:topk]
-
-        for i, item in enumerate(user_events):
+            records.sort(key=lambda x: -x['eventPoint'])
+        records = [item for item in records if await ctx.md.events.find_by_id(item['eventId'])][:topk]
+        for i, item in enumerate(records):
             item['no'] = i + 1
             event = await ctx.md.events.find_by_id(item['eventId'])
-            item['banner'] = await get_event_banner_img(ctx, event)
+            requests['banner', item['eventId']] = lambda event=event: get_event_banner_img(ctx, event)
             item['eventName'] = event['name']
             item['startAt'] = datetime.fromtimestamp(event['startAt'] / 1000)
             item['endAt'] = datetime.fromtimestamp(event['aggregateAt'] / 1000 + 1)
             if 'gameCharacterId' in item:
                 from .card import get_character_sd_image
-                item['charaIcon'] = await get_character_sd_image(item['gameCharacterId'])
+                requests['sd', item['gameCharacterId']] = lambda cid=item['gameCharacterId']: get_character_sd_image(cid)
+        groups.append((title, has_rank, records))
+    prepared = await prepare_assets(requests)
+    for _, _, records in groups:
+        for item in records:
+            item['banner'] = prepared['banner', item['eventId']]
+            if 'gameCharacterId' in item:
+                item['charaIcon'] = prepared['sd', item['gameCharacterId']]
 
+    def draw_events(title, has_rank, user_events):
         with VSplit().set_padding(16).set_sep(16).set_item_align('lt').set_content_align('lt').set_bg(roundrect_bg()):
             TextBox(title, style1)
 
@@ -1201,10 +1232,8 @@ async def compose_event_record_image(ctx: SekaiHandlerContext, qid: int) -> Imag
             TextBox("每次抓包仅包含最近一次活动的记录\n上传时进行增量更新，未上传过的记录将会丢失\n领取活动牌子后上传数据才能记录排名", style4, use_real_line_count=True) \
                 .set_bg(roundrect_bg()).set_padding(12)
             with HSplit().set_sep(16).set_item_align('lt').set_content_align('lt'):
-                if user_events:
-                    await draw_events("活动", user_events)
-                if user_worldblooms:
-                    await draw_events("WL单榜", user_worldblooms)
+                for group in groups:
+                    draw_events(*group)
     
     add_watermark(canvas)
     return await canvas.get_img()

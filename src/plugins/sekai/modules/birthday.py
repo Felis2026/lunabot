@@ -27,7 +27,6 @@ from .mysekai import (
 # 浇水基础积分为每个露滴 100，生日卡 rate 与其相加；每朵门槛仍从本期表读取。
 BIRTHDAY_DELIVERY_BASE_POINT = 100
 BIRTHDAY_REWARD_PURPOSE = 'birthday_party_delivery_total_reward'
-BIRTHDAY_PREPARE_CONCURRENCY = 4
 BIRTHDAY_RESOURCE_TABLES = dict(
     material='materials', boost_item='boostItems', practice_ticket='practiceTickets',
     skill_practice_ticket='skillPracticeTickets', mysekai_material='mysekaiMaterials',
@@ -363,28 +362,44 @@ async def _birthday_prepare_tables(data, material_ctx):
         if any(frame.get('playerFrameAttachStatus') == 'first' for frame in frames) and not get_selected_custom_avatar_frame(ctx.region, data['uid']):
             requests.update((ctx.region, name) for name in ('playerFrames', 'playerFrameGroups'))
     # 限制单次查询的预备请求数，组件仍按原顺序创建，避免异步任务交错进入绘图容器。
-    limiter = asyncio.Semaphore(BIRTHDAY_PREPARE_CONCURRENCY)
-
     async def prepare(region, name):
-        async with limiter:
-            await _birthday_table(contexts[region], name)
+        rows = await _birthday_table(contexts[region], name)
+        if isinstance(rows, list):
+            data['metadata'][region, name] = {row['id']: row for row in rows if 'id' in row}
 
-    await asyncio.gather(*(prepare(region, name) for region, name in sorted(requests)))
+    await prepare_assets({(region, name): lambda region=region, name=name: prepare(region, name)
+                          for region, name in sorted(requests)})
 
 
 class _BirthdayRipView:
     """称号合成沿用原函数，缺图时按相同资源路径补查 JP，失败保留文字档位。"""
-    def __init__(self, ctx, cache):
+    def __init__(self, ctx, cache, tasks=None):
         self.ctx, self.cache = ctx, cache
+        self.tasks = tasks if tasks is not None else {}
 
     async def img(self, path, **kwargs):
         key = (self.ctx.region, path)
-        if key not in self.cache:
+        async def load():
             picture = await self.ctx.rip.img(path, **{**kwargs, 'allow_error': True, 'default': None})
             if picture is None and self.ctx.region == 'cn':
                 picture = await SekaiHandlerContext.from_region('jp').rip.img(
                     path, **{**kwargs, 'allow_error': True, 'default': None})
             self.cache[key] = picture
+            return picture
+        if key not in self.cache:
+            task = self.tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(load())
+                self.tasks[key] = task
+
+                def finish(completed):
+                    if self.tasks.get(key) is completed:
+                        self.tasks.pop(key, None)
+                    if not completed.cancelled():
+                        completed.exception()
+
+                task.add_done_callback(finish)
+            await asyncio.shield(task)
         picture = self.cache[key]
         if picture is None and not kwargs.get('allow_error', False):
             raise FileNotFoundError(path)
@@ -393,7 +408,7 @@ class _BirthdayRipView:
 
 async def _birthday_icon(data, ctx, path):
     """使用统一解包资源管理器的缓存和主备源，单次查询内复用成功或失败结果。"""
-    picture = await _BirthdayRipView(ctx, data['images']).img(path, allow_error=True)
+    picture = await _BirthdayRipView(ctx, data['images'], data.setdefault('image_tasks', {})).img(path, allow_error=True)
     return picture if picture is not None else UNKNOWN_IMG
 
 
@@ -426,7 +441,7 @@ async def _birthday_honor(data, item):
             data['images'][key] = None
             return None
         view = copy.copy(ctx)
-        view.rip = _BirthdayRipView(ctx, data['images'])
+        view.rip = _BirthdayRipView(ctx, data['images'], data.setdefault('image_tasks', {}))
         picture = await compose_full_honor_image(view, dict(
             honorId=item['resourceId'], honorLevel=item['resourceLevel'], profileHonorType='normal'), True)
     except Exception as exc:
@@ -678,11 +693,10 @@ def _draw_birthday_requirement(data, dew):
             TextBox(note, _birthday_style(16, color=RED))
 
 
-async def _draw_birthday_cards(data, birthday_cards):
-    """每行最多六张且末行居中，缺 Suite 保留卡面并标注持有未知。"""
+async def _prepare_birthday_card_images(data):
+    """准备本期加成卡，区服回退与持有状态只使用本请求的数据。"""
     ctx, state = data['ctx'], data['state']
-    pictures = []
-    for bonus in state['bonuses']:
+    async def prepare(bonus):
         card = await ctx.md.cards.find_by_id(bonus['cardId'])
         card_ctx = ctx
         if card is None:
@@ -692,7 +706,33 @@ async def _draw_birthday_cards(data, birthday_cards):
         held = state['owned'] is not None and bonus['cardId'] in state['owned']
         if not held and not state['top']:
             picture = ImageOps.grayscale(picture).convert('RGBA')
-        pictures.append((bonus, picture, held, card and (card_ctx.region != ctx.region or card.get('releaseAt', 0) > data['now'])))
+        return (bonus, picture, held, card and (card_ctx.region != ctx.region or card.get('releaseAt', 0) > data['now']))
+    bonuses = {bonus['cardId']: bonus for bonus in state['bonuses']}
+    prepared = await prepare_assets({card_id: lambda bonus=bonus: prepare(bonus) for card_id, bonus in bonuses.items()})
+    return [prepared[bonus['cardId']] for bonus in state['bonuses']]
+
+
+async def _prepare_birthday_display(data):
+    """只预取目标内实际展示的奖励和卡图，不增加账号 API 请求。"""
+    requests = {'cards': lambda: _prepare_birthday_card_images(data)}
+    for row in data['rewards']['rows']:
+        if row['requirement'] > data['state']['target']:
+            continue
+        for item in data['rewards']['boxes'][row['resourceBoxId']]['details']:
+            if item['resourceType'] == 'honor':
+                key = ('honor', item['resourceId'], item['resourceLevel'])
+                requests[key] = lambda item=item: _birthday_honor(data, item)
+            else:
+                key = (item['resourceType'], item['resourceId'])
+                requests[key] = lambda key=key: _birthday_resource(data, *key)
+    prepared = await prepare_assets(requests)
+    data['card_images'] = prepared['cards']
+
+
+async def _draw_birthday_cards(data, birthday_cards):
+    """每行最多六张且末行居中，缺 Suite 保留卡面并标注持有未知。"""
+    state = data['state']
+    pictures = data['card_images']
     with VSplit().set_w(1040).set_padding(18).set_sep(16).set_bg(roundrect_bg()).set_item_align('l'):
         with HSplit().set_sep(24).set_item_align('c'):
             TextBox('生日卡加成', _birthday_style(21, True))
@@ -859,6 +899,7 @@ async def _draw_birthday_rewards(data):
 
 # ================================ 页面准备与命令入口 ================================ #
 
+@resource_prepare_scope()
 async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, target=None):
     """通过原账号、MasterData 和资源层准备数据，绘制完整生日浇水页面。"""
     uid = await get_player_bind_id(ctx, check_bind=False)
@@ -910,10 +951,16 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
         material = next((row for row in await _birthday_table(material_ctx, 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
         if material is None and ctx.region == 'cn' and not reference:
             material = next((row for row in await _birthday_table(SekaiHandlerContext.from_region('jp'), 'mysekaiMaterials') or [] if row['id'] == party['deliveryRewardMysekaiMaterialId']), None)
-        data['flower'] = await _birthday_icon(data, material_ctx, f"mysekai/thumbnail/material/{material['iconAssetbundleName']}.png") if material else UNKNOWN_IMG
-        dew = await _birthday_icon(data, material_ctx, f"thumbnail/material_rip/material{party['deliveryItemMaterialId']}.png")
+        icons = await prepare_assets({
+            'flower': lambda: _birthday_icon(data, material_ctx, f"mysekai/thumbnail/material/{material['iconAssetbundleName']}.png")
+                if material else asyncio.sleep(0, result=UNKNOWN_IMG),
+            'dew': lambda: _birthday_icon(data, material_ctx, f"thumbnail/material_rip/material{party['deliveryItemMaterialId']}.png"),
+        })
+        data['flower'], dew = icons['flower'], icons['dew']
+        await _prepare_birthday_display(data)
     else:
         background = await get_card_image(ctx, background_card, False, decode_in_pool=True)
+        pictures = await prepare_assets({card['id']: lambda card=card: get_card_full_thumbnail(ctx, card, False) for card in cards})
     with Canvas(bg=ImageBg(background)).set_padding(20) as canvas:
         with VSplit().set_w(1072).set_padding(16).set_sep(16).set_bg(roundrect_bg()).set_item_align('l'):
             with HSplit().set_sep(16).set_item_align('lt'):
@@ -936,10 +983,10 @@ async def compose_birthday_watering_image(ctx: SekaiHandlerContext, cid=None, ta
                     TextBox(f'*暂无{get_region_name(ctx.region)}下一期生日浇水数据，暂无法计算', _birthday_style(20, color=RED))
                 with VSplit().set_w(1040).set_padding(18).set_sep(14).set_bg(roundrect_bg()):
                     TextBox('生日卡', _birthday_style(21, True))
-                    pictures = await batch_gather(*[get_card_full_thumbnail(ctx, card, False) for card in cards])
                     for start in range(0, len(cards), 6):
                         with HSplit().set_sep(16).set_item_align('c'):
-                            for card, picture in zip(cards[start:start + 6], pictures[start:start + 6]):
+                            for card in cards[start:start + 6]:
+                                picture = pictures[card['id']]
                                 with VSplit().set_sep(4).set_item_align('c'):
                                     ImageBox(picture, size=(128, 128))
                                     TextBox(str(card['id']), _birthday_style(16))

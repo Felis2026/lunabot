@@ -20,6 +20,7 @@ from .honor import compose_full_honor_image
 from .resbox import get_res_box_info, get_res_icon
 from ...utils.safety import *
 from ...imgtool import shrink_image
+import tempfile
 
 
 SEKAI_PROFILE_DIR = f"{SEKAI_DATA_DIR}/profile"
@@ -710,8 +711,45 @@ async def get_card_thumbnail(ctx: SekaiHandlerContext, cid: int, after_training:
         img_cache_kwargs = {'use_img_cache': True, 'img_cache_max_res': CARD_ICON_CACHE_RES }
     return await ctx.rip.img(f"thumbnail/chara_rip/{card['assetbundleName']}_{image_type}.png", **img_cache_kwargs)
 
-# 获取角色卡牌完整缩略图（包括边框、星级等）
+_card_thumbnail_tasks = {}
+_card_thumbnail_limit = asyncio.Semaphore(4)
+
+
 async def get_card_full_thumbnail(
+    ctx: SekaiHandlerContext, card_or_card_id: Dict, after_training: bool = None,
+    pcard: Dict = None, custom_text: str = None, high_res: bool = False,
+):
+    """返回独立的卡牌缩略图；公共图共享准备，玩家状态图独立合成。"""
+    async def build():
+        async with resource_prepare_scope():
+            return await _build_card_full_thumbnail(ctx, card_or_card_id, after_training,
+                                                    pcard, custom_text, high_res)
+
+    if pcard:
+        return await build()
+    if isinstance(card_or_card_id, int):
+        identifier = card_or_card_id
+        card_or_card_id = await ctx.md.cards.find_by_id(identifier)
+        assert_and_reply(card_or_card_id, f'找不到ID为{identifier}的卡牌')
+    card_id = card_or_card_id['id']
+    trained = only_has_after_training(card_or_card_id) or bool(after_training and has_after_training(card_or_card_id))
+    key = (ctx.region, card_id, trained, high_res)
+    task = _card_thumbnail_tasks.get(key)
+    if task is None:
+        task = asyncio.create_task(build())
+        _card_thumbnail_tasks[key] = task
+
+        def finish(completed):
+            if _card_thumbnail_tasks.get(key) is completed:
+                _card_thumbnail_tasks.pop(key, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(finish)
+    return (await asyncio.shield(task)).copy()
+
+
+async def _build_card_full_thumbnail(
     ctx: SekaiHandlerContext, 
     card_or_card_id: Dict, 
     after_training: bool=None, 
@@ -719,6 +757,7 @@ async def get_card_full_thumbnail(
     custom_text: str=None,
     high_res: bool=False,
 ):
+    """按卡框和星级规则合成缩略图，成功的公共图片原子保存。"""
     if isinstance(card_or_card_id, int):
         card = await ctx.md.cards.find_by_id(card_or_card_id)
         assert_and_reply(card, f"找不到ID为{card_or_card_id}的卡牌")
@@ -741,14 +780,13 @@ async def get_card_full_thumbnail(
     if not pcard:
         image_type = "after_training" if after_training else "normal"
         cache_path = f"{SEKAI_ASSET_DIR}/card_full_thumbnail/{ctx.region}/{cid}_{image_type}.png"
-        try: return open_image(cache_path)
-        except: pass
+        try: return await run_in_pool_until_complete(open_image, cache_path)
+        except Exception: pass
 
     img = await get_card_thumbnail(ctx, cid, after_training, high_res=high_res)
     ok_to_cache = (img != UNKNOWN_IMG)
-    img = img.resize((128, 128), Image.BICUBIC)
-
     def draw(img: Image.Image, card):
+        img = img.resize((128, 128), Image.BICUBIC)
         attr = card['attr']
         rare = card['cardRarityType']
         frame_img = ctx.static_imgs.get(f"card/frame_{rare}.png")
@@ -801,11 +839,22 @@ async def get_card_full_thumbnail(
         img.putalpha(mask)
         return img
     
-    img = await run_in_pool(draw, img, card)
+    # 下载期间释放合成额度，缺图请求不会阻塞其他卡牌的本地缓存读取。
+    async with _card_thumbnail_limit:
+        img = await run_in_pool_until_complete(draw, img, card)
 
     if not pcard and ok_to_cache:
-        create_parent_folder(cache_path)
-        img.save(cache_path)
+        def save():
+            create_parent_folder(cache_path)
+            descriptor, temporary = tempfile.mkstemp(dir=os.path.dirname(cache_path), suffix='.tmp')
+            os.close(descriptor)
+            try:
+                img.save(temporary, format='PNG')
+                os.replace(temporary, cache_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        await run_in_pool_until_complete(save)
 
     return img
 

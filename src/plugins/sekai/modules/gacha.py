@@ -242,7 +242,7 @@ async def get_gacha_banner(ctx: SekaiHandlerContext, gacha_or_gacha_id: Union[Ga
     else:
         gacha_id = gacha_or_gacha_id
     banner_path = f'home/banner/banner_gacha{gacha_id}/banner_gacha{gacha_id}.png'
-    return await ctx.rip.img(banner_path, use_img_cache=True, default=default)
+    return await get_gacha_asset_image(ctx, banner_path, use_img_cache=True, default=default)
 
 # 获取卡池的logo
 async def get_gacha_logo(ctx: SekaiHandlerContext, gacha_or_gacha_id: Union[Gacha, int], default=UNKNOWN_IMG) -> Optional[Image.Image]:
@@ -251,7 +251,7 @@ async def get_gacha_logo(ctx: SekaiHandlerContext, gacha_or_gacha_id: Union[Gach
     else:
         gacha = await ctx.md.gachas.find_by_id(gacha_or_gacha_id)
         assert_and_reply(gacha, f"找不到卡池{ctx.region.upper()}-{gacha_or_gacha_id}")
-    return await ctx.rip.img(f"gacha/{gacha.asset_name}/logo/logo.png", use_img_cache=True, default=default)
+    return await get_gacha_asset_image(ctx, f"gacha/{gacha.asset_name}/logo/logo.png", use_img_cache=True, default=default)
 
 # 获取卡池抽卡权重信息
 async def get_gacha_weight_info(ctx: SekaiHandlerContext, gacha: Gacha) -> GachaWeightInfo:
@@ -758,18 +758,8 @@ async def draw_gacha_list_footer(ctx, gacha, conditions, page, pages, *, exchang
 
 
 async def _compose_gacha_detail_image(ctx: SekaiHandlerContext, gacha: Gacha, full_data=None, page=1):
-    logo = await get_gacha_logo(ctx, gacha, default=None)
-    banner = await get_gacha_banner(ctx, gacha, default=None)
-    first_pickup = None
-    for card in gacha.cards:
-        if card.is_pickup:
-            first_pickup = card.id
-            break
-    bg = SEKAI_BLUE_BG
-    if first_pickup:
-        card_img = await get_card_image(ctx, first_pickup, after_training=has_after_training(await ctx.md.cards.find_by_id(first_pickup)), allow_error=True)
-        if card_img != UNKNOWN_IMG:
-            bg = ImageBg(card_img)
+    logo, banner, card_img = _GACHA_RENDER_DATA.get()[1]['_base_images']
+    bg = ImageBg(card_img) if card_img is not None and card_img != UNKNOWN_IMG else SEKAI_BLUE_BG
     weight_info = await weight_info_for_display(ctx, gacha)
     pickup_rate = 0.0
     pickup_cards: List[GachaCardWeightInfo] = []
@@ -1254,12 +1244,19 @@ async def _(ctx: SekaiHandlerContext):
     # 查单卡池
     query = await parse_gacha_detail_query(ctx, args)
     if query:
-        return await ctx.asend_reply_msg(await get_image_cq(
-            await compose_gacha_detail_image(ctx, query.gacha, full=query.full,
-                                            conditions=query.conditions, page=query.page, exchange=query.exchange,
-                                            show_unowned=query.show_unowned),
-            low_quality=True,
-        ))
+        started = time.perf_counter()
+        trace_id = f'{ctx.region}/{query.gacha.id}/{time.monotonic_ns()}'
+        image = await compose_gacha_detail_image(
+            ctx, query.gacha, full=query.full, conditions=query.conditions, page=query.page,
+            exchange=query.exchange, show_unowned=query.show_unowned, trace_id=trace_id)
+        rendered = time.perf_counter()
+        message = await get_image_cq(image, low_quality=True)
+        encoded = time.perf_counter()
+        result = await ctx.asend_reply_msg(message)
+        logger.info(f'卡池发送耗时 {trace_id}: '
+                    f'准备及绘图={rendered-started:.3f}s 编码={encoded-rendered:.3f}s '
+                    f'发送={time.perf_counter()-encoded:.3f}s')
+        return result
     
     # 查多个卡池
     filter, args = await parse_search_multiple_gacha_args(ctx, args)
@@ -1312,6 +1309,45 @@ from .costume_crop import fixed_bounds, resolve_costume_pair
 LEAK_NOTICE = '内容仅供参考，以正式实装为准'
 JST = ZoneInfo('Asia/Tokyo')
 _GACHA_RENDER_DATA = ContextVar('gacha_render_data')
+_GACHA_PREPARE_LIMIT = ASSET_RESOURCE_LIMIT
+
+
+async def _gacha_gather(*coroutines):
+    """保序准备独立资源，失败或取消时收取所有子任务的结果。"""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def get_gacha_asset_image(ctx, path, **options):
+    """在线程池读取和解码卡池图片，明确缺图仅缓存 60 秒。"""
+    token = None
+    if ASSET_REQUEST_LIMIT.get() is None:
+        token = ASSET_REQUEST_LIMIT.set(_GACHA_PREPARE_LIMIT)
+    try:
+        return await ctx.rip.img(path, decode_in_pool=True, cache_missing_secs=60, **options)
+    finally:
+        if token is not None:
+            ASSET_REQUEST_LIMIT.reset(token)
+
+
+async def _prepare_gacha_base_images(ctx, gacha):
+    """准备独立的基础图片，返回 Logo、Banner 和首张 UP 卡背景。"""
+    async def background():
+        identifier = next((card.id for card in gacha.cards if card.is_pickup), None)
+        if identifier is None:
+            return None
+        card = await ctx.md.cards.find_by_id(identifier)
+        return await get_card_image(ctx, identifier, after_training=has_after_training(card),
+                                    allow_error=True, decode_in_pool=True)
+
+    return await _gacha_gather(get_gacha_logo(ctx, gacha, default=None),
+                               get_gacha_banner(ctx, gacha, default=None), background())
 
 
 class GachaExtensionDataError(Exception):
@@ -1494,6 +1530,24 @@ async def _load_gacha_render_data(ctx, gacha):
     tables = {'gachas': [gacha.raw], '_unavailable_tables': []}
     required = set()
     raw = gacha.raw
+
+    async def load_tables(names):
+        """并发读取同阶段独立表，完成后按名称合并本请求的数据和失败状态。"""
+        async def load_table(name):
+            try:
+                rows = ([row.raw for row in await ctx.md.gachas.get()] if name == 'gachas'
+                        else await ctx.md.get(name))
+                if name == 'resourceBoxes' and isinstance(rows, dict):
+                    rows = [row for boxes in rows.values() for row in boxes.values()]
+                return name, rows, False
+            except Exception as error:
+                logger.print_exc(f'卡池关联数据读取失败：{ctx.region}/{name}：{error}')
+                return name, [], True
+
+        for name, rows, failed in await _gacha_gather(*(load_table(name) for name in sorted(names))):
+            tables[name] = rows
+            if failed:
+                tables['_unavailable_tables'].append(name)
     if any(row.get('gachaExtraId') for row in raw.get('gachaBehaviors', [])):
         required.update(('gachaExtras', 'resourceBoxes'))
     if raw.get('wishSelectCount') or raw.get('rateChoiceGachaWishGroupId'):
@@ -1508,19 +1562,8 @@ async def _load_gacha_render_data(ctx, gacha):
     if raw.get('gachaType') == 'gift':
         required.update(('giftGachaExchanges', 'resourceBoxes', 'materials'))
     if raw.get('gachaType') in ('sureturn', 'subeginner', 'sunormal'):
-        required.update(('gachaTabs', 'gachaExtras', 'resourceBoxes'))
-        tables['gachas'] = [row.raw for row in await ctx.md.gachas.get()]
-    for name in sorted(required):
-        try:
-            rows = await ctx.md.get(name)
-            if name == 'resourceBoxes' and isinstance(rows, dict):
-                rows = [row for boxes in rows.values() for row in boxes.values()]
-            tables[name] = rows
-        except Exception as error:
-            # 关联表短时不可用不能让原有卡池信息整体报错；扩展读取不到则跳过。
-            logger.print_exc(f'卡池扩展数据读取失败：{ctx.region}/{name}：{error}')
-            tables[name] = []
-            tables['_unavailable_tables'].append(name)
+        required.update(('gachaTabs', 'gachaExtras', 'resourceBoxes', 'gachas'))
+    await load_tables(required)
     if tables['_unavailable_tables']:
         return tables
     try:
@@ -1535,23 +1578,14 @@ async def _load_gacha_render_data(ctx, gacha):
              'skill_practice_ticket': 'skillPracticeTickets', 'boost_item': 'boostItems',
              'material': 'materials', 'costume_3d': 'costume3ds'}
     name_tables = {names[kind] for kind in kinds if kind in names}
-    for name in name_tables - set(tables):
-        try:
-            tables[name] = await ctx.md.get(name)
-        except Exception as error:
-            logger.print_exc(f'卡池奖励名称读取失败：{ctx.region}/{name}：{error}')
-            tables['_unavailable_tables'].append(name)
+    await load_tables(name_tables - set(tables))
     selected_costumes = {detail['resourceId'] for row in tables.get('resourceBoxes', [])
                          if (row['resourceBoxPurpose'], row['id']) in selected_boxes
                          for detail in row.get('details', []) if detail['resourceType'] == 'costume_3d'}
     if selected_costumes and any(not row.get('name') for row in tables.get('costume3ds', [])
                                  if row['id'] in selected_costumes):
         # Compact主表把名称拆到分组表；已有名称的完整主表无需读取不存在的分组端点。
-        try:
-            tables['costume3dGroups'] = await ctx.md.get('costume3dGroups')
-        except Exception as error:
-            logger.print_exc(f'卡池衣装名称读取失败：{ctx.region}：{error}')
-            tables['_unavailable_tables'].append('costume3dGroups')
+        await load_tables({'costume3dGroups'})
     selected_materials = {detail['resourceId'] for row in tables.get('resourceBoxes', [])
         if row['resourceBoxPurpose'] == 'gacha_extra' and (row['resourceBoxPurpose'], row['id']) in selected_boxes
         for detail in row.get('details', []) if detail['resourceType'] == 'material'}
@@ -1559,22 +1593,26 @@ async def _load_gacha_render_data(ctx, gacha):
                and (row.get('materialType') == 'card_ticket' or
                     any(word in row.get('name', '') for word in ('メンバーチケット', 'セレクトチケット', '自选', '成员兑换券')))]
     if tickets or 'gacha_ticket' in kinds:
-        for name in ('materialExchangeSummaries', 'cards', 'eventCards', 'events'):
-            try:
-                tables[name] = await ctx.md.get(name)
-            except Exception as error:
-                logger.print_exc(f'卡池兑换范围读取失败：{ctx.region}/{name}：{error}')
-                tables['_unavailable_tables'].append(name)
+        await load_tables({'materialExchangeSummaries', 'cards', 'eventCards', 'events'} - set(tables))
     return tables
 
 
 async def compose_gacha_detail_image(ctx: SekaiHandlerContext, gacha: Gacha, *, full=False, conditions='', page=1,
-                                   exchange=False, show_unowned=False, personal_profile=None):
+                                   exchange=False, show_unowned=False, personal_profile=None, trace_id=None):
     """准备特殊机制和可选完整名单，请求数据通过ContextVar隔离。"""
     full = full or exchange or show_unowned
-    tables = await _load_gacha_render_data(ctx, gacha)
-    token = _GACHA_RENDER_DATA.set((ctx, tables))
+    trace_id = trace_id or f'{ctx.region}/{gacha.id}/{time.monotonic_ns()}'
+    limit_token = ASSET_REQUEST_LIMIT.set(_GACHA_PREPARE_LIMIT)
+    timings = []
+    timing_token = ASSET_PREPARE_TIMINGS.set(timings)
+    token = None
+    started = time.perf_counter()
     try:
+        tables, base_images = await _gacha_gather(_load_gacha_render_data(ctx, gacha),
+                                                 _prepare_gacha_base_images(ctx, gacha))
+        tables['_base_images'] = base_images
+        token = _GACHA_RENDER_DATA.set((ctx, tables))
+        prepared = time.perf_counter()
         full_data = await prepare_gacha_full_list(ctx, gacha, conditions, exchange=exchange) if full else None
         if full_data is not None and show_unowned and personal_profile is None:
             personal_profile, _ = await get_detailed_profile(
@@ -1588,9 +1626,18 @@ async def compose_gacha_detail_image(ctx: SekaiHandlerContext, gacha: Gacha, *, 
             full_data['ordered_ids'] = [card_id for card_id in full_data['ordered_ids'] if card_id not in owned_ids]
             full_data['matched'] = len(full_data['ordered_ids'])
             full_data['personal_profile'] = personal_profile
-        return await _compose_gacha_detail_image(ctx, gacha, full_data, page)
+        listed = time.perf_counter()
+        image = await _compose_gacha_detail_image(ctx, gacha, full_data, page)
+        logger.info(f'卡池绘图耗时 {trace_id}: 数据及基础图片={prepared-started:.3f}s '
+                    f'名单及持卡={listed-prepared:.3f}s 绘制及其余素材={time.perf_counter()-listed:.3f}s')
+        if timings:
+            logger.info(f'卡池资源耗时 {trace_id}: {timings}')
+        return image
     finally:
-        _GACHA_RENDER_DATA.reset(token)
+        if token is not None:
+            _GACHA_RENDER_DATA.reset(token)
+        ASSET_REQUEST_LIMIT.reset(limit_token)
+        ASSET_PREPARE_TIMINGS.reset(timing_token)
 
 
 GACHA_TYPE_NAMES.update({'sureturn': '回归阶梯', 'subeginner': '新手阶梯', 'sunormal': '阶梯', 'return': '回归'})
@@ -2018,18 +2065,26 @@ def costume_role_cache_key(ctx, raw, relative):
 async def draw_costume(ctx, raw, width):
     """类型确认与裁切回退分开：未知图1占位，不能盲裁或直接放整张原图。"""
     relative = f"gacha/{raw['assetbundleName']}/screen/texture"
-    first = await ctx.rip.img(f"{relative}/bg_gacha{raw['id']}_1.png", default=None)
-    second = await ctx.rip.img(f"{relative}/bg_gacha{raw['id']}_2.png", default=None)
-    # 国服专有衣装包使用一张多人展示背景，img_是宣传文字层，不能当作第二张试穿图。
-    if first is None and second is None and ctx.region == 'cn':
-        stem = raw['assetbundleName'].removeprefix('ab_')
-        single_path = f'{relative}/bg_{stem}.png'
-        single = await ctx.rip.img(single_path, default=None)
+    stem = raw['assetbundleName'].removeprefix('ab_')
+    single_path = f'{relative}/bg_{stem}.png'
+    single_first = ctx.region == 'cn' and raw['assetbundleName'].startswith('ab_gacha_cn_')
+    if single_first:
+        single = await get_gacha_asset_image(ctx, single_path, default=None)
         if single is not None:
             await draw_single_costume_lineup(ctx, raw, single, single_path, width)
             return
-    title_first = await ctx.rip.img(f"{relative}/cardname_gacha{raw['id']}_1.png", default=None)
-    title_second = await ctx.rip.img(f"{relative}/cardname_gacha{raw['id']}_2.png", default=None)
+    first, second = await _gacha_gather(
+        get_gacha_asset_image(ctx, f"{relative}/bg_gacha{raw['id']}_1.png", default=None),
+        get_gacha_asset_image(ctx, f"{relative}/bg_gacha{raw['id']}_2.png", default=None))
+    # 国服专有衣装包使用一张多人展示背景，img_是宣传文字层，不能当作第二张试穿图。
+    if first is None and second is None and ctx.region == 'cn' and not single_first:
+        single = await get_gacha_asset_image(ctx, single_path, default=None)
+        if single is not None:
+            await draw_single_costume_lineup(ctx, raw, single, single_path, width)
+            return
+    title_first, title_second = await _gacha_gather(
+        get_gacha_asset_image(ctx, f"{relative}/cardname_gacha{raw['id']}_1.png", default=None),
+        get_gacha_asset_image(ctx, f"{relative}/cardname_gacha{raw['id']}_2.png", default=None))
     # 读取用途缓存和原子保存均在线程中执行，避免同步磁盘等待占用命令事件循环。
     classification = await asyncio.to_thread(
         resolve_costume_pair, first, second, title_first is not None and title_second is not None,
@@ -2112,7 +2167,7 @@ async def draw_gacha_costume_names(ctx, raw, width):
         icon = None
         asset_names = list(dict.fromkeys(costume['assetbundleName'] for costume in costumes if costume.get('assetbundleName')))
         for asset_name in asset_names[:3]:
-            icon = await ctx.rip.img(f'thumbnail/costume_rip/{asset_name}.png', default=None)
+            icon = await get_gacha_asset_image(ctx, f'thumbnail/costume_rip/{asset_name}.png', default=None)
             if icon is not None:
                 break
         with HSplit().set_w(width).set_sep(10).set_content_align('l').set_item_align('c'):

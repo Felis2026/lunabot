@@ -81,6 +81,82 @@ async def _(ctx: SekaiHandlerContext):
 
 
 card_extractor = CardExtractor()
+_card_extractor_signature = None
+_card_extractor_tasks = {}
+_card_extractor_build_lock = asyncio.Lock()
+_card_extractor_retry = {}
+
+
+async def _build_card_extractor(ctx, cards, signature):
+    """尝试补齐候选素材并独立建索引，已有索引在素材不齐时继续使用。"""
+    global card_extractor, _card_extractor_signature
+    async with _card_extractor_build_lock:
+        if _card_extractor_signature == signature:
+            return card_extractor
+        requests, candidates = {}, []
+        for card in cards:
+            states = ([False] if not only_has_after_training(card) else []) + ([True] if has_after_training(card) else [])
+            for trained in states:
+                image_type = 'after_training' if trained else 'normal'
+                path = f"thumbnail/chara_rip/{card['assetbundleName']}_{image_type}.png"
+                requests[path] = lambda path=path: ctx.rip.get_asset_cache_path(path)
+                candidates.append((card, trained, path))
+        paths = await prepare_assets(requests)
+        complete = all(paths[path] for _, _, path in candidates)
+        if not candidates or not any(paths.values()):
+            raise ValueError('卡牌识别素材未准备完整')
+        if not complete and card_extractor.is_initialized():
+            raise ValueError('卡牌识别新素材未准备完整，继续使用已有索引')
+        thumbnails = [CardThumbnail(id=card['id'], rarity=card['cardRarityType'], attr=card['attr'],
+                                    is_aftertraining=trained, img_path=paths[path])
+                      for card, trained, path in candidates if paths[path]]
+        candidate = CardExtractor()
+        await run_in_pool_until_complete(candidate.init, thumbnails)
+        card_extractor, _card_extractor_signature = candidate, signature if complete else None
+        _card_extractor_retry.pop(signature, None)
+        if not complete:
+            # 首次准备仍可识别已具备的素材，缺失项继续按三十秒间隔补齐。
+            _card_extractor_retry.clear()
+            _card_extractor_retry[signature] = time.monotonic() + 30
+            logger.warning(f'卡牌识别索引尚缺 {len(candidates) - len(thumbnails)} 张素材，后续访问重试')
+        return candidate
+
+
+@resource_prepare_scope()
+async def get_card_extractor(ctx):
+    """取得可用索引；更新失败保留旧索引，缺失素材三十秒后重试补齐。"""
+    cards = list(await ctx.md.cards.get())
+    signature = (ctx.region, tuple((card['id'], card['assetbundleName'], card['cardRarityType'], card['attr'],
+                                    card.get('initialSpecialTrainingStatus')) for card in cards))
+    if _card_extractor_signature == signature:
+        return card_extractor
+    retry_at = _card_extractor_retry.get(signature, 0)
+    if time.monotonic() < retry_at:
+        if card_extractor.is_initialized():
+            return card_extractor
+        raise ReplyException('卡牌识别素材准备未完成，请稍后重试')
+    task = _card_extractor_tasks.get(signature)
+    if task is None:
+        task = asyncio.create_task(_build_card_extractor(ctx, cards, signature))
+        _card_extractor_tasks[signature] = task
+
+        def finish(completed):
+            if _card_extractor_tasks.get(signature) is completed:
+                _card_extractor_tasks.pop(signature, None)
+            if not completed.cancelled() and completed.exception() is not None:
+                _card_extractor_retry.clear()
+                _card_extractor_retry[signature] = time.monotonic() + 30
+
+        task.add_done_callback(finish)
+    try:
+        return await asyncio.shield(task)
+    except Exception as exc:
+        logger.warning(f'卡牌识别索引准备失败: {get_exc_desc(exc)}')
+        if card_extractor.is_initialized():
+            return card_extractor
+        raise ReplyException('卡牌识别素材准备未完成，请稍后重试') from exc
+
+
 extract_card = SekaiCmdHandler([
     "/提取卡牌"
 ], regions=['jp'])
@@ -88,7 +164,6 @@ extract_card.check_cdrate(cd).check_wblist(gbl)
 @extract_card.handle()
 async def _(ctx: SekaiHandlerContext):
     await ctx.block()
-    global card_extractor
     bot, event = ctx.bot, ctx.event
     reply_msg = ctx.get_reply_msg()
     assert_and_reply(reply_msg, "请回复一张游戏内“角色 > 成员”卡牌一览截图")
@@ -96,40 +171,11 @@ async def _(ctx: SekaiHandlerContext):
     assert_and_reply(cqs.get('image'), "回复消息中没有可读取的图片")
     img = await download_image(cqs['image'][0]['url'])
     
-    if not card_extractor.is_initialized():
-        card_thumbs = []
-        for card in await ctx.md.cards.get():
-            card_id = card['id']
-            rarity = card['cardRarityType']
-            attr = card['attr']
-            assetbundle_name = card['assetbundleName']
-            if not only_has_after_training(card):
-                normal_path = await ctx.rip.get_asset_cache_path(f'thumbnail/chara_rip/{assetbundle_name}_normal.png')
-                if normal_path:
-                    card_thumbs.append(CardThumbnail(
-                        id=card_id,
-                        rarity=rarity,
-                        attr=attr,
-                        is_aftertraining=False,
-                        img_path=normal_path,
-                    ))
-            if has_after_training(card):
-                aftertraining_path = await ctx.rip.get_asset_cache_path(f'thumbnail/chara_rip/{assetbundle_name}_after_training.png')
-                if aftertraining_path:
-                    card_thumbs.append(CardThumbnail(
-                        id=card_id,
-                        rarity=rarity,
-                        attr=attr,
-                        is_aftertraining=True,
-                        img_path=aftertraining_path,
-                    ))
-        t = datetime.now()
-        await run_in_pool(card_extractor.init, card_thumbs)
-        logger.info(f"CardExtractor initialized in {datetime.now() - t} seconds")
+    extractor = await get_card_extractor(ctx)
     
     t = datetime.now()
     try:
-        result: CardExtractResult = await run_in_pool(card_extractor.extract_cards, img)
+        result: CardExtractResult = await run_in_pool_until_complete(extractor.extract_cards, img)
     except CardGridDetectionError as e:
         # 该识别器只支持卡牌一览的规则方格截图；对表情包、卡面或裁剪图应给出
         # 可操作的提示，不能把底层网格检测异常直接暴露给用户。
@@ -139,6 +185,14 @@ async def _(ctx: SekaiHandlerContext):
         )
     logger.info(f"CardExtractor extracted {len(result.cards)} cards in {datetime.now() - t} seconds")
     
+    async def prepare_thumbnail(card):
+        pcard = dict(defaultImage='special_training' if card.is_aftertraining else 'normal',
+                     specialTrainingStatus='done' if card.is_aftertraining else 'none',
+                     level=card.level, masterRank=card.master_rank)
+        custom_text = None if card.level is not None else f'SLv.{card.skill_level}'
+        return await get_card_full_thumbnail(ctx, card.id, pcard=pcard, custom_text=custom_text)
+    thumbnails = await prepare_assets({(card.row_idx, card.col_idx): lambda card=card: prepare_thumbnail(card)
+                                       for card in result.cards})
     with Canvas(bg=FillBg(WHITE)).set_padding(BG_PADDING) as canvas:
         with Grid(col_count=result.grid.cols).set_sep(8, 8):
             for row_idx in range(result.grid.rows):
@@ -160,14 +214,7 @@ async def _(ctx: SekaiHandlerContext):
                         if card is None:
                             ImageBox(UNKNOWN_IMG, size=(w, w))
                         else:
-                            pcard = {
-                                'defaultImage': "special_training" if card.is_aftertraining else "normal",
-                                'specialTrainingStatus': "done" if card.is_aftertraining else "none",
-                                'level': card.level,
-                                'masterRank': card.master_rank,
-                            }
-                            custom_text = None if card.level is not None else f"SLv.{card.skill_level}"
-                            thumb = await get_card_full_thumbnail(ctx, card.id, pcard=pcard, custom_text=custom_text)
+                            thumb = thumbnails[row_idx, col_idx]
                             ImageBox(thumb, size=(w, w))
         
     return await ctx.asend_reply_msg(

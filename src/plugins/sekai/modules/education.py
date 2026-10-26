@@ -703,8 +703,9 @@ async def get_area_item_icon(ctx: SekaiHandlerContext, asset_name: str) -> Image
     return UNKNOWN_IMG
 
 
-# 合成区域道具升级材料图片
+@resource_prepare_scope()
 async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qid: int, filter: AreaItemFilter) -> Image.Image:
+    """绘制筛选道具的升级需求，qid 为空时展示从零开始的累计材料。"""
     profile = None
     if qid:
         profile, pmsg = await get_detailed_profile(
@@ -787,10 +788,10 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
 
     item_ids = sorted(item_ids)
     # 未选中的道具不下载图标，防止一次普通查询也触发新道具素材请求。
-    for item in await ctx.md.area_items.get():
-        if item['id'] in item_ids:
-            asset_name = item['assetbundleName']
-            area_item_icons[item['id']] = await get_area_item_icon(ctx, asset_name)
+    icon_requests = {
+        item['assetbundleName']: lambda name=item['assetbundleName']: get_area_item_icon(ctx, name)
+        for item in await ctx.md.area_items.get() if item['id'] in item_ids
+    }
 
     # 统计展示的最低等级
     user_area_item_lower_lv = None
@@ -845,6 +846,15 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
             for mid, quantity in materials.items():
                 sum_materials[mid] = sum_materials.get(mid, 0) + quantity
                 area_item_lv_sum_materials.setdefault(item_id, {}).setdefault(lv, {})[mid] = sum_materials[mid]
+
+    material_ids = {mid for item_id, levels in area_item_lv_sum_materials.items()
+                    for level, materials in levels.items() for mid in materials}
+    requests = {('item', name): factory for name, factory in icon_requests.items()}
+    requests.update({('material', mid): lambda mid=mid: get_res_icon(
+        ctx, 'coin' if mid == COIN_ID else 'material', mid) for mid in material_ids})
+    prepared = await prepare_assets(requests)
+    area_item_icons = {item['id']: prepared['item', item['assetbundleName']]
+                       for item in await ctx.md.area_items.get() if item['id'] in item_ids}
 
     def get_quant_text(q: int) -> str:
         if q >= 10000000:
@@ -919,7 +929,7 @@ async def compose_area_item_upgrade_materials_image(ctx: SekaiHandlerContext, qi
                                 else:
                                     for mid, quantity in lv_materials[lv].items():
                                         with VSplit().set_content_align('c').set_item_align('c').set_sep(4):
-                                            material_icon = await get_res_icon(ctx, 'coin' if mid == COIN_ID else 'material', mid)
+                                            material_icon = prepared['material', mid]
                                             quantity_text = get_quant_text(quantity)
                                             have_text = get_quant_text(user_materials.get(mid, 0))
                                             sum_text = get_quant_text(lv_sum_materials[lv][mid])
