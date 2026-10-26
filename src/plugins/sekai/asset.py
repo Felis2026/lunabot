@@ -1308,29 +1308,37 @@ class RegionRipAssetManger:
         self.cache_dir = pjoin(DEFAULT_RIP_ASSET_DIR, region)
         self.cached_images: Dict[str, Image.Image] = {}
         self._asset_requests: dict[tuple, asyncio.Task] = {}
+        self._json_requests: dict[tuple, asyncio.Task] = {}
         self._missing_assets = OrderedDict()
         create_folder(self.cache_dir)
 
     def _iter_local_cache_paths(self, path: str) -> List[str]:
-        candidates: List[str] = [path]
+        """优先匹配更新器的当前导出格式，同时保留旧缓存路径。"""
+        current = path.replace('_rip/', '/')
+        parts = current.split('/')
+        # 卡池屏幕贴图已平铺导出；其他资源的 texture 目录仍有独立含义。
+        if len(parts) == 5 and parts[0] == 'gacha' and parts[2:4] == ['screen', 'texture']:
+            current = '/'.join(parts[:3] + parts[4:])
+        if current.endswith('.asset'):
+            current = current[:-6] + '.json'
+        score = current.startswith('music/music_score/')
+        if score and not Path(current).suffix:
+            current += '.txt'
 
-        # _rip -> 非 _rip
-        if "_rip/" in path:
-            alt_path = path.replace("_rip/", "/")
-            if alt_path not in candidates:
-                candidates.append(alt_path)
-
-        # 非 _rip -> _rip（仅处理最后一层目录，适配 xxx/dir/file 与 xxx/dir_rip/file）
-        parts = path.split("/")
-        if len(parts) >= 2:
-            parent = parts[-2]
-            if not parent.endswith("_rip"):
-                alt_parent = parent + "_rip"
-                alt_path = "/".join(parts[:-2] + [alt_parent, parts[-1]])
-                if alt_path not in candidates:
-                    candidates.append(alt_path)
-
-        return candidates
+        variants = [current]
+        parts = current.split('/')
+        if len(parts) == 4 and parts[0] == 'gacha' and parts[2] == 'screen':
+            variants.append('/'.join(parts[:3] + ['texture', parts[-1]]))
+        if path.endswith('.asset'):
+            variants.extend(item[:-5] + '.asset' for item in list(variants))
+        if score and current.endswith('.txt'):
+            variants.append(current[:-4])
+        variants.append(path)
+        for item in list(variants):
+            parts = item.split('/')
+            if len(parts) >= 2 and not parts[-2].endswith('_rip'):
+                variants.append('/'.join(parts[:-2] + [parts[-2] + '_rip', parts[-1]]))
+        return list(dict.fromkeys(variants))
 
     def get_local_asset_cache_path(
         self,
@@ -1482,7 +1490,7 @@ class RegionRipAssetManger:
         - `cache_expire_secs`: 缓存过期时间
         - `timeout`: 超时时间
         """
-        cache_path = pjoin(self.cache_dir, path)
+        cache_path = pjoin(self.cache_dir, self._iter_local_cache_paths(path)[0])
         # 首先尝试从缓存加载
         if use_cache:
             cached = (await run_in_pool_until_complete(self._read_cached_asset, path, cache_expire_secs) if read_in_pool
@@ -1554,7 +1562,7 @@ class RegionRipAssetManger:
                                         cache_expire_secs=cache_expire_secs, timeout=timeout,
                                         read_in_pool=True)
             return self.get_local_asset_cache_path(path, cache_expire_secs=None) if data is not None else default
-        cache_path = pjoin(self.cache_dir, path)
+        cache_path = pjoin(self.cache_dir, self._iter_local_cache_paths(path)[0])
         
         # 尝试从网络下载
         error_list: List[Tuple[str, str]] = []
@@ -1650,6 +1658,56 @@ class RegionRipAssetManger:
         logger.warning(f"解析下载的 {self.region} 解包资源 {path} 为图片失败: 返回默认值")
         return default
     
+    def _read_cached_json(self, path, cache_expire_secs, required_keys):
+        """按业务字段识别同名 JSON 导出，多个候选均匹配时交由上游确认。"""
+        for relative in self._iter_local_cache_paths(path):
+            target = Path(self.cache_dir) / relative
+            candidates = [target]
+            if target.suffix == '.json':
+                candidates.extend(sorted(target.parent.glob(target.stem + '__dup*.json')))
+            matches = []
+            for candidate in candidates:
+                try:
+                    if cache_expire_secs is not None and time.time() - candidate.stat().st_mtime >= cache_expire_secs:
+                        continue
+                    data = loads_json(candidate.read_bytes())
+                    if isinstance(data, dict) and all(key in data for key in required_keys):
+                        if candidate == target:
+                            return data
+                        matches.append(data)
+                except (OSError, ValueError, TypeError):
+                    continue
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                return None
+        return None
+
+    async def _get_validated_json(self, path, cache_expire_secs, timeout, required_keys):
+        """合并同一业务 JSON 的上游读取，校验成功后保存当前格式的缓存。"""
+        sources = tuple((source.base_url, tuple(source.prefixes or ())) for source in self.sources)
+        key = (path, cache_expire_secs, get_cfg_or_value(timeout), required_keys, sources)
+        task = self._json_requests.get(key)
+        if task is None:
+            async def fetch():
+                data = await self.get_asset(path, False, False, None, cache_expire_secs,
+                                            get_cfg_or_value(timeout), read_in_pool=True)
+                result = await run_in_pool_until_complete(loads_json, data)
+                if not isinstance(result, dict) or any(field not in result for field in required_keys):
+                    raise ValueError('资源 JSON 缺少所需业务字段')
+                cache_path = pjoin(self.cache_dir, self._iter_local_cache_paths(path)[0])
+                await run_in_pool_until_complete(self._write_cached_asset, cache_path, data)
+                return data
+            task = asyncio.create_task(fetch())
+            self._json_requests[key] = task
+            def finish(completed):
+                if self._json_requests.get(key) is completed:
+                    self._json_requests.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+            task.add_done_callback(finish)
+        return await asyncio.shield(task)
+
     async def json(
         self,
         path: str, 
@@ -1658,6 +1716,7 @@ class RegionRipAssetManger:
         default=None, 
         cache_expire_secs=None, 
         timeout: Union[int, ConfigItem]=DEFAULT_GET_RIP_ASSET_TIMEOUT_CFG,
+        *, required_keys: tuple[str, ...]=(),
     ) -> Any:
         """
         获取json类型解包资源，参数：
@@ -1667,12 +1726,27 @@ class RegionRipAssetManger:
         - `default`: 允许错误的情况下的默认值
         - `cache_expire_secs`: 缓存过期时间
         - `timeout`: 超时时间
+        - `required_keys`: 用于区分同名导出文件的必要业务字段
         """
+        # Unity 元数据和业务对象可能被导出成同名文件，用字段区分实际需要的数据。
+        if use_cache and required_keys:
+            cached = await run_in_pool_until_complete(self._read_cached_json, path, cache_expire_secs, required_keys)
+            if cached is not None:
+                return cached
         in_pool = ASSET_PREPARE_IN_POOL.get()
-        data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs,
-                                    get_cfg_or_value(timeout), read_in_pool=in_pool)
+        if not required_keys:
+            data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs,
+                                        get_cfg_or_value(timeout), read_in_pool=in_pool)
         try:
-            return await run_in_pool_until_complete(loads_json, data) if in_pool else loads_json(data)
+            if required_keys and use_cache:
+                data = await self._get_validated_json(path, cache_expire_secs, timeout, required_keys)
+            elif required_keys:
+                data = await self.get_asset(path, use_cache, allow_error, default, cache_expire_secs,
+                                            get_cfg_or_value(timeout), read_in_pool=in_pool)
+            result = await run_in_pool_until_complete(loads_json, data) if in_pool else loads_json(data)
+            if required_keys and (not isinstance(result, dict) or any(key not in result for key in required_keys)):
+                raise ValueError('资源 JSON 缺少所需业务字段')
+            return result
         except asyncio.CancelledError:
             raise
         except: pass

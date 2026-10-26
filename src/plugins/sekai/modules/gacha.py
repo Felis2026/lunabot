@@ -2064,6 +2064,7 @@ def costume_role_cache_key(ctx, raw, relative):
 
 async def draw_costume(ctx, raw, width):
     """类型确认与裁切回退分开：未知图1占位，不能盲裁或直接放整张原图。"""
+    # CDN 仍使用 texture 路径；资源管理器将本地读取与裁框指纹统一到当前导出文件。
     relative = f"gacha/{raw['assetbundleName']}/screen/texture"
     stem = raw['assetbundleName'].removeprefix('ab_')
     single_path = f'{relative}/bg_{stem}.png'

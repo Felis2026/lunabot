@@ -1461,6 +1461,7 @@ async def _prepare_mysekai_fixture_detail(ctx: SekaiHandlerContext, fid: int) ->
     react_data = await ctx.rip.json(
         'mysekai/system/fixture_reaction_data_rip/fixture_reaction_data.asset', 
         cache_expire_secs=60*60*24, 
+        required_keys=('FixturerRactions',),
     )
     if react_data:
         react_data = find_by(react_data['FixturerRactions'], 'FixtureId', fid)
