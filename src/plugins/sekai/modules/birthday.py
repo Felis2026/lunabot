@@ -15,7 +15,7 @@ from .profile import (
     get_player_bind_id, get_basic_profile, get_detailed_profile,
     get_detailed_profile_card, get_detailed_profile_card_filter,
     get_player_avatar_info_by_detailed_profile, get_player_avatar_info_by_basic_profile,
-    get_player_frames, get_selected_custom_avatar_frame, PlayerAvatarInfo,
+    get_player_frames, get_selected_custom_avatar_frame, PlayerAvatarInfo, to_unix_millis,
 )
 from .mysekai import (
     get_mysekai_info, get_mysekai_info_card, get_mysekai_and_detail_profile_card,
@@ -227,28 +227,42 @@ def _birthday_find(data: dict, table: str, key: str, value):
     return next((row for row in rows if row.get(key) == value), None) if isinstance(rows, list) else None
 
 
+def _birthday_inventory(table, identity, identifier, suite, capture):
+    """选择 MySekai 与 Suite 中较新的指定材料库存，均缺失时返回未知。"""
+    resources = (capture or {}).get('updatedResources', {})
+    captured = _birthday_find(resources, table, identity, identifier)
+    stored = _birthday_find(suite or {}, table, identity, identifier)
+    stamps = (capture or {}).get('resource_updated_at_ms', {})
+    capture_time = to_unix_millis(stamps.get(f'{table}:{identifier}')
+                                 or stamps.get(table) or resources.get('now'))
+    suite_time = to_unix_millis((suite or {}).get('upload_time'))
+    if captured is not None and (stored is None or suite_time is None or
+                                 (capture_time is not None and capture_time >= suite_time)):
+        return captured.get('quantity')
+    return stored.get('quantity') if stored is not None else None
+
+
 def _birthday_calculate(party, bonuses, threshold, target, suite, capture, prestart, top):
     """分别提取持卡、库存与当期进度，缺字段保持未知，积分向上取整为露滴需求。"""
     resources = capture.get('updatedResources', {}) if capture else {}
     cards = suite.get('userCards') if suite else None
     owned = {row['cardId'] for row in cards} if isinstance(cards, list) else None
     bonus = sum(row['rate'] for row in bonuses if top or row['cardId'] in owned) if bonuses and (top or owned is not None) else None
-    # 生日累计进度来自 MySekai，Suite 只提供持卡与库存。
+    # 生日进度来自 MySekai，库存按材料更新时间选择来源，持卡使用 Suite。
     progress = _birthday_find(resources, 'userBirthdayParties', 'birthdayPartyId', party['id'])
     planning = prestart or top
     count = 0 if planning else progress.get('obtainedMysekaiMaterialCount') if progress else None
+    pending = 0 if planning else progress.get('droppedMysekaiMaterialCount') if progress else None
     point = 0 if planning else progress.get('deliveryTotalPoint') if progress else None
-    inventory = _birthday_find(suite or {}, 'userMaterials', 'materialId', party['deliveryItemMaterialId'])
-    flowers = _birthday_find(suite or {}, 'userMysekaiMaterials', 'mysekaiMaterialId', party['deliveryRewardMysekaiMaterialId'])
-    inventory = inventory.get('quantity') if inventory else None
-    flowers = flowers.get('quantity') if flowers else None
+    inventory = _birthday_inventory('userMaterials', 'materialId', party['deliveryItemMaterialId'], suite, capture)
+    flowers = _birthday_inventory('userMysekaiMaterials', 'mysekaiMaterialId', party['deliveryRewardMysekaiMaterialId'], suite, capture)
     per_dew = BIRTHDAY_DELIVERY_BASE_POINT + bonus if bonus is not None else None
     remaining = max(0, target * threshold - point) if target is not None and threshold and point is not None else None
     divisor = per_dew or BIRTHDAY_DELIVERY_BASE_POINT
     need = (remaining + divisor - 1) // divisor if remaining is not None else None
     upper_bound = need is not None and per_dew is None
     gap = max(0, need - inventory) if need is not None and inventory is not None and not upper_bound else None
-    return dict(owned=owned, bonus=bonus, count=count, point=point, inventory=inventory,
+    return dict(owned=owned, bonus=bonus, count=count, pending_flowers=pending, point=point, inventory=inventory,
                 flower_stock=flowers, per_dew=per_dew, need=need, gap=gap, upper_bound=upper_bound,
                 planning=planning, target=target, threshold=threshold, top=top, bonuses=bonuses)
 
@@ -600,10 +614,8 @@ def _draw_birthday_progress_panel(data, flower, dew, is_flower):
     point, threshold = state['point'], state['threshold']
     value = state['count'] if is_flower else point % threshold if point is not None and threshold else None
     total = state['target'] if is_flower else threshold
-    # 积分与累计获得数分别上报；已够下一朵时保留满条，不因取余显示成重新开始。
-    pending_flower = point is not None and threshold and state['count'] is not None and point >= (state['count'] + 1) * threshold
-    if not is_flower and pending_flower:
-        value = threshold
+    # 积分达到门槛即进入下一轮，待领取数用括号附在下一轮说明后。
+    pending = state.get('pending_flowers')
     with VSplit().set_w(512).set_padding(16).set_sep(10).set_item_align('l'):
         with HSplit().set_sep(8).set_item_align('c'):
             ImageBox(flower if is_flower else dew, size=(36, 36))
@@ -616,12 +628,14 @@ def _draw_birthday_progress_panel(data, flower, dew, is_flower):
                     TextBox(f"库存 {state['flower_stock']} 朵", _birthday_style(15)).set_w(480).set_content_align('r')
             if is_flower:
                 TextBox(f"{'起算值' if state['planning'] else '已获得'} {value} 朵　目标 {total} 朵", _birthday_style(16))
-            elif pending_flower:
-                TextBox('积分已满足下一朵，累计花朵记录尚未增加', _birthday_style(16))
-            elif state['per_dew']:
-                TextBox(f"再消耗 {math.ceil((total - value) / state['per_dew'])} 个露滴可培育下一朵", _birthday_style(16))
             else:
-                TextBox(f'距下一朵还差 {total - value:,} 积分', _birthday_style(16))
+                if state['per_dew']:
+                    description = f"再消耗 {math.ceil((total - value) / state['per_dew'])} 个露滴可培育下一朵"
+                else:
+                    description = f'距下一朵还差 {total - value:,} 积分'
+                if pending:
+                    description += f'（待领取 {pending} 朵）'
+                TextBox(description, _birthday_style(16))
         else:
             TextBox('*本期花朵目标暂未公布' if is_flower and value is not None else '*未获取到生日进度或积分规则', _birthday_style(16, color=RED))
             if is_flower and state['flower_stock'] is not None:
