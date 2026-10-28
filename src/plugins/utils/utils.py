@@ -1259,95 +1259,152 @@ from playwright.async_api import (
 )
 
 _playwright_instance: Playwright | None = None
-_browser_type: BrowserType | None = NotImplementedError
+_browser_type: BrowserType | None = None
 _playwright_browser: Browser | None = None
+_playwright_init_lock = asyncio.Lock()
 
 MAX_CONTEXTS = global_config.get("playwright.context_num")
-_context_semaphore = asyncio.Semaphore(MAX_CONTEXTS)
+_context_semaphore = asyncio.BoundedSemaphore(MAX_CONTEXTS)
+PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS = 30
+PLAYWRIGHT_CREATE_TIMEOUT_SECONDS = 30
+PLAYWRIGHT_CLOSE_TIMEOUT_SECONDS = 10
+SVG_RENDER_TIMEOUT_SECONDS = 90
+
+
+async def _get_playwright_browser() -> Browser:
+    """复用已连接的浏览器，并串行处理首次启动和断连后的重建。"""
+    global _playwright_instance, _browser_type, _playwright_browser
+    async with _playwright_init_lock:
+        if _playwright_browser is not None and _playwright_browser.is_connected():
+            return _playwright_browser
+        if _playwright_instance is None:
+            _playwright_instance = await async_playwright().start()
+            utils_logger.info("初始化 Playwright 异步 API")
+
+        pw_cfg = global_config.get("playwright", {})
+        remote_url = pw_cfg.get("remote_url", "")
+        _browser_type = getattr(_playwright_instance, pw_cfg.get("browser_type", "chromium"))
+        if remote_url:
+            if remote_url.startswith(("ws://", "wss://")):
+                _playwright_browser = await _browser_type.connect(remote_url, timeout=30000)
+            else:
+                _playwright_browser = await _browser_type.connect_over_cdp(remote_url, timeout=30000)
+            utils_logger.info("成功连接远程 Playwright 浏览器")
+        else:
+            _playwright_browser = await _browser_type.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox'],
+                timeout=30000,
+            )
+            utils_logger.info("启动本地 Playwright Browser")
+        return _playwright_browser
+
 
 class PlaywrightPage:
+    """借用一个浏览器页面，退出或创建失败时关闭会话并归还并发额度。
+
+    取消期间等待有期限的创建和清理完成，避免丢失尚未返回的会话。
+    等待额度或创建页面超时会抛出 TimeoutError，调用方仍需限制业务执行时间。
     """
-    异步上下文管理器，用于管理 Playwright 的context。
-    """
+
     def __init__(self, context_options: dict | None = None):
+        self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
-        self.context_options: dict = context_options if context_options is not None else { 
-            'locale': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+        self.context_options = dict(context_options) if context_options is not None else {
+            'locale': 'zh-CN',
+            'extra_http_headers': {
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+            },
         }
+        self._acquired = False
+        self._entered = False
+        self._open_task: asyncio.Task | None = None
+        self._cleanup_task: asyncio.Task | None = None
+
+    async def _open(self) -> Page:
+        """在创建期限内连接浏览器并创建独立会话和页面。"""
+        stage = "连接浏览器"
+        try:
+            self.browser = await _get_playwright_browser()
+            stage = "创建会话"
+            self.context = await self.browser.new_context(**self.context_options)
+            stage = "创建页面"
+            self.page = await self.context.new_page()
+            return self.page
+        except Exception:
+            utils_logger.print_exc(f"Playwright {stage}失败")
+            raise
 
     async def __aenter__(self) -> Page:
-        global _playwright_instance, _browser_type, _playwright_browser
-        # 检查浏览器的情况
-        if _playwright_browser is None or not _playwright_browser.is_connected():
-
-            if _playwright_instance is None: 
-                # 启动async_playwright实例
-                _playwright_instance = await async_playwright().start()
-                utils_logger.info("初始化 Playwright 异步 API")
-                pass
-            
-            # 获取配置
-            pw_cfg = global_config.get("playwright", {})
-            remote_url :str = pw_cfg.get("remote_url", "")
-            browser_type_str = pw_cfg.get("browser_type", "chromium")
-            
-            _browser_type = getattr(_playwright_instance, browser_type_str)
-
-            if remote_url:
-                utils_logger.info(f"正在连接远程 Playwright 浏览器: {remote_url}")
-                if remote_url.startswith("ws://") or remote_url.startswith("wss://"):
-                    _playwright_browser = await _browser_type.connect(remote_url, timeout=30000)
-                else:
-                    _playwright_browser = await _browser_type.connect_over_cdp(remote_url, timeout=30000)
-                utils_logger.info(f"成功连接至远程浏览器")
-            else:
-                # 清除本地临时文件
-                if os.system("rm -rf /tmp/rust_mozprofile*") != 0:
-                    utils_logger.error(f"清空WebDriver临时文件失败")
-                # 启动浏览器
-                _playwright_browser = await _browser_type.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox'],
-                )
-                utils_logger.info(f"启动本地 Playwright Browser")
-            pass
-        # 限制context的数量
-        await _context_semaphore.acquire()
+        if self._entered:
+            raise RuntimeError("同一个 PlaywrightPage 不能同时借用多个页面")
+        self._entered = True
+        self._open_task = None
+        self._cleanup_task = None
         try:
-            self.context = await _playwright_browser.new_context(**self.context_options)
-        except PlaywrightError as pe:
-            # 在新建context时就发生异常，可以认为playwright本身出了问题，重启一下
             try:
-                _playwright_browser.close()
-            except Exception as e:
-                utils_logger.error(f"关闭 Playwright Browser 失败 {get_exc_desc(e)}")
-            _playwright_browser = None
-            _context_semaphore.release()
-            raise pe
-        except: 
-            # 出现异常时释放信号
-            _context_semaphore.release()
+                await asyncio.wait_for(
+                    _context_semaphore.acquire(), PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                utils_logger.warning(f"等待 Playwright 并发额度超时，上限 {MAX_CONTEXTS}")
+                raise TimeoutError("出图任务较多，等待超时，请稍后重试") from exc
+            self._acquired = True
+            utils_logger.debug("Playwright 已取得并发额度，开始创建页面")
+            # 取消调用方时继续接收创建结果，随后由清理任务关闭已经分配的会话。
+            self._open_task = asyncio.create_task(asyncio.wait_for(
+                self._open(), PLAYWRIGHT_CREATE_TIMEOUT_SECONDS,
+            ))
+            try:
+                return await asyncio.shield(self._open_task)
+            except asyncio.TimeoutError as exc:
+                utils_logger.print_exc("Playwright 创建页面超时")
+                raise TimeoutError("创建出图页面超时，请稍后重试") from exc
+        except BaseException:
+            await self._cleanup()
             raise
-        self.page = await self.context.new_page()
-        return self.page
+
+    async def _close_context(self) -> None:
+        """收齐创建结果后关闭会话，最终归还本次持有的额度。"""
+        try:
+            if self._open_task is not None:
+                try:
+                    await self._open_task
+                except (Exception, asyncio.CancelledError):
+                    # 创建阶段已记录异常；已经创建的会话仍需关闭。
+                    pass
+            if self.context is not None:
+                try:
+                    # 关闭会话会一并关闭其中的页面，避免分别关闭时遗漏清理。
+                    await asyncio.wait_for(self.context.close(), PLAYWRIGHT_CLOSE_TIMEOUT_SECONDS)
+                except Exception:
+                    utils_logger.print_exc("关闭 Playwright 会话失败")
+        finally:
+            self.page = None
+            self.context = None
+            self._entered = False
+            if self._acquired:
+                self._acquired = False
+                _context_semaphore.release()
+                utils_logger.debug("Playwright 已归还并发额度")
+
+    async def _cleanup(self) -> None:
+        """等待同一个清理任务完成，调用方取消时也保留清理流程。"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._close_context())
+        cancelled = False
+        while not self._cleanup_task.done():
+            try:
+                await asyncio.shield(self._cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # 关闭上下文，自动清理
-        if self.page:
-            try:
-                await self.page.close()
-            except Exception as e:
-                utils_logger.error(f"关闭 Playwright Page 失败 {get_exc_desc(e)}")
-        if self.context:
-            try:
-                await self.context.close()
-            except Exception as e:
-                utils_logger.error(f"关闭 Playwright Context 失败 {get_exc_desc(e)}")
-            finally:# 释放信号
-                _context_semaphore.release()
-        self.page = None
-        self.context = None
+        await self._cleanup()
         return False
 
 
@@ -1418,30 +1475,47 @@ async def download_image(image_url, force_http=False) -> Image.Image:
         image = await resp.read()
         return Image.open(io.BytesIO(image))
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), reraise=True)
 async def download_and_convert_svg(svg_url: str) -> Image.Image:
-    """
-    下载SVG图片并转换为PIL.Image对象
-    """
-    async with PlaywrightPage() as page: # Playwright Page 对象
-        try:
-            await page.goto(svg_url, wait_until="domcontentloaded")
-            svg_locator = page.locator('svg').nth(0)
+    """将 SVG 渲染为图片，失败时抛出异常，并限制包含排队和重试的总时间。
 
-            bounding_box = await svg_locator.bounding_box()
-            if not bounding_box:
-                raise Exception("未找到SVG元素或元素不可见")
-            
-            width = int(bounding_box['width'])
-            height = int(bounding_box['height'])
-            await page.set_viewport_size({"width": width, "height": height})
-            
-            with TempFilePath('png') as path:
-                await svg_locator.screenshot(path=path)
-                return open_image(path)
-        except Exception:
-            utils_logger.print_exc(f'下载SVG图片失败')
-            return None 
+    仅在浏览器已经断连时重试，参数错误、无效 SVG 和额度等待超时直接返回异常。
+    取消或超时后仍会等待有期限的会话清理，随后向调用方传播异常。
+    """
+    async def render():
+        """完成一次转换，浏览器断连时最多尝试三次。"""
+        for attempt in range(3):
+            manager = PlaywrightPage()
+            try:
+                async with manager as page:
+                    await page.goto(svg_url, wait_until="domcontentloaded")
+                    svg_locator = page.locator('svg').nth(0)
+                    bounding_box = await svg_locator.bounding_box()
+                    if not bounding_box:
+                        raise ValueError("未找到 SVG 元素或元素不可见")
+
+                    width = int(bounding_box['width'])
+                    height = int(bounding_box['height'])
+                    await page.set_viewport_size({"width": width, "height": height})
+                    with TempFilePath('png') as path:
+                        await svg_locator.screenshot(path=path)
+                        return open_image(path)
+            except PlaywrightError:
+                if manager.browser is None or manager.browser.is_connected() or attempt == 2:
+                    raise
+                utils_logger.warning(f"SVG 转图时浏览器断连，准备第 {attempt + 2} 次尝试")
+                await asyncio.sleep(1)
+
+    try:
+        return await asyncio.wait_for(render(), SVG_RENDER_TIMEOUT_SECONDS)
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        utils_logger.print_exc("SVG 转图超时")
+        if not str(exc):
+            raise TimeoutError("图片生成超时，请稍后重试") from exc
+        raise
+    except Exception:
+        utils_logger.print_exc("SVG 转图失败")
+        raise
+
 
 # ================================ Markdown离线渲染 ================================ #
 # Markdown 内容可能来自普通群成员。浏览器必须保持离线，不能让用户通过图片地址
