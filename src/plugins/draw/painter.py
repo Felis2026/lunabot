@@ -23,6 +23,7 @@ import struct
 from functools import lru_cache
 from urllib.parse import quote_plus
 import unicodedata
+import tempfile
 
 from fontTools.ttLib import TTFont
 
@@ -412,6 +413,79 @@ def deterministic_hash(obj: Any, raise_error: bool = False) -> str:
 # =========================== 基础定义 =========================== #
 
 PAINTER_CACHE_DIR = "data/utils/painter_cache/"
+_painter_cache_io_limit = asyncio.Semaphore(4)
+_painter_cache_commit_lock = threading.Lock()
+
+
+async def _run_painter_cache_io(func, *args):
+    """以四路额度执行缓存读写，取消时等待线程收尾后再释放额度。"""
+    async with _painter_cache_io_limit:
+        task = asyncio.create_task(asyncio.to_thread(func, *args))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            try:
+                result = task.result()
+            except Exception:
+                pass
+            else:
+                if isinstance(result, Image.Image):
+                    result.close()
+            raise asyncio.CancelledError
+        return task.result()
+
+
+def _read_painter_cache(cache_key: str, op_hash: str) -> Optional[Image.Image]:
+    """完整解码指定哈希的缓存；文件缺失或损坏时返回空值。"""
+    path = os.path.join(PAINTER_CACHE_DIR, f"{cache_key}__{op_hash}.png")
+    try:
+        # 打开文件与提交使用同一短锁，解码在锁外完成。
+        with _painter_cache_commit_lock:
+            stream = open(path, 'rb')
+        with stream:
+            image = Image.open(stream)
+            try:
+                image.load()
+            except Exception:
+                image.close()
+                raise
+        return image
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        debug_print(f"Failed to read cache for {cache_key}: {exc}")
+        return None
+
+
+def _write_painter_cache(cache_key: str, op_hash: str, image: Image.Image):
+    """原子保存完整 PNG，保存成功后清理同键的旧哈希文件。"""
+    os.makedirs(PAINTER_CACHE_DIR, exist_ok=True)
+    path = os.path.join(PAINTER_CACHE_DIR, f"{cache_key}__{op_hash}.png")
+    descriptor, temporary = tempfile.mkstemp(prefix='.painter-cache-', suffix='.tmp', dir=PAINTER_CACHE_DIR)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            image.save(stream, format='PNG')
+        # 提交与旧文件清理使用同一短锁，避免两个写入者互删刚提交的文件。
+        with _painter_cache_commit_lock:
+            os.replace(temporary, path)
+            pattern = os.path.join(PAINTER_CACHE_DIR, f"{glob.escape(cache_key)}__*.png")
+            for old_path in glob.glob(pattern):
+                if old_path != path:
+                    try:
+                        os.remove(old_path)
+                    except OSError as exc:
+                        debug_print(f"Failed to remove cache file {old_path}: {exc}")
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
 
 PAINTER_PROCESS_NUM = global_config.get('painter.process_num')
 
@@ -1411,23 +1485,10 @@ class Painter:
             op_hash = await asyncio.to_thread(deterministic_hash, {"key": cache_key, "op": self.operations})
             debug_print(f"Cache key: {cache_key}, op_hash: {op_hash}, elapsed: {datetime.now() - t}")
 
-            paths = glob.glob(os.path.join(PAINTER_CACHE_DIR, f"{cache_key}__*.png"))
-            if paths:
-                path = paths[0]
-                if path.endswith(f"{cache_key}__{op_hash}.png"):
-                    # 如果hash相同则直接返回缓存的图片
-                    debug_print(f"Using cached image: {path}")
-                    img = Image.open(path)
-                    img.load()
-                    return img
-                else:
-                    # 否则清空缓存并重新绘图
-                    for p in paths:
-                        try: 
-                            os.remove(p)
-                        except Exception as e: 
-                            print(f"Failed to remove cache file {p}: {e}")
-                    debug_print(f"Cache mismatch, removed {len(paths)} files")
+            img = await _run_painter_cache_io(_read_painter_cache, cache_key, op_hash)
+            if img is not None:
+                debug_print(f"Using cached image for {cache_key}: {op_hash}")
+                return img
 
         debug_print(f"Main process memory usage: {get_memo_usage()} MB")
 
@@ -1462,11 +1523,9 @@ class Painter:
         # 保存缓存
         if cache_key is not None:
             try:
-                cache_path = os.path.join(PAINTER_CACHE_DIR, f"{cache_key}__{op_hash}.png")
-                os.makedirs(PAINTER_CACHE_DIR, exist_ok=True)
-                self.img.save(cache_path, format='PNG')
-            except:
-                debug_print(f"Failed to save cache for {cache_key}")
+                await _run_painter_cache_io(_write_painter_cache, cache_key, op_hash, self.img)
+            except Exception as exc:
+                debug_print(f"Failed to save cache for {cache_key}: {exc}")
 
         return self.img
     
@@ -1497,7 +1556,11 @@ class Painter:
         paths = glob.glob(os.path.join(PAINTER_CACHE_DIR, f"*.png"))
         cache_keys = {}
         for p in paths:
-            mtime = os.path.getmtime(p)
+            # 后台提交可能已清理列表中的旧哈希文件。
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
             cache_key = os.path.basename(p).split('__')[0]
             cache_keys[cache_key] = datetime.fromtimestamp(mtime)
         return cache_keys
