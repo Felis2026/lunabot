@@ -1060,7 +1060,7 @@ async def compose_event_detail_image(ctx: SekaiHandlerContext, event: dict) -> I
                         if detail.start_time <= now <= detail.end_time:
                             TextBox(f"距结束还有{get_readable_timedelta(detail.end_time - now)}", text_style)
                         elif now > detail.end_time:
-                            TextBox(f"活动已结束", text_style)
+                            TextBox(f"活动已结束（{get_readable_timedelta(now - detail.end_time, precision='d')}前）", text_style)
                         else:
                             TextBox(f"距开始还有{get_readable_timedelta(detail.start_time - now)}", text_style)
 
