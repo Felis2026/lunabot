@@ -22,38 +22,75 @@ import aiohttp
 
 # ================================ 查询参数 ================================ #
 
-def parse_saying_query(args: str, mentioned_ids: list[int], default_id: int) -> tuple[int | None, int, str]:
-    """解析作者、页码和配色；默认查询全群，全部或 all 返回空作者。"""
+def parse_saying_query(args: str, mentioned_ids: list[int], default_id: int) -> tuple[int | None, int, str, tuple[str, ...]]:
+    """解析作者、关键词、页码和配色，带引号的内容按关键词处理。"""
     author_ids = list(dict.fromkeys(mentioned_ids))
-    tokens = args.strip().split()
+    if len(author_ids) > 1:
+        raise ValueError("请指定一位群友，例如 /查语录 @群友 烤猪")
+    tokens = []
+    for token in re.findall(r'"(?:\\.|[^"\\])*"|“[^”]*”|\S+', args):
+        quoted = token.startswith(('"', '“'))
+        if token.startswith('"'):
+            try:
+                token = json.loads(token)
+            except ValueError:
+                raise ValueError('关键词引号不完整，例如 /查语录 搜索 "深色"') from None
+        elif token.startswith('“'):
+            if not token.endswith('”'):
+                raise ValueError('关键词引号不完整，例如 /查语录 搜索 “深色”')
+            token = token[1:-1]
+        tokens.append((token, quoted))
     themes = {"浅色": "light", "深色": "dark"}
-    selected_themes = [token for token in tokens if token in themes]
+    selected_themes = [token for token, quoted in tokens if not quoted and token in themes]
     if len(selected_themes) > 1:
         raise ValueError("请选择一种背景：浅色或深色，例如 /查语录 @群友 深色")
     theme = themes[selected_themes[0]] if selected_themes else "light"
-    tokens = [token for token in tokens if token not in themes]
+    tokens = [(token, quoted) for token, quoted in tokens if quoted or token not in themes]
     page = 1
     # p2/page2 明确表示页码，纯数字仍用于指定 QQ；兼容已经使用的中文页码。
-    if tokens and (match := re.fullmatch(
-            r"(?:p(?:age)?([1-9]\d{0,8})|第?([1-9]\d{0,8})页)", tokens[-1], re.IGNORECASE)):
+    if tokens and not tokens[-1][1] and (match := re.fullmatch(
+            r"(?:p(?:age)?([1-9]\d{0,8})|第?([1-9]\d{0,8})页)", tokens[-1][0], re.IGNORECASE)):
         page = int(match.group(1) or match.group(2))
         tokens.pop()
-    if any(token.lower() in {"全部", "all"} for token in tokens):
-        if len(tokens) != 1 or author_ids:
-            raise ValueError("查询全部语录时请不要同时指定群友，例如 /查语录 all p2")
-        return None, page, theme
-    if len(author_ids) > 1 or len(tokens) > 1:
-        raise ValueError("请指定一位群友，例如 /查语录 @群友 p2")
-    if tokens:
-        if author_ids or (tokens[0] != "自己" and not re.fullmatch(r"[1-9]\d{4,18}", tokens[0])):
-            raise ValueError("请使用 /查语录 all、/查语录 自己、/查语录 @群友 或 /查语录 QQ号，可附加 p2、page2、浅色或深色")
-        author_ids.append(default_id if tokens[0] == "自己" else int(tokens[0]))
-    if not author_ids:
-        return None, page, theme
-    author_id = author_ids[0]
-    if not 0 < author_id < 2 ** 63:
+    elif tokens and not tokens[-1][1] and re.fullmatch(r'p(?:age)?-?\d+|第?-?\d+页', tokens[-1][0], re.IGNORECASE):
+        raise ValueError('页码应为正整数，例如 /查语录 p2')
+    if tokens and not tokens[0][1]:
+        target = tokens[0][0]
+        if target.lower() in {'全部', 'all'}:
+            if author_ids:
+                raise ValueError('查询全部语录时请不要同时指定群友，例如 /查语录 all 烤猪')
+            tokens.pop(0)
+        elif target == '自己' or re.fullmatch(r'[1-9]\d{4,18}', target):
+            if author_ids:
+                raise ValueError('已指定群友，搜索数字或“自己”请加搜索参数，例如 /查语录 @群友 搜索 12345')
+            author_ids.append(default_id if target == '自己' else int(target))
+            tokens.pop(0)
+    explicit_search = bool(tokens and tokens[0] == ('搜索', False))
+    if explicit_search:
+        tokens.pop(0)
+    keywords = tuple(dict.fromkeys(token for token, _ in tokens if token.strip()))
+    if explicit_search and not keywords:
+        raise ValueError('请填写关键词，例如 /查语录 搜索 烤猪')
+    author_id = author_ids[0] if author_ids else None
+    if author_id is not None and not 0 < author_id < 2 ** 63:
         raise ValueError("QQ号无效，请指定一位群友")
-    return author_id, page, theme
+    return author_id, page, theme, keywords
+
+
+def saying_query_command(author_id: int | None, keywords: tuple[str, ...], page: int, theme: str) -> str:
+    """生成保留筛选条件的翻页指令，选项同名关键词使用引号。"""
+    parts = ['/查语录', str(author_id) if author_id is not None else 'all']
+    if keywords:
+        parts.append('搜索')
+        for keyword in keywords:
+            needs_quotes = (keyword in ('浅色', '深色') or
+                            re.fullmatch(r'p(?:age)?\d+|第?\d+页', keyword, re.IGNORECASE) or
+                            any(character.isspace() or character in '"\\“”' for character in keyword))
+            parts.append(json.dumps(keyword, ensure_ascii=False) if needs_quotes else keyword)
+    parts.append(f'p{page}')
+    if theme == 'dark':
+        parts.append('深色')
+    return ' '.join(parts)
 
 
 def parse_saying_number(args: str) -> int:
@@ -142,6 +179,11 @@ class SayingStore:
                 for name in ("deleted_at", "deleted_by"):
                     if name not in columns:
                         await connection.execute(f"ALTER TABLE sayings ADD COLUMN {name} INTEGER")
+                # 旧库补齐删除标记后再建索引，计数和随机筛选无需读取整条正文。
+                await connection.execute('''
+                    CREATE INDEX IF NOT EXISTS sayings_visible
+                    ON sayings (group_id, deleted_at, number DESC)
+                ''')
                 await connection.execute("""
                     CREATE INDEX IF NOT EXISTS sayings_media_content
                     ON sayings (group_id, author_id, content_key, number)
@@ -316,8 +358,8 @@ class SayingStore:
             raise first_error
 
     async def list_page(self, group_id: int, author_id: int | None, page: int,
-                        page_size: int) -> tuple[list[tuple[Saying, bytes | None]], int, int]:
-        """分页读取本群或指定作者的原图，通过页大小约束文件读取量。"""
+                        page_size: int, keywords: tuple[str, ...] = ()) -> tuple[list[tuple[Saying, bytes | None]], int, int]:
+        """按群、作者与全部关键词分页，仅读取当页原图。"""
         async with self._lock:
             connection = await self._connect()
             # 全群和个人查询共用分页，群号始终是必选条件；主键支持本群编号倒序。
@@ -326,6 +368,11 @@ class SayingStore:
             if author_id is not None:
                 where_clause += " AND author_id = ?"
                 parameters += (author_id,)
+            for keyword in keywords:
+                # 将用户输入中的通配符按原字符匹配，参数绑定用于传入正文。
+                escaped = keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                where_clause += " AND text LIKE ? ESCAPE '\\'"
+                parameters += (f'%{escaped}%',)
             row = await self._fetch_one(connection,
                 f"SELECT COUNT(*) AS count FROM sayings WHERE {where_clause}", parameters)
             total = row["count"]
@@ -341,6 +388,29 @@ class SayingStore:
                 sayings = [Saying(**dict(row)) for row in await cursor.fetchall()]
             images = [(saying, await self._read_image(saying)) for saying in sayings]
             return images, total, page_count
+
+    async def has_visible(self, group_id: int, author_id: int | None = None) -> bool:
+        """检查本群或指定作者是否有未删除记录，仅读取存在性。"""
+        async with self._lock:
+            connection = await self._connect()
+            query = 'SELECT 1 FROM sayings WHERE group_id = ? AND deleted_at IS NULL'
+            parameters = (group_id,)
+            if author_id is not None:
+                query += ' AND author_id = ?'
+                parameters += (author_id,)
+            return await self._fetch_one(connection, query + ' LIMIT 1', parameters) is not None
+
+    async def get_random(self, group_id: int) -> tuple[Saying, bytes | None] | None:
+        """随机读取一条本群未删除语录，只加载选中记录的成品图。"""
+        async with self._lock:
+            connection = await self._connect()
+            row = await self._fetch_one(connection,
+                'SELECT * FROM sayings WHERE group_id = ? AND deleted_at IS NULL ORDER BY RANDOM() LIMIT 1',
+                (group_id,))
+            if row is None:
+                return None
+            saying = Saying(**dict(row))
+            return saying, await self._read_image(saying)
 
     async def delete(self, group_id: int, number: int, actor_id: int,
                      is_admin: bool) -> Saying | None:
@@ -1259,8 +1329,28 @@ def _get_saying_settings() -> dict:
     }
 
 
+def _wrap_saying_album_text(text: str, font, width: int) -> list[str]:
+    """按实际字宽换行，保留搜索条件和翻页指令的完整文字。"""
+    lines = []
+    for paragraph in text.split('\n'):
+        if not paragraph:
+            lines.append('')
+        while paragraph:
+            lower, upper = 1, len(paragraph)
+            while lower < upper:
+                middle = (lower + upper + 1) // 2
+                if get_text_width(font, paragraph[:middle]) <= width:
+                    lower = middle
+                else:
+                    upper = middle - 1
+            lines.append(paragraph[:lower])
+            paragraph = paragraph[lower:]
+    return lines
+
+
 def _render_saying_album(entries, author_name: str, author_id: int | None,
-                         total: int, page: int, page_count: int, theme: str = "light") -> Image.Image:
+                         total: int, page: int, page_count: int, theme: str = "light",
+                         keywords: tuple[str, ...] = ()) -> Image.Image:
     """按选定配色生成个人或全群图册，整图缩略展示并提供操作指令。"""
     # ================================ 图册框架 ================================ #
     colors = SAYING_ALBUM_THEMES[theme]
@@ -1271,16 +1361,24 @@ def _render_saying_album(entries, author_name: str, author_id: int | None,
     card_padding = 10
     guide_lines = ["用法：/语录 [编号] ；/查语录 @[目标]"]
     if page_count > 1:
-        query_target = "all" if author_id is None else str(author_id)
-        theme_suffix = " 深色" if theme == "dark" else ""
-        guide_lines.append(f"翻页：/查语录 {query_target} p2{theme_suffix}")
-    footer_height = 36 + len(guide_lines) * 28
+        next_page = page + 1 if page < page_count else 1
+        guide_lines.append(f"翻页：{saying_query_command(author_id, keywords, next_page, theme)}")
     image_width, image_height = SAYING_ALBUM_IMAGE_SIZE
     card_width = image_width + card_padding * 2
     card_height = caption_height + image_height + card_padding * 2
     columns = min(SAYING_ALBUM_COLUMNS, max(1, len(entries)))
     rows = (len(entries) + columns - 1) // columns
     width = margin * 2 + columns * card_width + (columns - 1) * gap
+    summary_font = get_font(DEFAULT_FONT, 20)
+    summary = f'匹配 {total} 条　关键词：' + '、'.join(keywords) if keywords else f'本群收录 {total} 条'
+    summary_lines = _wrap_saying_album_text(summary, summary_font, width - margin * 2)
+    header_height += (len(summary_lines) - 1) * 28
+    page_font = get_font(DEFAULT_FONT, 18)
+    page_label = f'{page}/{page_count}'
+    guide_font = get_font(DEFAULT_FONT, 18)
+    guide_width = width - margin * 2 - get_text_width(page_font, page_label) - 24
+    guide_lines = [line for text in guide_lines for line in _wrap_saying_album_text(text, guide_font, guide_width)]
+    footer_height = 36 + len(guide_lines) * 28
     content_height = rows * card_height + max(0, rows - 1) * gap
     height = header_height + content_height + footer_height
     canvas = Image.new("RGB", (width, height), colors["background"])
@@ -1294,8 +1392,8 @@ def _render_saying_album(entries, author_name: str, author_id: int | None,
             author_name = author_name[:-1]
             title = f"{author_name}…的语录"
     painter._text(title, (margin, 16), title_font, colors["title"])
-    painter._text(f"本群收录 {total} 条",
-                  (margin, 60), get_font(DEFAULT_FONT, 20), colors["secondary"])
+    for index, line in enumerate(summary_lines):
+        painter._text(line, (margin, 60 + index * 28), summary_font, colors['secondary'])
 
     # ================================ 语录卡片 ================================ #
     number_font = get_font(DEFAULT_FONT, 22)
@@ -1326,9 +1424,7 @@ def _render_saying_album(entries, author_name: str, author_id: int | None,
     # ================================ 查询引导 ================================ #
     for index, line in enumerate(guide_lines):
         painter._text(line, (margin, header_height + content_height + 18 + index * 28),
-                      get_font(DEFAULT_FONT, 18), colors["secondary"])
-    page_font = get_font(DEFAULT_FONT, 18)
-    page_label = f"{page}/{page_count}"
+                      guide_font, colors["secondary"])
     page_position = (width - margin - get_text_width(page_font, page_label),
                      header_height + content_height + 18 + (len(guide_lines) - 1) * 28)
     painter._text(page_label, page_position, page_font, colors["secondary"])
@@ -1437,7 +1533,10 @@ async def _handle_saying(ctx: HandlerContext):
         return await _send_saved_saying(ctx, stored)
     source_msg_id = ctx.get_reply_msg_id()
     if source_msg_id is None:
-        raise ReplyException("请回复消息生成语录，或使用 /语录 编号 查看原图")
+        stored = await saying_store.get_random(ctx.group_id)
+        if stored is None:
+            raise ReplyException('本群还没有收录的语录，回复消息发送 /语录 即可收录')
+        return await _send_saved_saying(ctx, stored)
 
     # 优先复用原消息已有记录。索引服务异常时继续生成即时语录图。
     try:
@@ -1537,19 +1636,21 @@ async def _handle_query_sayings(ctx: HandlerContext):
                 raise ReplyException("请 @ 一位群友，不支持 @全体成员")
             mentioned_ids.append(int(value))
     try:
-        author_id, page, theme = parse_saying_query(ctx.get_args(), mentioned_ids, ctx.user_id)
+        author_id, page, theme, keywords = parse_saying_query(ctx.get_args(), mentioned_ids, ctx.user_id)
         # 双列图册每页最多 16 条，通过分页约束输出高度与内存占用。
         settings = await run_in_pool(_get_saying_settings)
         entries, total, page_count = await saying_store.list_page(
-            ctx.group_id, author_id, page, settings['page_size'])
+            ctx.group_id, author_id, page, settings['page_size'], keywords)
     except (ValueError, SayingPageError) as error:
         raise ReplyException(str(error))
     if not entries:
+        if keywords and await saying_store.has_visible(ctx.group_id, author_id):
+            raise ReplyException('没有找到匹配的语录，可减少关键词后重试')
         if author_id is None:
             raise ReplyException("本群还没有收录的语录，回复消息发送 /语录 即可收录")
         raise ReplyException("这位群友在本群还没有收录的语录")
     image = await run_in_pool(_render_saying_album, entries, entries[0][0].nickname,
-                              author_id, total, page, page_count, theme)
+                              author_id, total, page, page_count, theme, keywords)
     try:
         jpeg = await run_in_pool(_encode_saying_album, image)
     finally:
