@@ -1254,6 +1254,7 @@ class RandomTriangleBgPreset:
     gradient_start: tuple[float, float] | None = (1.0, 0.0)
     gradient_end: tuple[float, float] | None = (0.0, 1.0)
     periods: list[tuple[str, str]] | None = None
+    rotation: tuple[float, float] | None = None  # 随机旋转角度范围[min, max]，None表示0-360
 
 
 @dataclass
@@ -2282,7 +2283,7 @@ class Painter:
         bg = bg.resize((w, h), Image.Resampling.LANCZOS)
 
         def draw_tri(x, y, rot, size, alpha):
-            if not images: return
+            if not images or size <= 0: return
             img = random.choices(images, weights=image_weights, k=1)[0]
             color = random.choices(preset.image_colors, weights=preset.image_color_weights, k=1)[0]
             color = (*color, alpha) if len(color) == 3 else (*color[:3], color[3] * alpha // 255)
@@ -2311,7 +2312,7 @@ class Painter:
                 x, y = positions[i]
                 if x < 0 or x >= w or y < 0 or y >= h:
                     continue
-                rot = random.uniform(0, 360)
+                rot = random.uniform(*(preset.rotation or (0, 360)))
                 size = max(1, min(1000, int(random.normalvariate(sz[0], sz[1]))))
                 dist = (((x - w // 2) / w * 2) ** 2 + ((y - h // 2) / h * 2) ** 2)
                 size = int(size * dist)
