@@ -11,10 +11,48 @@ vlive_user_sub = SekaiUserSubHelper("live", "虚拟Live@提醒", ALL_SERVER_REGI
 
 # ======================= 处理逻辑 ======================= #
 
-async def get_vlive_widget(ctx: SekaiHandlerContext, vlive: dict) -> Frame:
-    """
-    从单个vlive数据生成一个vlive控件(Frame)
-    """
+async def _get_vlive_reward_info(ctx: SekaiHandlerContext, box_id: int) -> list:
+    """读取参与奖励，奖励箱缺失时保留其他 Live 信息。"""
+    try:
+        return await get_res_box_info(ctx, "virtual_live_reward", box_id, 64)
+    except Exception:
+        logger.print_exc("获取虚拟Live奖励失败")
+        return []
+
+
+async def _get_vlive_character_icon(ctx: SekaiHandlerContext, unit_id: int) -> Image.Image:
+    """解析出演角色并在线程中读取本地头像。"""
+    character = await ctx.md.game_character_units.find_by_id(unit_id)
+    return await run_in_pool_until_complete(lambda: get_chara_icon_by_chara_id(
+        cid=character['gameCharacterId'], unit=character['unit']))
+
+
+async def _prepare_vlive_resources(ctx: SekaiHandlerContext, vlives: list) -> dict:
+    """按素材键准备横幅、首个普通参与奖励箱及出演头像，返回本次绘图使用的结果。"""
+    requests = {}
+    for vlive in vlives:
+        asset_name = vlive['asset_name']
+        requests['banner', asset_name] = lambda asset_name=asset_name: ctx.rip.img(
+            f"virtual_live/select/banner/{asset_name}_rip/{asset_name}.png", allow_error=True)
+        for reward in vlive['rewards']:
+            if reward['virtualLiveType'] == 'normal':
+                box_id = reward['resourceBoxId']
+                requests['reward', box_id] = lambda box_id=box_id: _get_vlive_reward_info(ctx, box_id)
+                break
+        for character in vlive['characters']:
+            if character.get('virtualLivePerformanceType', 'both') not in ('main_only', 'both'):
+                continue
+            unit_id = character.get('gameCharacterUnitId')
+            if unit_id:
+                requests['character', unit_id] = lambda unit_id=unit_id: _get_vlive_character_icon(ctx, unit_id)
+    # 资源工厂共享现有四路下载额度，完成后由调用方顺序创建绘图组件。
+    return await prepare_assets(requests)
+
+
+async def get_vlive_widget(ctx: SekaiHandlerContext, vlive: dict, prepared: dict = None) -> Frame:
+    """从单场 Live 生成控件，可复用列表已准备的素材。"""
+    if prepared is None:
+        prepared = await _prepare_vlive_resources(ctx, [vlive])
     vlive["current"] = None
     vlive["living"] = False
     for start, end in vlive["schedule"]:
@@ -40,7 +78,7 @@ async def get_vlive_widget(ctx: SekaiHandlerContext, vlive: dict) -> Frame:
             with HSplit().set_content_align('c').set_item_align('c').set_sep(8):
                 # 图片
                 asset_name = vlive['asset_name']
-                img = await ctx.rip.img(f"virtual_live/select/banner/{asset_name}_rip/{asset_name}.png", allow_error=True)
+                img = prepared['banner', asset_name]
                 if img:
                     ImageBox(img, size=(None, 100), use_alphablend=True)
 
@@ -64,13 +102,10 @@ async def get_vlive_widget(ctx: SekaiHandlerContext, vlive: dict) -> Frame:
                 # 参与奖励
                 res_size = 64
                 res_info_list = []
-                try:
-                    for reward in vlive['rewards']:
-                        if reward['virtualLiveType'] == 'normal':
-                            res_info_list = await get_res_box_info(ctx, "virtual_live_reward", reward['resourceBoxId'], res_size)
-                            break
-                except:
-                    logger.print_exc(f"获取虚拟Live奖励失败")
+                for reward in vlive['rewards']:
+                    if reward['virtualLiveType'] == 'normal':
+                        res_info_list = prepared['reward', reward['resourceBoxId']]
+                        break
                 if res_info_list:
                     with VSplit().set_content_align('l').set_item_align('l').set_sep(8):
                         TextBox("参与奖励", TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=(50, 50, 50)))
@@ -91,10 +126,8 @@ async def get_vlive_widget(ctx: SekaiHandlerContext, vlive: dict) -> Frame:
                         item['virtualLivePerformanceType'] not in ['main_only', 'both']:
                         continue
                     cuid = item.get('gameCharacterUnitId')
-                    scid = item.get('subGameCharacter2dId')
                     if cuid:
-                        cu = await ctx.md.game_character_units.find_by_id(cuid)
-                        chara_icons.append(get_chara_icon_by_chara_id(cid=cu['gameCharacterId'], unit=cu['unit']))
+                        chara_icons.append(prepared['character', cuid])
                 if chara_icons:
                     with VSplit().set_content_align('l').set_item_align('l').set_sep(8):
                         TextBox("出演角色", TextStyle(font=DEFAULT_BOLD_FONT, size=18, color=(50, 50, 50)))
@@ -108,12 +141,14 @@ async def compose_vlive_list_image(ctx: SekaiCmdHandler, vlives, title=None, tit
     """
     从给定的多个vlive生成一个vlive列表图片
     """
+    vlives = list(vlives)
+    prepared = await _prepare_vlive_resources(ctx, vlives)
     with Canvas(bg=bg).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
             if title and title_style:
                 TextBox(title, title_style).set_bg(roundrect_bg()).set_padding(16)
             for vlive in vlives:
-                await get_vlive_widget(ctx, vlive)
+                await get_vlive_widget(ctx, vlive, prepared)
     add_watermark(canvas)
     return await canvas.get_img()
 

@@ -326,8 +326,11 @@ async def compose_card_list_image(ctx: SekaiHandlerContext, cards: List[Dict], q
     add_watermark(canvas)
     return await canvas.get_img()
 
-async def get_card_image(ctx: SekaiHandlerContext, cid_or_card: int, after_training: bool, allow_error: bool = True, *, decode_in_pool: bool = False) -> Image.Image:
-    """获取普通或特训卡面，decode_in_pool=True 时在线程池解码。"""
+async def get_card_image(ctx: SekaiHandlerContext, cid_or_card: int, after_training: bool, allow_error: bool = True, *, decode_in_pool: bool = True) -> Image.Image:
+    """获取普通或特训卡面，默认在线程池读取并完整解码。
+
+    卡面解码与谱面读写共用六路额度；decode_in_pool=False 供同步解码调用使用。
+    """
     image_type = "after_training" if after_training else "normal"
     if isinstance(cid_or_card, int):
         card = await ctx.md.cards.find_by_id(cid_or_card)
@@ -337,6 +340,7 @@ async def get_card_image(ctx: SekaiHandlerContext, cid_or_card: int, after_train
     options = dict(timeout=30, allow_error=allow_error)
     if decode_in_pool:
         options['decode_in_pool'] = True
+        options['decode_limit'] = LOCAL_IMAGE_IO_LIMIT
     return await ctx.rip.img(f"character/member/{card['assetbundleName']}_rip/card_{image_type}.png", **options)
 
 # 获取卡面立绘图片

@@ -1608,6 +1608,7 @@ class RegionRipAssetManger:
         img_cache_max_res: Union[int, ConfigItem]=RIP_IMG_CACHE_MAX_RES_CFG,
         decode_in_pool: bool=False,
         cache_missing_secs: int=0,
+        decode_limit: asyncio.Semaphore=None,
     ) -> Image.Image:
         """
         获取图片类型解包资源，参数：
@@ -1620,6 +1621,7 @@ class RegionRipAssetManger:
         - `use_img_cache`: 是否使用图片缓存
         - `img_cache_max_res`: 图片缓存最大分辨率，None则不缩放
         - `decode_in_pool`: 在线程池中解码图片，减少大图解码占用事件循环的时间
+        - `decode_limit`: 可选的解码额度，仅在数据就绪后占用，下载期间不占用
         """
         decode_in_pool = decode_in_pool or ASSET_PREPARE_IN_POOL.get()
         # 尝试从图片缓存加载
@@ -1632,7 +1634,11 @@ class RegionRipAssetManger:
             return default
         try: 
             started = time.perf_counter()
-            img = await run_in_pool_until_complete(open_image, io.BytesIO(data)) if decode_in_pool else open_image(io.BytesIO(data))
+            if decode_in_pool and decode_limit is not None:
+                async with decode_limit:
+                    img = await run_local_io(open_image, io.BytesIO(data))
+            else:
+                img = await run_in_pool_until_complete(open_image, io.BytesIO(data)) if decode_in_pool else open_image(io.BytesIO(data))
             if decode_in_pool:
                 record_asset_timing('image_decode', path, time.perf_counter()-started)
             if use_img_cache:

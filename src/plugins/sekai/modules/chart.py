@@ -22,6 +22,36 @@ NOTE_SIZES = {
     'append': 0.875,
 }
 
+
+def _read_chart_cache(path: str, use_cache: bool) -> Image.Image | None:
+    """准备缓存目录，命中时完整解码谱面图片。"""
+    create_parent_folder(path)
+    if use_cache and os.path.exists(path):
+        return open_image(path)
+    return None
+
+
+def _finish_chart_image(image, random_clip_length_rate, max_resolution, cache_path):
+    """按既有规则裁剪、缩放谱面，并原子提交 PNG 缓存。"""
+    import uuid
+
+    if random_clip_length_rate:
+        image = image.crop((0, 0, image.size[0], image.size[1] - 260))
+    if image.size[0] * image.size[1] > max_resolution[0] * max_resolution[1]:
+        image = resize_keep_ratio(image, max_size=max_resolution[0] * max_resolution[1], mode='wxh')
+    if cache_path is not None:
+        temp_path = f"{cache_path}.{uuid.uuid4().hex}.tmp"
+        try:
+            image.save(temp_path, format='PNG')
+            os.replace(temp_path, cache_path)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+    return image
+
+
 # 生成谱面图片
 async def generate_music_chart(
     ctx: SekaiHandlerContext, 
@@ -39,9 +69,10 @@ async def generate_music_chart(
     # 带技能与不带技能的缓存分开
     cache_path_suffix = difficulty if not skill else f"{difficulty}_skill"
     cache_path = CHART_CACHE_PATH.format(region=ctx.region, mid=music_id, diff=cache_path_suffix)
-    create_parent_folder(cache_path)
-    if use_cache and not refresh and os.path.exists(cache_path):
-        return open_image(cache_path)
+    async with LOCAL_IMAGE_IO_LIMIT:
+        cached_image = await run_local_io(_read_chart_cache, cache_path, use_cache and not refresh)
+    if cached_image is not None:
+        return cached_image
 
     # 获取信息
     music = await ctx.md.musics.find_by_id(music_id)
@@ -123,16 +154,13 @@ async def generate_music_chart(
 
         # 渲染svg
         img = await download_and_convert_svg(f"file://{os.path.abspath(svg_path)}")
-        if random_clip_length_rate:
-            img = img.crop((0, 0, img.size[0], img.size[1] - 260))
-
         MAX_RES = config.get('chart.max_resolution')
-        if img.size[0] * img.size[1] > MAX_RES[0] * MAX_RES[1]:
-            img = resize_keep_ratio(img, max_size=MAX_RES[0] * MAX_RES[1], mode='wxh')
+        async with LOCAL_IMAGE_IO_LIMIT:
+            img = await run_local_io(
+                _finish_chart_image, img, random_clip_length_rate, MAX_RES,
+                cache_path if use_cache else None,
+            )
         logger.info(f'生成 mid={music_id} {difficulty} 谱面图片完成')
-
-        if use_cache:
-            img.save(cache_path)
         return img
 
 

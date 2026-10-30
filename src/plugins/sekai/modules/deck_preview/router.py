@@ -284,6 +284,12 @@ class OfficialActivationStore:
         self._refresh_if_changed()
         return str(event_id) in self._detected_events
 
+    def blocks_preview(self, event_id: int) -> bool:
+        """从同一次刷新结果判断活动是否已经进入正式切回流程。"""
+        self._refresh_if_changed()
+        key = str(event_id)
+        return key in self._events or key in self._detected_events
+
     def get(self, event_id: int) -> dict[str, Any] | None:
         self._refresh_if_changed()
         entry = self._events.get(str(event_id))
@@ -329,17 +335,23 @@ class OfficialActivationStore:
         temp_path = self.path.with_name(
             f".{self.path.name}.{uuid.uuid4().hex}.tmp"
         )
-        with temp_path.open("w", encoding="utf-8", newline="\n") as file:
-            json.dump(
-                payload,
-                file,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temp_path, self.path)
+        try:
+            with temp_path.open("w", encoding="utf-8", newline="\n") as file:
+                json.dump(
+                    payload,
+                    file,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, self.path)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
         self._loaded_signature = self._disk_signature()
 
     def mark_detected(self, event_id: int, entry: dict[str, Any]) -> bool:

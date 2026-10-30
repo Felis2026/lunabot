@@ -2024,8 +2024,14 @@ async def get_music_audio_mp3_path(ctx: SekaiHandlerContext, mid: int) -> Option
     asset_name = vocal['assetbundleName']
     return await ctx.rip.get_asset_cache_path(f"music/long/{asset_name}/{asset_name}.mp3")
 
-# 获取歌曲长度并缓存
+def _read_music_audio_length(path: str, filler_sec: float) -> float:
+    """解码本地 MP3 并扣除歌曲配置的前置空白秒数。"""
+    import pydub
+    return len(pydub.AudioSegment.from_mp3(path)) / 1000 - filler_sec
+
+
 async def get_music_audio_length(ctx: SekaiHandlerContext, mid: int) -> Optional[timedelta]:
+    """读取歌曲时长，缺少缓存和 MusicMeta 时在线程中解码音频。"""
     # 尝试从缓存获取
     key = f"music_audio_lengths.jp_{mid}"
     if length := file_db.get(key, None):
@@ -2045,9 +2051,11 @@ async def get_music_audio_length(ctx: SekaiHandlerContext, mid: int) -> Optional
         music = await ctx.md.musics.find_by_id(mid)
         assert_and_reply(music, f'曲目 {mid} 不存在')
         filler_sec = music.get('fillerSec', 0)
-        import pydub
-        audio = pydub.AudioSegment.from_mp3(path)
-        length = len(audio) / 1000 - filler_sec
+        async with AUDIO_LENGTH_IO_LIMIT:
+            # 等待额度期间，同一歌曲可能已由其他请求填入时长缓存。
+            length = file_db.get(key, None)
+            if length is None:
+                length = await run_local_io(_read_music_audio_length, path, filler_sec)
     file_db.set(key, length)
     return timedelta(seconds=length)
 

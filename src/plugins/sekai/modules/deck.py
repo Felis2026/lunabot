@@ -23,7 +23,6 @@ from .profile import (
     get_detailed_profile_card_filter,
     get_card_full_thumbnail,
 )
-from .education import get_user_challenge_live_info
 from .card import get_character_sd_image, get_unit_by_card_id, has_after_training
 from .music import (
     search_music,
@@ -875,13 +874,13 @@ async def extract_preview_target_event(
 
     state = preview_manager.get_state()
     known_preview_event = (
-        event_id in preview_manager.tracked_event_ids()
+        event_id in await preview_manager.tracked_event_ids()
     )
 
     # ================================ CN正式数据优先 ================================ #
     if cn_event:
-        if known_preview_event and not preview_manager.is_official_active(event_id):
-            preview_manager.mark_cn_detected(
+        if known_preview_event and not await preview_manager.is_official_active(event_id):
+            await preview_manager.mark_cn_detected(
                 event_id,
                 str(cn_event.get("eventType", "")),
             )
@@ -894,10 +893,7 @@ async def extract_preview_target_event(
         elif leading_ban_event_token:
             args = native_args
         return args, None, False
-    if (
-        preview_manager.is_official_active(event_id)
-        or preview_manager.is_cn_detected(event_id)
-    ):
+    if await preview_manager.blocks_preview(event_id):
         # CN_DETECTED/OFFICIAL_ACTIVE 后即使 CN 缓存短暂回退，也绝不重新使用 JP 规则。
         raise ReplyException("国服活动数据正在同步，请稍后再试")
 
@@ -2666,6 +2662,26 @@ def draw_wl_support_deck(deck, thumbnails: dict, limits: dict, front_start: int,
 
 # ================================ 组卡页面 ================================ #
 
+def _get_challenge_high_scores(profile: dict) -> Dict[int, Optional[int]] | None:
+    """读取各角色历史挑战分，重复记录使用首条匹配。
+
+    字段缺失或内容不是字典列表时返回 None，列表中没有该角色时按零分处理。
+    单个角色的得分无效时以 None 标记，绘图时隐藏其分差。
+    """
+    results = profile.get('userChallengeLiveSoloResults')
+    if not isinstance(results, list) or any(not isinstance(item, dict) for item in results):
+        return None
+    scores = {}
+    for character_id in range(1, 27):
+        result = find_by(results, 'characterId', character_id)
+        if result is None:
+            scores[character_id] = 0
+        else:
+            score = result.get('highScore')
+            scores[character_id] = score if type(score) is int and score >= 0 else None
+    return scores
+
+
 async def compose_deck_recommend_image(
     ctx: SekaiHandlerContext, 
     qid: int,
@@ -3186,7 +3202,7 @@ async def compose_deck_recommend_image(
             "预览组卡暂时不可用，请稍后再试",
         )
     elif preview_manager.enabled() and options.event_id and (
-        official_entry := preview_manager.official_entry(options.event_id)
+        official_entry := await preview_manager.official_entry(options.event_id)
     ):
         # 已由 preview 粘性切回的活动，只允许路由到确认加载正式 CN 指纹的节点。
         acked_urls = {
@@ -3539,13 +3555,12 @@ async def compose_deck_recommend_image(
     # 获取挑战live额外分数信息
     challenge_score_dlt = []
     if recommend_type in ["challenge", "challenge_all"]:
-        try: challenge_live_info = await get_user_challenge_live_info(ctx, profile)
-        except: challenge_live_info = {}
+        challenge_high_scores = _get_challenge_high_scores(profile)
         for deck in result_decks:
             card_id = deck.cards[0].card_id
             chara_id = (await _get_result_card_masterdata(card_id))['characterId']
-            _, high_score, _, _ = challenge_live_info.get(chara_id, (None, 0, None, None))
-            challenge_score_dlt.append(deck.score - high_score)
+            high_score = challenge_high_scores.get(chara_id) if challenge_high_scores is not None else None
+            challenge_score_dlt.append(deck.score - high_score if high_score is not None else None)
 
     # 绘制结果。
         
@@ -3865,7 +3880,10 @@ async def compose_deck_recommend_image(
                                             with Frame().set_content_align('rb'):
                                                 alg_offset = 0
                                                 # 挑战分数差距
-                                                if recommend_type in ['challenge', 'challenge_all']:
+                                                if (
+                                                    recommend_type in ['challenge', 'challenge_all']
+                                                    and challenge_score_dlt[i] is not None
+                                                ):
                                                     alg_offset = 20
                                                     dlt = challenge_score_dlt[i]
                                                     color = (50, 150, 50) if dlt > 0 else (150, 50, 50)
@@ -4607,13 +4625,13 @@ async def provide_preview_builder_source() -> dict:
     builder_request["jp_source_fingerprint"] = current_jp_fingerprint
     acked_servers: list[str] | None = None
     activation_candidates: list[dict] = []
-    for event_id in preview_manager.tracked_event_ids():
-        if preview_manager.is_official_active(event_id):
+    for event_id in await preview_manager.tracked_event_ids():
+        if await preview_manager.is_official_active(event_id):
             continue
         event = await cn_ctx.md.events.find_by_id(event_id)
         if not event:
             continue
-        preview_manager.mark_cn_detected(
+        await preview_manager.mark_cn_detected(
             event_id,
             str(event.get("eventType", "")),
         )

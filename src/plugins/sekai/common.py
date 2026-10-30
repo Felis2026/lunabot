@@ -17,6 +17,34 @@ file_db = get_file_db(f"{SEKAI_DATA_DIR}/db.json", logger)
 cd = ColdDown(file_db, logger)
 gbl = get_group_black_list(file_db, logger, 'sekai')
 
+# 本地后台操作合计最多六路，卡面与谱面共用图片额度。
+LOCAL_IO_LIMIT = asyncio.Semaphore(6)
+LOCAL_IMAGE_IO_LIMIT = asyncio.Semaphore(6)
+AUDIO_LENGTH_IO_LIMIT = asyncio.Semaphore(4)
+
+
+async def run_local_io(func, *args):
+    """执行本地同步操作，取消时等待线程结束并关闭未返回的图片。
+
+    正常返回的图片归调用方所有，工作线程异常按原样传播。
+    调用方另持有分类额度时，须等待本函数结束后再释放。
+    """
+    async with LOCAL_IO_LIMIT:
+        result = None
+
+        def execute():
+            nonlocal result
+            result = func(*args)
+            return result
+
+        try:
+            return await run_in_pool_until_complete(execute)
+        except asyncio.CancelledError:
+            # 线程已结束，可以关闭取消期间生成且未交给调用方的图片。
+            if isinstance(result, Image.Image):
+                result.close()
+            raise
+
 
 # ======================= 通用常量 ======================= #
 

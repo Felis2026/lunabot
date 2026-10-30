@@ -17,7 +17,7 @@ from ....utils import (
     get_exc_desc,
     run_managed_subprocess,
 )
-from ...common import config, logger
+from ...common import config, logger, run_local_io
 
 from .protocol import (
     PREVIEW_DATA_SCOPE,
@@ -90,6 +90,7 @@ class PreviewManager:
         self._state = PreviewRuntimeState()
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._activation_io_limit = asyncio.Semaphore(1)
         self._source_provider: SourceProvider | None = None
         self._configuration_error = ""
         self._last_source_signature = ""
@@ -225,30 +226,38 @@ class PreviewManager:
     def is_ready(self) -> bool:
         return self._state.status == PreviewStatus.READY
 
-    def is_official_active(self, event_id: int) -> bool:
-        return self._activation_store.is_active(event_id)
+    async def _run_activation_io(self, method, *args):
+        """串行执行状态读写，文件锁等待和落盘均在线程中完成。"""
+        async with self._activation_io_limit:
+            return await run_local_io(method, *args)
 
-    def is_cn_detected(self, event_id: int) -> bool:
-        return self._activation_store.is_detected(event_id)
+    async def is_official_active(self, event_id: int) -> bool:
+        return await self._run_activation_io(self._activation_store.is_active, event_id)
 
-    def mark_cn_detected(self, event_id: int, event_type: str) -> None:
+    async def is_cn_detected(self, event_id: int) -> bool:
+        return await self._run_activation_io(self._activation_store.is_detected, event_id)
+
+    async def blocks_preview(self, event_id: int) -> bool:
+        return await self._run_activation_io(self._activation_store.blocks_preview, event_id)
+
+    async def mark_cn_detected(self, event_id: int, event_type: str) -> None:
         """先原子记录 CN_DETECTED，再允许调用方进入闭包与正式节点核验。"""
 
-        if self._activation_store.mark_detected(event_id, {
+        if await self._run_activation_io(self._activation_store.mark_detected, event_id, {
             "event_type": event_type,
         }):
             logger.info(f"活动 CN-{event_id} 已进入 CN_DETECTED")
 
-    def tracked_event_ids(self) -> set[int]:
+    async def tracked_event_ids(self) -> set[int]:
         """返回当前 preview 活动与已检测活动的并集，供重建后继续完成切回。"""
 
         return {
             int(event_id)
             for event_id in self._state.manifest.get("event_ids", [])
-        } | self._activation_store.detected_ids()
+        } | await self._run_activation_io(self._activation_store.detected_ids)
 
-    def official_entry(self, event_id: int) -> dict[str, Any] | None:
-        return self._activation_store.get(event_id)
+    async def official_entry(self, event_id: int) -> dict[str, Any] | None:
+        return await self._run_activation_io(self._activation_store.get, event_id)
 
     def future_card_ids(self) -> set[int]:
         if not bool(_config_get(
@@ -334,7 +343,7 @@ class PreviewManager:
                     return
                 if self._source_provider is None:
                     raise RuntimeError("preview source provider 尚未配置")
-                if not self._activation_store.healthy():
+                if not await self._run_activation_io(self._activation_store.healthy):
                     raise RuntimeError("正式切回激活记录损坏，preview 已失败关闭")
                 if self._state.status == PreviewStatus.READY:
                     previous_ready_state = self.get_state()
@@ -437,7 +446,7 @@ class PreviewManager:
                         "acked_servers": acked_servers,
                         "native_canary": "passed",
                     }
-                    if self._activation_store.activate(event_id, activation):
+                    if await self._run_activation_io(self._activation_store.activate, event_id, activation):
                         logger.info(f"活动 CN-{event_id} 已粘性切回正式组卡")
                 for event_id, detail in official_canary.get(
                     "failures",
