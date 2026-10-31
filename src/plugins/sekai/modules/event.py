@@ -755,9 +755,11 @@ async def get_event_story_summary(ctx: SekaiHandlerContext, event: dict, refresh
             requests['image', index] = lambda index=index: ctx.rip.img(
                 f'event_story/{asset_name}/episode_image_rip/{asset_name}_{index:02d}.png')
             scenario_id = episode['scenarioId']
+            # 更新器会把同名 ScenarioSceneData 存根写到正式文件名，按剧情字段选取 __dup 导出中的真实数据
             requests['scenario', scenario_id] = lambda scenario_id=scenario_id: ctx.rip.json(
                 f'event_story/{asset_name}/scenario_rip/{scenario_id}.asset', allow_error=False,
-                use_cache=True, cache_expire_secs=0 if refresh else 60 * 60 * 24)
+                use_cache=True, cache_expire_secs=0 if refresh else 60 * 60 * 24,
+                required_keys=('AppearCharacters', 'Snippets'))
         prepared = await prepare_assets(requests)
         for i, ep in enumerate(story['eventStoryEpisodes'], 1):
             ep_id = ep['scenarioId']

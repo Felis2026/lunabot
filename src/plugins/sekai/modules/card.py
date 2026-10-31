@@ -485,7 +485,12 @@ async def get_card_story_summary(ctx: SekaiHandlerContext, card: dict, refresh: 
         asset_name = story['assetbundleName']
         scenario_id = story['scenarioId']
         ep_title = story['title']
-        ep_data = await ctx.rip.json(f"character/member/{asset_name}_rip/{scenario_id}.asset", allow_error=False)
+        # 更新器会把同名 ScenarioSceneData 存根写到正式文件名，按剧情字段选取 __dup 导出中的真实数据
+        ep_data = await ctx.rip.json(
+            f"character/member/{asset_name}_rip/{scenario_id}.asset",
+            allow_error=False,
+            required_keys=('AppearCharacters', 'Snippets'),
+        )
         cids = set([
             (await ctx.md.characters_2ds.find_by_id(item['Character2dId'])).get('characterId', None)
             for item in ep_data['AppearCharacters']
