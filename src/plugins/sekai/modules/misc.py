@@ -220,7 +220,7 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(
         await get_image_cq(
             await canvas.get_img(),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     )
 
@@ -381,7 +381,7 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(
         await get_image_cq(
             await canvas.get_img(),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     )
             

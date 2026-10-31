@@ -2006,10 +2006,20 @@ async def compose_profile_image(ctx: SekaiHandlerContext, basic_profile: dict, v
     with Canvas(bg=bg).set_padding(BG_PADDING) as canvas:
         if not vertical:
             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(16):
-                await draw_info(vertical)
+                info_panel = await draw_info(vertical)
                 with VSplit().set_content_align('c').set_item_align('c').set_sep(16):
-                    await draw_play(vertical)
-                    await draw_chara(vertical)
+                    play_panel = await draw_play(vertical)
+                    chara_panel = await draw_chara(vertical)
+                    right_panel = VSplit.get_current_widget()
+                left_height = info_panel._get_self_size()[1]
+                right_height = right_panel._get_self_size()[1]
+                gap_count = max(1, len(info_panel.items) - 1)
+                original_sep = info_panel.sep
+                target_sep = max(0, original_sep + (right_height - left_height) // gap_count)
+                info_panel.set_sep(target_sep)
+                info_panel.set_h(max(right_height, left_height + (target_sep - original_sep) * gap_count))
+                for panel in (info_panel, chara_panel, right_panel):
+                    panel._calc_w = panel._calc_h = None
         else:
             with VSplit().set_content_align('c').set_item_align('c').set_sep(16).set_item_bg(ui_bg):
                 (await draw_info(vertical)).set_bg(None)
@@ -3230,7 +3240,7 @@ async def _(ctx: SekaiHandlerContext):
 """.strip()
         return await ctx.asend_reply_msg(await get_image_cq(
             await markdown_to_image(help_text, width=760),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         ))
     nickname, rest = extract_nickname_from_args(raw_args)
     assert_and_reply(nickname, f"未识别到角色名称\n{help_msg}")
@@ -3250,7 +3260,7 @@ async def _(ctx: SekaiHandlerContext):
             assert_and_reply(mission_type is not None and not rest.strip(), f"未识别到角色等级任务名\n{help_msg}")
             return await ctx.asend_reply_msg(await get_image_cq(
                 await compose_character_rank_mission_all_image(ctx, ctx.user_id, cid, mission_type),
-                low_quality=True,
+                low_quality=True, quality=85, subsampling=2,
             ))
         assert_and_reply(False, f"参数无法解析: {rest}\n{help_msg}")
 
@@ -3263,7 +3273,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_character_rank_mission_overview_image(ctx, profile, err_msg, cid),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -3714,7 +3724,7 @@ async def _(ctx: SekaiHandlerContext):
     try:
         img_cq = await get_image_cq(
             await compose_profile_image(ctx, await get_basic_profile(ctx, uid)),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
         msg = img_cq + msg.strip()
     except Exception as e:
@@ -3840,7 +3850,7 @@ async def _(ctx: SekaiHandlerContext):
     try:
         img_cq = await get_image_cq(
             await compose_profile_image(ctx, await get_basic_profile(ctx, uid)),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
         msg = img_cq + msg.strip()
     except Exception as e:

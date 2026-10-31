@@ -195,6 +195,23 @@ async def compose_score_control_image(ctx: SekaiHandlerContext, target_point: in
     style1 = TextStyle(font=DEFAULT_BOLD_FONT, size=16, color=BLACK)
     style2 = TextStyle(font=DEFAULT_FONT,      size=16, color=(50, 50, 50))
     style3 = TextStyle(font=DEFAULT_BOLD_FONT, size=16, color=(200, 50, 50))
+
+    def table_cell(text, style, background, width, height, align='c'):
+        """按实际字形高度居中控分表格单元格，保留指定的水平对齐方式。"""
+        if align == 'r':
+            reference = get_score_str(MAX_SCORE)
+            number_width = min(width, math.ceil(get_text_width(get_font(style.font, style.size), reference)) + 4)
+            with Frame().set_bg(background).set_size((width, height)).set_content_align('c') as container:
+                widget = TextBox(text, style).set_size((number_width, height)).set_padding(0).set_content_align('r')
+        else:
+            widget = TextBox(text, style).set_bg(background).set_size((width, height)).set_content_align('c')
+            container = widget
+        font = widget._get_pil_font()
+        _, top, _, bottom = font.getbbox(widget.text, anchor='ls')
+        target_top = (style.size - (bottom - top) + 1) // 2
+        # 字形框居中后略向下调整，补偿小字号数字的视觉重心。
+        widget.set_text_offset((0, target_top - get_font_std_size(font)[1] - top + 1))
+        return container
     
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_content_align('lt').set_item_align('lt').set_sep(8).set_item_bg(roundrect_bg()) as vs:
@@ -228,20 +245,20 @@ async def compose_score_control_image(ctx: SekaiHandlerContext, target_point: in
                     bg2 = FillBg((255, 255, 255, 100))
                     with VSplit().set_content_align('lt').set_item_align('lt').set_sep(4).set_padding(8):
                         with HSplit().set_content_align('lt').set_item_align('lt').set_sep(4):
-                            TextBox("加成",  style1).set_bg(bg1).set_size((gw1, gh)).set_content_align('c')
-                            TextBox("火",    style1).set_bg(bg1).set_size((gw2, gh)).set_content_align('c')
-                            TextBox("分数下限",  style1).set_bg(bg1).set_size((gw3, gh)).set_content_align('c')
-                            TextBox("分数上限",  style1).set_bg(bg1).set_size((gw4, gh)).set_content_align('c')
+                            table_cell("加成", style1, bg1, gw1, gh)
+                            table_cell("火", style1, bg1, gw2, gh)
+                            table_cell("分数下限", style1, bg1, gw3, gh)
+                            table_cell("分数上限", style1, bg1, gw4, gh)
                         for i, item in enumerate(scores):
                             bg = bg2 if i % 2 == 0 else bg1
                             score_min = get_score_str(item.score_min)
                             if score_min == '0': score_min = '0 (放置)'
                             score_max = get_score_str(item.score_max)
                             with HSplit().set_content_align('lt').set_item_align('lt').set_sep(4):
-                                TextBox(f"{item.event_bonus}", style2).set_bg(bg).set_size((gw1, gh)).set_content_align('r')
-                                TextBox(f"{item.boost}",       style2).set_bg(bg).set_size((gw2, gh)).set_content_align('r')
-                                TextBox(f"{score_min}",         style2).set_bg(bg).set_size((gw3, gh)).set_content_align('r')
-                                TextBox(f"{score_max}",         style2).set_bg(bg).set_size((gw4, gh)).set_content_align('r')
+                                table_cell(f"{item.event_bonus}", style2, bg, gw1, gh)
+                                table_cell(f"{item.boost}", style2, bg, gw2, gh)
+                                table_cell(f"{score_min}", style2, bg, gw3, gh, 'r')
+                                table_cell(f"{score_max}", style2, bg, gw4, gh, 'r')
 
     # 如果数据panel比较多，重新调整标题文字的布局
     if len(data_hs.items) > 1:
@@ -730,7 +747,7 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(
         await get_image_cq(
             await compose_score_control_image(ctx, target_pt, mid, ctx.prefix_arg == 'wl'),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     ) 
 
@@ -755,7 +772,7 @@ async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(
         await get_image_cq(
             await compose_custom_room_score_control_image(ctx, target_pt),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     )
 
@@ -783,7 +800,7 @@ async def _(ctx: SekaiHandlerContext):
 
     img_cq = await get_image_cq(
         await compose_music_meta_image(ctx, mids),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     )
 
     return await ctx.asend_reply_msg(img_cq + res.candidate_msg)
@@ -972,7 +989,7 @@ async def _(ctx: SekaiHandlerContext):
                 page=page,
                 ascend=ascend,
             ),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     )
 

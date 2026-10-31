@@ -1337,7 +1337,7 @@ async def _(ctx: SekaiHandlerContext):
         logger.info(f"查询卡牌: id={card['id']}")
         msg = await get_image_cq(
             await compose_card_detail_image(card_ctx, card['id']),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
         if used_fallback:
             msg = format_jp_fallback_reply(msg)
@@ -1361,7 +1361,7 @@ async def _(ctx: SekaiHandlerContext):
             logger.info(f"国服卡牌筛选无结果，已回退到日服并搜索到{len(jp_res)}个卡牌")
             return await ctx.asend_reply_msg(format_jp_fallback_reply(await get_image_cq(
                 await compose_card_list_image(jp_ctx, jp_res, None),
-                low_quality=True,
+                low_quality=True, quality=85, subsampling=2,
             )))
 
     logger.info(f"搜索到{len(res)}个卡牌")
@@ -1369,7 +1369,7 @@ async def _(ctx: SekaiHandlerContext):
     qid = ctx.user_id if box else None
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_card_list_image(ctx, res, qid),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
         
         
@@ -1421,7 +1421,7 @@ async def _(ctx: SekaiHandlerContext):
 
     resp = await get_card_story_summary(ctx, card, refresh, model, save)
     if isinstance(resp, Image.Image):
-        return await ctx.asend_reply_msg(await get_image_cq(resp, low_quality=True))
+        return await ctx.asend_reply_msg(await get_image_cq(resp, low_quality=True, quality=85, subsampling=2))
     else:
         return await ctx.asend_fold_msg(resp)
 
@@ -1461,6 +1461,6 @@ async def _(ctx: SekaiHandlerContext):
     await ctx.asend_reply_msg(await get_image_cq(
         await compose_box_image(ctx, ctx.user_id, cards, show_id, show_box, use_after_training,
                                 show_unowned=show_unowned, layout=layout),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 

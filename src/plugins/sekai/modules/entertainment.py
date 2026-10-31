@@ -786,7 +786,7 @@ async def random_music(ctx: SekaiHandlerContext, res_type: str) -> Tuple[Dict, I
     assert datetime.now() > datetime.fromtimestamp(music['publishedAt'] / 1000)
     asset_name = music['assetbundleName']
     cover_img = await ctx.rip.img(f"music/jacket/{asset_name}_rip/{asset_name}.png", allow_error=False)
-    cover_thumb_cq = await get_image_cq(cover_img.resize((200, 200)), low_quality=True)
+    cover_thumb_cq = await get_image_cq(cover_img.resize((200, 200)), low_quality=True, quality=85, subsampling=2)
     if res_type == 'cover':
         return music, cover_thumb_cq, cover_img.resize((512, 512))
     elif res_type == 'audio':
@@ -1191,17 +1191,17 @@ async def _(ctx: SekaiHandlerContext):
             gctx.data['guessed'].add(cid)
         if cid == card["characterId"]:
             await gctx.asend_reply_msg(f"你猜对了！\n{await get_card_title(gctx.ctx, card, after_training)}")
-            await gctx.asend_msg(await get_image_cq(card_img, low_quality=True))
+            await gctx.asend_msg(await get_image_cq(card_img, low_quality=True, quality=85, subsampling=2))
             gctx.guess_success = True
         if len(gctx.data['guessed']) > GUESS_CARD_CID_LIMIT:
             await gctx.asend_msg(f"猜卡面失败，正确答案：\n{await get_card_title(ctx, card, after_training)}")
-            await gctx.asend_msg(await get_image_cq(card_img, low_quality=True))
+            await gctx.asend_msg(await get_image_cq(card_img, low_quality=True, quality=85, subsampling=2))
             gctx.guess_success = True
     
     async def stop_fn(gctx: GuessContext):
         card, card_img, after_training = gctx.data['card'], gctx.data['card_img'], gctx.data['after_training']
         await gctx.asend_msg(f"猜卡面结束，正确答案：\n{await get_card_title(ctx, card, after_training)}")
-        await gctx.asend_msg(await get_image_cq(card_img, low_quality=True))
+        await gctx.asend_msg(await get_image_cq(card_img, low_quality=True, quality=85, subsampling=2))
 
     await start_guess(ctx, '猜卡面', GUESS_CARD_TIMEOUT, start_fn, check_fn, stop_fn, send_guess_card_hint)
 
@@ -1269,7 +1269,7 @@ async def _(ctx: SekaiHandlerContext):
     cards = await spin_gacha(ctx, gacha, count)
     ret = await ctx.asend_reply_msg(await get_image_cq(
         await compose_gacha_spin_image(ctx, gacha, cards), 
-        low_quality=True
+        low_quality=True, quality=85, subsampling=2
     ))
     if is_group_scope:
         _commit_group_entertainment_quota_usage(ctx)

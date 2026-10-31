@@ -1310,7 +1310,7 @@ async def _(ctx: SekaiHandlerContext):
         logger.info(f"查询活动列表，筛选条件={filter}")
         return await ctx.asend_reply_msg(await get_image_cq(
             await compose_event_list_image(ctx, filter),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         ))
     
     async def query_single(args: str):
@@ -1322,7 +1322,7 @@ async def _(ctx: SekaiHandlerContext):
             event = await get_current_event(ctx, fallback='next_first')
         msg = await get_image_cq(
             await compose_event_detail_image(query_ctx, event),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
         if used_fallback:
             msg = format_jp_fallback_reply(msg)
@@ -1380,7 +1380,7 @@ async def _(ctx: SekaiHandlerContext):
 
     resp = await get_event_story_summary(ctx, event, refresh, model, save)
     if isinstance(resp, Image.Image):
-        return await ctx.asend_reply_msg(await get_image_cq(resp, low_quality=True))
+        return await ctx.asend_reply_msg(await get_image_cq(resp, low_quality=True, quality=85, subsampling=2))
     else:
         return await ctx.asend_fold_msg(resp)
 
@@ -1406,5 +1406,5 @@ pjsk_event_record.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_event_record_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))

@@ -2609,7 +2609,7 @@ async def _(ctx: SekaiHandlerContext):
         leak_musics = sorted(leak_musics, key=lambda x: (x['publishedAt'], x['id']))
         return await ctx.asend_reply_msg(await get_image_cq(
             await compose_music_brief_list_image(ctx, leak_musics, hide_too_far=True),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         ))
     
     # 查询多曲
@@ -2621,7 +2621,7 @@ async def _(ctx: SekaiHandlerContext):
     if mids:
         return await ctx.asend_reply_msg(await get_image_cq(
             await compose_music_brief_list_image(ctx, mids),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         ))
 
     # 查询单曲
@@ -2770,7 +2770,7 @@ async def _(ctx: SekaiHandlerContext):
             show_id, show_leak, play_result_filter,
             show_constant,
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2786,7 +2786,7 @@ async def _(ctx: SekaiHandlerContext):
     diff, _ = extract_diff(args)
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_play_progress_image(ctx, diff, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2867,7 +2867,7 @@ pjsk_music_rewards.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_music_rewards_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2888,7 +2888,7 @@ async def _(ctx: SekaiHandlerContext):
 
     cover_cq = await get_image_cq(
         await get_music_cover_thumb(query_ctx, ret.music['id']), 
-        low_quality=True
+        low_quality=True, quality=85, subsampling=2
     )
     msg = f"{cover_cq}【{ret.music['id']}】{ret.music['title']}\n{ret.candidate_msg}".strip()
     
@@ -2960,7 +2960,7 @@ async def _(ctx: SekaiHandlerContext):
         total_count=len(all_entries),
         owned_count=sum(1 for item in all_entries if item.owned),
     )
-    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True))
+    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True, quality=85, subsampling=2))
 
 
 # best30
@@ -2972,7 +2972,7 @@ pjsk_best30.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_best30_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 

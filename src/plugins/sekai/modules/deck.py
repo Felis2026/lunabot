@@ -3013,6 +3013,9 @@ async def compose_deck_recommend_image(
         options.event_id,
     )
 
+    finale_honor_rows = await rule_ctx.md.event_honor_bonuses.find_by('eventId', options.event_id, mode='all') if is_finale else []
+    owned_honor_ids = {row['honorId'] for row in profile.get('userHonors', [])} if is_finale else set()
+
     # 按终章规则修正下发参数。
     # 终章在 MasterData 里只有 finale 章节，没有“按角色拆开的 worldBloom chapter”。
     # 因此这里不能再把目标角色继续塞进 world_bloom_character_id 下发给后端，
@@ -3973,11 +3976,24 @@ async def compose_deck_recommend_image(
                                             else:
                                                 bonus = None
                                                 total = f"{deck.event_bonus_rate:.1f}%"
-                                            with Frame().set_content_align('rb'):
-                                                if bonus is not None:
-                                                    TextBox(bonus, TextStyle(font=DEFAULT_FONT, size=14, color=(150, 150, 150))).set_offset((0, -6-voffset*2))
-                                                with Frame().set_content_align('c'):
-                                                    TextBox(total, tb_style).set_h(gh).set_content_align('c').set_offset((0, -voffset))
+                                            if is_finale:
+                                                with VSplit().set_h(gh).set_padding(0).set_sep(3).set_content_align('c').set_item_align('c'):
+                                                    TextBox(total, tb_style)
+                                                    detail_style = TextStyle(font=DEFAULT_FONT, size=14, color=(100, 100, 100))
+                                                    if bonus is not None:
+                                                        TextBox(bonus, detail_style)
+                                                    # 称号数值已计入队长加成，此处按对应活动映射补充说明。
+                                                    leader_character_id = (await _get_result_card_masterdata(deck.cards[0].card_id))['characterId']
+                                                    matched_honors = [row for row in finale_honor_rows if row['leaderGameCharacterId'] == leader_character_id and row['honorId'] in owned_honor_ids]
+                                                    honor_bonus = sum(row['bonusRate'] for row in matched_honors)
+                                                    if honor_bonus:
+                                                        TextBox(f'（含称号加成{honor_bonus:g}%）', detail_style)
+                                            else:
+                                                with Frame().set_content_align('rb'):
+                                                    if bonus is not None:
+                                                        TextBox(bonus, TextStyle(font=DEFAULT_FONT, size=14, color=(150, 150, 150))).set_offset((0, -6-voffset*2))
+                                                    with Frame().set_content_align('c'):
+                                                        TextBox(total, tb_style).set_h(gh).set_content_align('c').set_offset((0, -voffset))
 
                                 # 实效
                                 if options.live_type in ['multi', 'cheerful']:
@@ -4088,7 +4104,7 @@ async def _(ctx: SekaiHandlerContext):
                 ctx, ctx.user_id, 
                 **(await extract_event_options(ctx, ctx.get_args()))
             ),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         ))
 
 
@@ -4105,7 +4121,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx, ctx.user_id,
             **(await extract_challenge_options(ctx, ctx.get_args()))
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -4123,7 +4139,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx, ctx.user_id,
             **(await extract_no_event_options(ctx, ctx.get_args()))
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -4141,7 +4157,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx, ctx.user_id,
             **(await extract_bonus_options(ctx, ctx.get_args()))
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -4159,7 +4175,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx, ctx.user_id,
             **(await extract_mysekai_options(ctx, ctx.get_args()))
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 

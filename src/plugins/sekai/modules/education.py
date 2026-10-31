@@ -1218,7 +1218,7 @@ pjsk_challenge_info.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_challenge_live_detail_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1232,7 +1232,7 @@ pjsk_power_bonus_info.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_power_bonus_detail_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1289,7 +1289,7 @@ async def _(ctx: SekaiHandlerContext):
     )
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_area_item_upgrade_materials_image(ctx, qid, filter),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1312,7 +1312,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_bonds_image(ctx, ctx.user_id, cid),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1326,6 +1326,6 @@ pjsk_leader_count.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_leader_count_image(ctx, ctx.user_id),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 

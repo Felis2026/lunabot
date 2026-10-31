@@ -204,7 +204,7 @@ async def _(ctx: SekaiHandlerContext):
                 style_sheet=config.get('chart.style_sheet_name'),
                 skill=skill
             ),
-            low_quality=True,
+            low_quality=True, quality=85, subsampling=2,
         )
     except Exception as e:
         logger.print_exc(f"获取 mid={mid} {diff} 的谱面失败")

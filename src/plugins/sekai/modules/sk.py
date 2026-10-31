@@ -1846,7 +1846,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_msg(await get_image_cq(
         await compose_skp_image(ctx),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1881,7 +1881,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_msg(await get_image_cq(
         await compose_skl_image(ctx, wl_event or event, full),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2039,7 +2039,7 @@ async def _(ctx: SekaiHandlerContext):
             full=full,
             final_snapshot=snapshot,
         ),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2060,7 +2060,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_msg(await get_image_cq(
         await compose_sks_image(ctx, unit='h', event=wl_event, period=period),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2081,7 +2081,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_msg(await get_image_cq(
         await compose_sks_image(ctx, unit='d', event=wl_event, period=period),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2099,7 +2099,7 @@ async def _(ctx: SekaiHandlerContext):
     qtype, qval = await parse_sk_query_params(ctx, args)
     return await ctx.asend_msg(await get_image_cq(
         await compose_sk_image(ctx, qtype, qval, event=wl_event),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
     
 
@@ -2116,7 +2116,7 @@ async def _(ctx: SekaiHandlerContext):
     qtype, qval = await parse_sk_query_params(ctx, args)
     return await ctx.asend_msg(await get_image_cq(
         await compose_cf_image(ctx, qtype, qval, event=wl_event),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2133,7 +2133,7 @@ async def _(ctx: SekaiHandlerContext):
     qtype, qval = await parse_sk_query_params(ctx, args)
     return await ctx.asend_msg(await get_image_cq(
         await compose_csb_image(ctx, qtype, qval, event=wl_event),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2150,7 +2150,7 @@ async def _(ctx: SekaiHandlerContext):
     qtype, qval = await parse_sk_query_params(ctx, args)
     return await ctx.asend_msg(await get_image_cq(
         await compose_player_trace_image(ctx, qtype, qval, event=wl_event),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2171,7 +2171,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_msg(await get_image_cq(
         await compose_rank_trace_image(ctx, rank, event=wl_event),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -2185,7 +2185,7 @@ pjsk_winrate.check_cdrate(cd).check_wblist(gbl)
 async def _(ctx: SekaiHandlerContext):
     return await ctx.asend_msg(await get_image_cq(
         await compose_winrate_predict_image(ctx),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 

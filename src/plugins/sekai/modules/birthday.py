@@ -1001,4 +1001,4 @@ async def _(ctx: SekaiHandlerContext):
     cid, target = _parse_birthday_args(ctx.get_args().strip())
     await ctx.block_region('birthday_watering')
     image = await compose_birthday_watering_image(ctx, cid, target)
-    return await ctx.asend_reply_msg(await get_image_cq(image, low_quality=True))
+    return await ctx.asend_reply_msg(await get_image_cq(image, low_quality=True, quality=85, subsampling=2))

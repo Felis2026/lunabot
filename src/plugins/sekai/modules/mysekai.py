@@ -2345,7 +2345,7 @@ async def _(ctx: SekaiHandlerContext):
             show_all_talks=show_all_talks
         )
 
-    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True))
+    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True, quality=85, subsampling=2))
 
 
 # 查询mysekai家具列表/家具
@@ -2364,7 +2364,7 @@ async def _(ctx: SekaiHandlerContext):
         assert_and_reply(len(fids) <= 10, "最多一次查询10个家具")
         return await ctx.asend_reply_msg(await get_image_cq(
             await compose_mysekai_fixture_detail_image(ctx, fids),
-            low_quality=True
+            low_quality=True, quality=85, subsampling=2
         ))
     
     # 查询家具列表
@@ -2392,7 +2392,7 @@ async def _(ctx: SekaiHandlerContext):
             show_all_talks=show_all_talks
         )
 
-    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True))
+    return await ctx.asend_reply_msg(await get_image_cq(img, low_quality=True, quality=85, subsampling=2))
 
 
 # 下载mysekai照片
@@ -2492,7 +2492,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_mysekai_door_upgrade_image(ctx, qid, gate_id, preview=preview),
-        low_quality=True
+        low_quality=True, quality=85, subsampling=2
     ))
 
 
@@ -2515,7 +2515,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx.user_id,
             show_id=show_id,
         ),
-        low_quality=True
+        low_quality=True, quality=85, subsampling=2
     ))
 
 
@@ -2624,7 +2624,7 @@ async def msr_auto_push():
             try:
                 logger.info(f"在 {gid} 中自动推送用户 {qid} 的{region_name}Mysekai资源查询")
                 contents = [
-                    await get_image_cq(img, low_quality=True) for img in 
+                    await get_image_cq(img, low_quality=True, quality=85, subsampling=2) for img in
                     await compose_mysekai_res_image(user_ctx, qid, False, True)
                 ]
                 contents = [f"[CQ:at,qq={qid}]的{region_name}MSR推送"] + contents

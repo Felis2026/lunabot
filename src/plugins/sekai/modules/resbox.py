@@ -400,5 +400,5 @@ async def _(ctx: SekaiHandlerContext):
                      '请查询自己绑定的账号，可用 u2 等序号切换')
     category = _parse_inventory_category(ctx.get_args(), ctx.trigger_cmd)
     await ctx.asend_reply_msg(await get_image_cq(
-        await compose_inventory_image(ctx, ctx.user_id, category), low_quality=True,
+        await compose_inventory_image(ctx, ctx.user_id, category), low_quality=True, quality=85, subsampling=2,
     ))

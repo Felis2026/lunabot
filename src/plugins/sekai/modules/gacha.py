@@ -466,16 +466,16 @@ async def compose_gacha_list_image(ctx: SekaiHandlerContext, filter: GachaFilter
     logos = await batch_gather(*[get_gacha_logo(ctx, g) for g in gachas])
 
     row_count = math.ceil(math.sqrt(len(gachas)))
-    style1 = TextStyle(font=DEFAULT_HEAVY_FONT, size=10, color=(50, 50, 50))
-    style2 = TextStyle(font=DEFAULT_FONT,       size=10, color=(70, 70, 70))
+    style1 = TextStyle(font=DEFAULT_HEAVY_FONT, size=12, color=(50, 50, 50))
+    style2 = TextStyle(font=DEFAULT_FONT,       size=12, color=(70, 70, 70))
 
     with Canvas(bg=SEKAI_BLUE_BG).set_padding(BG_PADDING) as canvas:
         with VSplit().set_padding(0).set_sep(4).set_content_align('lt').set_item_align('lt'):
             TextBox(
                 f"卡池按时间顺序排列，黄色为开放中卡池，当前为第 {page}/{total_pages} 页",
-                TextStyle(font=DEFAULT_FONT, size=12, color=(0, 0, 100))
+                TextStyle(font=DEFAULT_FONT, size=14, color=(0, 0, 100))
             ).set_bg(roundrect_bg(radius=4)).set_padding(4)
-            with Grid(row_count=row_count, vertical=True).set_sep(8, 2).set_item_align('c').set_content_align('c'):
+            with Grid(row_count=row_count, vertical=True).set_sep(8, 8).set_item_align('c').set_content_align('c'):
                 for g, logo in zip(gachas, logos):
                     now = datetime.now()
                     bg_color = WIDGET_BG_COLOR_CFG.get()
@@ -484,10 +484,10 @@ async def compose_gacha_list_image(ctx: SekaiHandlerContext, filter: GachaFilter
                     elif now > g.end_at:
                         bg_color = (220, 220, 220, 200)
                     bg = roundrect_bg(bg_color, 5)
-                    with HSplit().set_padding(4).set_sep(4).set_item_align('lt').set_content_align('lt').set_bg(bg):
-                        with VSplit().set_padding(0).set_sep(2).set_item_align('lt').set_content_align('lt'):
-                            ImageBox(logo, size=(None, 60))
-                            TextBox(f"【{g.id}】{g.name}", style1, line_count=2, use_real_line_count=False).set_w(130)
+                    with HSplit().set_w(168).set_padding(4).set_sep(4).set_item_align('lt').set_content_align('lt').set_bg(bg):
+                        with VSplit().set_w(160).set_padding(0).set_sep(4).set_item_align('lt').set_content_align('lt'):
+                            ImageBox(logo, size=(160, 72), image_size_mode='fit').set_content_align('c')
+                            TextBox(f"【{g.id}】{g.name}", style1, line_count=2, use_real_line_count=False).set_w(160)
                             TextBox(f"S {g.start_at.strftime('%Y-%m-%d %H:%M')}", style2)
                             TextBox(f"T {g.end_at.strftime('%Y-%m-%d %H:%M')}", style2)
 
@@ -1250,7 +1250,7 @@ async def _(ctx: SekaiHandlerContext):
             ctx, query.gacha, full=query.full, conditions=query.conditions, page=query.page,
             exchange=query.exchange, show_unowned=query.show_unowned, trace_id=trace_id)
         rendered = time.perf_counter()
-        message = await get_image_cq(image, low_quality=True)
+        message = await get_image_cq(image, low_quality=True, quality=85, subsampling=2)
         encoded = time.perf_counter()
         result = await ctx.asend_reply_msg(message)
         logger.info(f'卡池发送耗时 {trace_id}: '
@@ -1268,7 +1268,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_gacha_list_image(ctx, filter),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 
 
@@ -1293,7 +1293,7 @@ async def _(ctx: SekaiHandlerContext):
 
     return await ctx.asend_reply_msg(await get_image_cq(
         await compose_gacha_record_image(ctx, ctx.user_id, spec_gids),
-        low_quality=True,
+        low_quality=True, quality=85, subsampling=2,
     ))
 # ================================ 特殊卡池数据与绘图 ================================ #
 # 普通卡池仍走原版单栏；扩展只读取当前请求需要的表，不使用历史样本编号或时钟。
