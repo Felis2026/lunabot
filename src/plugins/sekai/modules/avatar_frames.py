@@ -75,8 +75,12 @@ def render_custom_avatar_border(frame: CustomAvatarFrame, height: int = 100) -> 
     return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
-def render_custom_avatar(avatar: Image.Image, frame: CustomAvatarFrame, avatar_w: int) -> Image.Image:
-    """返回保留全部装饰的RGBA图，调用者须按返回图尺寸为布局分配空间。"""
+def render_custom_avatar(avatar: Image.Image, frame: CustomAvatarFrame, avatar_w: int) -> tuple[Image.Image, tuple[int, int]]:
+    """合成带框头像，返回保留全部装饰的RGBA图和摆放偏移。
+
+    头像参考区域按宽度缩放到avatar_w。偏移为合成图左上角相对avatar_w见方头像占位左上角的位置，
+    按偏移摆放后头像区域中心与占位中心重合，装饰向占位外延伸。
+    """
     with Image.open(frame.image) as source:
         if source.mode != 'RGBA':
             raise ValueError(f'头像框 {frame.id} 必须带透明通道')
@@ -96,4 +100,8 @@ def render_custom_avatar(avatar: Image.Image, frame: CustomAvatarFrame, avatar_w
     merged = Image.alpha_composite(layer, border)
     factor = avatar_w / width
     size = tuple(math.ceil(value * factor) for value in merged.size)
-    return merged.resize(size, Image.Resampling.LANCZOS)
+    # 向上取整使两轴缩放比略有差异，头像区域中心按实际缩放后的尺寸换算。
+    center_x = (x + width / 2) * size[0] / merged.width
+    center_y = (y + height / 2) * size[1] / merged.height
+    offset = (round(avatar_w / 2 - center_x), round(avatar_w / 2 - center_y))
+    return merged.resize(size, Image.Resampling.LANCZOS), offset

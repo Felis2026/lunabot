@@ -2283,10 +2283,10 @@ async def get_avatar_widget_with_frame(
     custom_frame = get_selected_custom_avatar_frame(ctx.region, uid)
     if custom_frame:
         try:
-            image = await run_in_pool(render_custom_avatar, avatar_img, custom_frame, avatar_w)
-            # 框图外沿和阴影参与尺寸计算，紧凑资料卡会为吉祥物自动留白。
-            with Frame().set_content_align('c').set_padding(6) as ret:
-                ImageBox(image, use_alphablend=True, shadow=True)
+            image, offset = await run_in_pool(render_custom_avatar, avatar_img, custom_frame, avatar_w)
+            # 与游戏框相同，只占头像大小的位置，装饰和阴影向外绘制，不改变资料卡尺寸和昵称位置。
+            with Frame().set_size((avatar_w, avatar_w)).set_content_align('lt').set_allow_draw_outside(True) as ret:
+                ImageBox(image, use_alphablend=True, shadow=True).set_offset(offset)
             return ret
         except Exception as e:
             logger.warning(f"绘制自定义头像框 {custom_frame.id} 失败，回退游戏框: {get_exc_desc(e)}")
