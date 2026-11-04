@@ -23,10 +23,12 @@ NOTE_SIZES = {
 }
 
 
-def _read_chart_cache(path: str, use_cache: bool) -> Image.Image | None:
-    """准备缓存目录，命中时完整解码谱面图片。"""
+def _read_chart_cache(path: str, use_cache: bool, return_cache_path: bool = False) -> Image.Image | str | None:
+    """准备缓存目录，命中时按调用方式返回文件路径或完整解码图片。"""
     create_parent_folder(path)
     if use_cache and os.path.exists(path):
+        if return_cache_path:
+            return path
         return open_image(path)
     return None
 
@@ -62,15 +64,22 @@ async def generate_music_chart(
     style_sheet: str = 'black',
     use_cache: bool = True,
     refresh: bool = False,
-    skill: bool = False
-) -> Image.Image:
+    skill: bool = False,
+    return_cache_path: bool = False,
+) -> Image.Image | str:
+    """生成或读取谱面，return_cache_path用于直接发送PNG缓存。
+
+    返回路径时必须启用use_cache；默认返回独立图片，供猜谱等功能裁剪。
+    """
+    if return_cache_path and not use_cache:
+        raise ValueError('返回谱面路径需要启用缓存')
     if use_cache:
         await ctx.block_region(f"chart_{music_id}_{difficulty}_{skill}")
     # 带技能与不带技能的缓存分开
     cache_path_suffix = difficulty if not skill else f"{difficulty}_skill"
     cache_path = CHART_CACHE_PATH.format(region=ctx.region, mid=music_id, diff=cache_path_suffix)
     async with LOCAL_IMAGE_IO_LIMIT:
-        cached_image = await run_local_io(_read_chart_cache, cache_path, use_cache and not refresh)
+        cached_image = await run_local_io(_read_chart_cache, cache_path, use_cache and not refresh, return_cache_path)
     if cached_image is not None:
         return cached_image
 
@@ -161,6 +170,9 @@ async def generate_music_chart(
                 cache_path if use_cache else None,
             )
         logger.info(f'生成 mid={music_id} {difficulty} 谱面图片完成')
+        if return_cache_path:
+            img.close()
+            return cache_path
         return img
 
 
@@ -202,9 +214,10 @@ async def _(ctx: SekaiHandlerContext):
                 refresh=refresh, 
                 use_cache=True,
                 style_sheet=config.get('chart.style_sheet_name'),
-                skill=skill
+                skill=skill,
+                return_cache_path=True,
             ),
-            low_quality=True, quality=85, subsampling=2,
+            send_url_as_is=True,
         )
     except Exception as e:
         logger.print_exc(f"获取 mid={mid} {diff} 的谱面失败")
