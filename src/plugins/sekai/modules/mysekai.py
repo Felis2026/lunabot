@@ -59,6 +59,25 @@ class MsrIdNotMatchException(ReplyException):
 MYSEKAI_HARVEST_MAP_IMAGE_SCALE_CFG = config.item('mysekai.map_image_scale')
 MYSEKAI_HARVEST_MAP_SITE_BG_IMAGE_DOWNSAMPLE = 0.5
 
+MYSEKAI_MAP_RENDER_CONFIG = Config('sekai.mysekai_map_render')
+
+def get_mysekai_map_render_settings():
+    """读取资源图参数，缺省字段使用原项目的绘图参数。"""
+    defaults = {
+        'fixture_sizes': {'default': 160},
+        'fixture_anchor': 'original',
+        'birthday_size': 50,
+        'birthday_image': None,
+        'primary_drop_size': 35,
+        'secondary_drop_size': 17,
+        'drop_y_offset': -32,
+    }
+    overrides = MYSEKAI_MAP_RENDER_CONFIG.get_all() or {}
+    values = {**defaults, **overrides}
+    values['fixture_sizes'] = {**defaults['fixture_sizes'], **(overrides.get('fixture_sizes') or {})}
+    return values
+
+
 MYSEKAI_RARE_RES_KEYS_CFG = config.item('mysekai.rare_res_keys')
 MYSEKAI_HARVEST_FIXTURE_IMAGE_NAME = {
     1001: "oak.png",
@@ -99,7 +118,6 @@ MSR_PUSH_CONCURRENCY_CFG = config.item('mysekai.msr_push_concurrency')
 
 bd_msr_bind_db = get_file_db(f"{SEKAI_PROFILE_DIR}/bd_msr_bind.json", logger)
 
-harvest_point_image_offsets_cache: dict[int, Tuple[Image.Image, tuple[int, int]]] = {}
 
 MYSEKAI_ICON_CACHE_RES = 64 * 64
 
@@ -523,6 +541,10 @@ def get_mysekai_phenomena_color_info(phenomena_id: int) -> dict:
 
 # 合成mysekai资源位置地图图片
 async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_map: dict, show_harvested: bool, phenomena_color_info: dict, mysekai_info: dict = None) -> Image.Image:
+    """绘制采集物及主副掉落，按配置设置尺寸和偏移。"""
+    settings = get_mysekai_map_render_settings()
+    # 每次绘图单独保存缩放结果，使配置修改在下一次绘图生效。
+    harvest_point_image_offsets_cache = {}
     site_id = harvest_map['mysekaiSiteId']
     site_image_info = Config('sekai.mysekai_site_map_image_info').get(site_id)
     site_image = ctx.static_imgs.get(site_image_info['image'])
@@ -638,24 +660,28 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
             ftype = harvest_fixture['mysekaiSiteHarvestFixtureType']
 
             if ftype == 'birthday_plant':
-                # 检查该位置的掉落以判断是哪个角色的生日花
-                cid = None
-                for res_key in all_res.get(pkey, {}):
-                    res_id = int(res_key.rsplit("_", 1)[-1])
-                    if 174 <= res_id <= 199:
-                        cid = res_id - 173
-                        break
-                assert cid
-                chara_eng_name = (await ctx.md.game_characters.find_by_id(cid))['givenNameEnglish'].lower()
-                image = await ctx.rip.img(
-                    f'mysekai/birthday/{chara_eng_name}_{datetime.now().year}/icon_refresh.png',
-                    use_img_cache=True,
-                    default=None
-                )
-                if image is None:
-                    # 使用全透明图暂时替代
-                    image = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
-                point_img_size = 50 * scale
+                if settings['birthday_image']:
+                    image = ctx.static_imgs.get(settings['birthday_image'])
+                else:
+                    # 检查该位置的掉落以判断是哪个角色的生日花
+                    cid = None
+                    for res_key in all_res.get(pkey, {}):
+                        res_id = int(res_key.rsplit("_", 1)[-1])
+                        if 174 <= res_id <= 199:
+                            cid = res_id - 173
+                            break
+                    assert cid
+                    chara_eng_name = (await ctx.md.game_characters.find_by_id(cid))['givenNameEnglish'].lower()
+                    image = await ctx.rip.img(
+                        f'mysekai/birthday/{chara_eng_name}_{datetime.now().year}/icon_refresh.png',
+                        use_img_cache=True,
+                        default=None
+                    )
+                    if image is None:
+                        # 使用全透明图暂时替代
+                        image = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
+
+                point_img_size = settings['birthday_size'] * scale
                 xoffset = point_img_size * 0.15
                 zoffset = 0
                 image = resize_keep_ratio(image, point_img_size)
@@ -664,10 +690,16 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
                 rarity = harvest_fixture['mysekaiSiteHarvestFixtureRarityType']
                 image = ctx.static_imgs.get(f"mysekai/harvest_fixture_icon/{rarity}/{asset_name}.png", (128, None))
 
-                point_img_size = 160 * scale
-                xoffset = 0
-                zoffset = -point_img_size * 0.3  # 道具和资源点图标整体偏上，以让资源点对齐实际位置
+                point_img_size = settings['fixture_sizes'].get(ftype, settings['fixture_sizes']['default']) * scale
                 image = resize_keep_ratio(image, point_img_size)
+                if settings['fixture_anchor'] == 'bottom_center':
+                    # 新渲染素材按透明边界对齐底部及水平中心。
+                    bbox = image.getbbox() or (0, 0, image.width, image.height)
+                    xoffset = point_img_size * 0.5 - (bbox[0] + bbox[2]) * 0.5
+                    zoffset = point_img_size * 0.5 - bbox[3]
+                else:
+                    xoffset = 0
+                    zoffset = -point_img_size * 0.3
 
             # 提前shrink以提高绘制效率
             # try:
@@ -730,7 +762,7 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
                 else:                   large_total += 1
             small_idx, large_idx = 0, 0
 
-            icon_zoffset = -160 * scale * 0.2
+            icon_zoffset = settings['drop_y_offset'] * scale
 
             for item in pres:
                 if item['del']: continue
@@ -746,7 +778,8 @@ async def compose_mysekai_harvest_map_image(ctx: SekaiHandlerContext, harvest_ma
                 )
 
                 # 计算大小和位置
-                large_size, small_size = 35 * scale, 17 * scale
+                large_size = settings['primary_drop_size'] * scale
+                small_size = settings['secondary_drop_size'] * scale
                 if item['type'] == 'mysekai_material' and item['id'] == 24:
                     large_size *= 1.5
                 if item['type'] == 'mysekai_music_record':
